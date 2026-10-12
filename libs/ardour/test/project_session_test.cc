@@ -207,6 +207,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (mixer_automation_roundtrip);
 	CPPUNIT_TEST (native_fader_automation);
 	CPPUNIT_TEST (automation_collision);
+	CPPUNIT_TEST (region_fades_roundtrip);
 	CPPUNIT_TEST_SUITE_END ();
 public:
 	void roundtrip ();
@@ -230,10 +231,105 @@ public:
 	void transport_collision ();
 	void mixer_automation_roundtrip ();
 	void native_fader_automation ();
+	void region_fades_roundtrip ();
 	void automation_collision ();
 };
 
 CPPUNIT_TEST_SUITE_REGISTRATION (ProjectSessionTest);
+
+void ProjectSessionTest::region_fades_roundtrip ()
+{
+	Fixture fixture;
+	auto input = example (fixture);
+	// Constant, distinct channel levels make the processed PCM a direct
+	// measurement of the complete gain/fade curve, including abrupt edges.
+	{
+		SF_INFO info = {}; info.channels = 2; info.samplerate = input.media[0].sample_rate; info.format = SF_FORMAT_WAV | SF_FORMAT_FLOAT;
+		SNDFILE* file = sf_open (fixture.path ("source.wav").c_str (), SFM_WRITE, &info); CPPUNIT_ASSERT (file);
+		std::vector<float> pcm (info.samplerate * 4);
+		for (size_t i = 0; i < pcm.size (); ++i) { pcm[i] = i % 2 ? .25 : .125; }
+		CPPUNIT_ASSERT_EQUAL (sf_count_t (info.samplerate * 2), sf_writef_float (file, pcm.data (), info.samplerate * 2));
+		CPPUNIT_ASSERT_EQUAL (0, sf_close (file));
+	}
+	input.tracks.erase (input.tracks.begin () + 1); input.tracks.pop_back ();
+	auto& lane = input.tracks[1]; lane.parent.clear (); lane.destination = "master"; lane.pan = .5;
+	auto clip = lane.clips.front (); lane.clips.clear ();
+	for (unsigned i = 0; i < 12; ++i) { clip.name = "Fade " + std::to_string (i); clip.position.value = 1 + i; lane.clips.push_back (clip); }
+	package (fixture, input);
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"), fixture.path ("Fades"), "Fades", fixture.report);
+	const samplecnt_t rate = fixture.session->sample_rate ();
+	auto render = [&] (std::shared_ptr<AudioRegion> audio) {
+		std::vector<float> output (audio->length_samples () * 2, 0);
+		std::vector<float> mix (256), gain (256);
+		for (unsigned channel = 0; channel < 2; ++channel) {
+			for (samplecnt_t at = 0; at < audio->length_samples (); at += 256) {
+				auto count = std::min (samplecnt_t (256), audio->length_samples () - at);
+				CPPUNIT_ASSERT_EQUAL (count, audio->read_at (output.data () + channel * audio->length_samples () + at, mix.data (), gain.data (), audio->position_sample () + at, count, channel));
+			}
+		}
+		return output;
+	};
+	std::map<std::string, std::vector<float>> expected;
+	{
+		auto native = std::dynamic_pointer_cast<ARDOUR::Track> (fixture.session->route_by_name (lane.name));
+		auto regions = native->playlist ()->region_list ();
+		unsigned i = 0;
+		for (auto const& region : *regions) {
+			auto audio = std::dynamic_pointer_cast<AudioRegion> (region); CPPUNIT_ASSERT (audio);
+			audio->set_scale_amplitude (i == 11 ? 0 : 1.7);
+			if (i < 10) {
+				audio->set_opaque (i >= 5);
+				audio->set_fade_in (static_cast<FadeShape> (i % 5), rate * 35 / 100);
+				audio->set_fade_out (static_cast<FadeShape> (i % 5), rate * 35 / 100);
+				audio->set_fade_in_active (true); audio->set_fade_out_active (true);
+				auto envelope = audio->envelope (); envelope->clear (); envelope->freeze ();
+				for (auto p : std::vector<std::pair<double, double>> {{0, .8}, {.15, 1.4}, {.35, .3}, {.5, 1}}) {
+					envelope->fast_simple_add (Temporal::timepos_t (samplepos_t (std::llround (p.first * rate))), p.second);
+				}
+				envelope->thaw (); audio->set_envelope_active (true);
+			}
+			expected[audio->name ()] = render (audio); ++i;
+		}
+	}
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("Fades"), "Fades", nullptr, "", true));
+	AudioEngine::instance ()->set_session (fixture.session.get ());
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("fades.dawproject"), fixture.report);
+	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& d) { return d.detail.find ("one-sample gain transition") != std::string::npos; }));
+	PX::SessionExchange::export_logic (*fixture.session, fixture.path ("FadeAAF"), fixture.report);
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	for (bool logic : {false, true}) {
+		std::string name = logic ? "AAFReturn" : "DAWReturn";
+		fixture.session = logic ? PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("FadeAAF/Project.aaf"), fixture.path ("FadeAAF/Project.mid"), fixture.path (name), name, fixture.report)
+		                        : PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("fades.dawproject"), fixture.path (name), name, fixture.report);
+		AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+		fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path (name), name, nullptr, "", true));
+		{
+			auto native = std::dynamic_pointer_cast<ARDOUR::Track> (fixture.session->route_by_name (lane.name)); CPPUNIT_ASSERT (native);
+			auto regions = native->playlist ()->region_list ();
+			CPPUNIT_ASSERT_EQUAL (expected.size (), regions->size ());
+			for (auto const& region : *regions) {
+				auto audio = std::dynamic_pointer_cast<AudioRegion> (region); auto actual = render (audio);
+				// AAF clip names currently use source/subclip names. Placement is stable.
+				std::string key = "Fade " + std::to_string (int (std::llround (double (audio->position_sample ()) / rate)) - 1);
+				auto const& reference = expected.at (key); CPPUNIT_ASSERT_EQUAL (reference.size (), actual.size ());
+				for (size_t i = 0; i < actual.size (); ++i) {
+					auto frame = i % audio->length_samples ();
+					bool edge = frame == size_t (rate * 15 / 100 - 1) || frame == size_t (rate * 35 / 100 - 1);
+					if (edge) {
+						// Native read_at switches fade contributions on sample
+						// boundaries. The shared linear envelope explicitly uses
+						// a one-sample transition there, never an overshoot.
+						CPPUNIT_ASSERT (actual[i] >= std::min (reference[i - 1], reference[i + 1]) - .0002);
+						CPPUNIT_ASSERT (actual[i] <= std::max (reference[i - 1], reference[i + 1]) + .0002);
+					} else { CPPUNIT_ASSERT_DOUBLES_EQUAL_MESSAGE (name + " " + key + " sample " + std::to_string (i), reference[i], actual[i], .0002); }
+				}
+			}
+		}
+		AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	}
+}
 
 void ProjectSessionTest::mixer_automation_roundtrip ()
 {
@@ -822,7 +918,7 @@ void ProjectSessionTest::reject_unmapped_processing ()
 		if (!track) { continue; }
 		auto regions = track->playlist ()->region_list ();
 		for (auto const& region : *regions) {
-			if (auto audio = std::dynamic_pointer_cast<AudioRegion> (region)) { audio->set_scale_amplitude (0.5); changed = true; }
+			if (auto audio = std::dynamic_pointer_cast<AudioRegion> (region)) { audio->set_opaque (true); audio->set_position (Temporal::timepos_t (samplepos_t (0))); changed = true; }
 		}
 	}
 	CPPUNIT_ASSERT (changed);

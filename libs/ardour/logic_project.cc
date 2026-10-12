@@ -168,8 +168,19 @@ LogicProject::LogicProject (const std::string& path, const std::string& midi, Ca
 			value.duration = seconds (clip->len, track->edit_rate);
 			value.offset = Time (seconds (clip->essence_offset, track->edit_rate), TimeUnit::Seconds);
 			value.enabled = !clip->mute;
-			value.gain = self.fixed (clip->gain, value.name + " gain", 1);
-			if (clip->automation) { project.report.push_back ({Disposition::Unsupported, value.name, "AAF clip automation is not yet supported by project import"}); }
+			value.gain = self.mixer (clip->gain, value.envelope, track->edit_rate, value.name + " gain", 1);
+			if (!value.envelope.points.empty ()) { value.gain = 1; }
+			if (clip->automation) {
+				Automation curve {TimeUnit::Seconds, {}};
+				self.mixer (clip->automation, curve, track->edit_rate, value.name + " envelope", 1);
+				auto source = std::find_if (project.media.begin (), project.media.end (), [&] (const Media& m) { return m.id == value.media; });
+				value.envelope = multiply_automation (value.envelope, curve, 1.0 / source->sample_rate);
+			}
+			for (auto gain : {clip->gain, clip->automation}) {
+				if (gain && gain->time && gain->length != clip->len) {
+					project.report.push_back ({Disposition::Unsupported, value.name, "AAF clip envelope spans a different operation range; explicit trimming is required"});
+				}
+			}
 			output.clips.push_back (value);
 		}
 		project.tracks.push_back (output);

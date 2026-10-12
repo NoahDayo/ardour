@@ -271,7 +271,12 @@ def write_aaf(root, destination):
                 require(clip_gain >= 0, "Invalid clip gain")
                 if clip.attrib.get("enabled") != "true":
                     clip_gain = 0
-                if clip_gain != 1:
+                clip_points = automation_points(clip.find("GainAutomation"), rate)
+                if clip_points:
+                    require(clip_points[-1][0] <= length, "Clip automation extends outside clip")
+                    clip_points = [(at, value * clip_gain, linear) for at, value, linear in clip_points]
+                    segment = apply_automation(output, segment, mono_gain if channels == 1 else stereo_gain, amplitude, clip_points)
+                elif clip_gain != 1:
                     segment = apply_constant(output, segment, mono_gain if channels == 1 else stereo_gain, amplitude, clip_gain)
                 for field in ("name", "color"):
                     if clip.attrib.get(field):

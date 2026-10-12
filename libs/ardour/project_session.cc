@@ -24,6 +24,7 @@
 
 #include "pbd/controllable.h"
 #include "pbd/control_math.h"
+#include "evoral/Curve.h"
 #include "pbd/scoped_file_descriptor.h"
 #include "pbd/xml++.h"
 #include "temporal/tempo.h"
@@ -482,6 +483,19 @@ void populate (Session& session, const Project& project, const std::map<std::str
 				audio->set_scale_amplitude (clip.gain);
 				audio->set_fade_in_active (false);
 				audio->set_fade_out_active (false);
+				if (!clip.envelope.points.empty ()) {
+					auto curve = linearize_automation (slice_automation (clip.envelope, 0, duration), 1.0 / session.sample_rate ());
+					auto list = audio->envelope ();
+					double peak = 1;
+					for (auto const& p : curve.points) { peak = std::max (peak, p.value); }
+					double scale = std::max (1.0, peak / list->descriptor ().upper);
+					if (!std::isfinite (clip.gain * scale) || clip.gain * scale > std::numeric_limits<float>::max ()) { throw ExchangeError ("Clip envelope amplitude exceeds native range"); }
+					audio->set_scale_amplitude (clip.gain * scale);
+					list->clear (); list->set_interpolation (Evoral::ControlList::Linear); list->freeze ();
+					for (auto const& p : curve.points) { list->fast_simple_add (Temporal::timepos_t (samples (p.time, session.sample_rate ())), p.value / scale); }
+					list->thaw (); audio->set_envelope_active (true);
+					report.push_back ({Disposition::Transformed, clip.name, "Clip gain/fades use an editable linear-amplitude region envelope at the session sample resolution"});
+				}
 			}
 			auto native_track = std::dynamic_pointer_cast<ARDOUR::Track> (route);
 			if (!native_track || !native_track->playlist ()) { throw ExchangeError ("Imported region has no playlist"); }
@@ -550,6 +564,122 @@ Automation collect_automation (Project& project, const std::string& object, std:
 	if (transformed) { project.report.push_back ({Disposition::Transformed, object, "Native curved automation sampled to linear segments within 0.000101 amplitude before destination rounding"}); }
 	if (control->automation_state () != Play) { project.report.push_back ({Disposition::Transformed, object, "Recorded envelope exported as playback automation; write/touch/latch mode is not transferred"}); }
 	return curve;
+}
+
+Automation region_curve (std::shared_ptr<AutomationList> list, samplecnt_t rate)
+{
+	// Curve evaluation maintains a lookup cache. Copy the list under its
+	// own read lock so export never shares that cache with disk playback.
+	list = std::make_shared<AutomationList> (*list);
+	Automation result; result.unit = TimeUnit::Seconds;
+	if (list->empty ()) { return result; }
+	if (list->time_domain () != Temporal::AudioTime) { throw ExchangeError ("Region gain curve must use audio time"); }
+	auto style = list->interpolation ();
+	list->curve ().solve ();
+	size_t evaluations = 0;
+	auto value = [&] (samplepos_t at) {
+		if (++evaluations > 2000000) { throw ExchangeError ("Region curve exceeds conversion work limit"); }
+		float v = 0; list->curve ().get_vector (Temporal::timepos_t (at), Temporal::timepos_t (at), &v, 1);
+		if (!std::isfinite (v) || v < -0.0000001) { throw ExchangeError ("Invalid native region gain curve at sample " + std::to_string (at) + ": " + std::to_string (v) + " (interpolation " + std::to_string (int (style)) + ")"); }
+		return std::max (0.0, double (v));
+	};
+	Evoral::ControlEvent* before = nullptr;
+	for (auto const& event : *list) {
+		samplepos_t end = event->when.samples ();
+		if (!before) { result.points.push_back ({double (end) / rate, event->value, style != Evoral::ControlList::Discrete}); }
+		else {
+			std::function<void (samplepos_t, samplepos_t)> append;
+			append = [&] (samplepos_t a, samplepos_t b) {
+				double bound = 0;
+				if (style == Evoral::ControlList::Curved && event->coeff) {
+					double x = Temporal::timepos_t (a).val (), y = Temporal::timepos_t (b).val ();
+					// Cubic secant error <= max |f''| * interval^2 / 8.
+					bound = std::max (std::fabs (2 * event->coeff[2] + 6 * event->coeff[3] * x),
+					                  std::fabs (2 * event->coeff[2] + 6 * event->coeff[3] * y)) * (y - x) * (y - x) / 8;
+				}
+				if (style == Evoral::ControlList::Exponential || style == Evoral::ControlList::Logarithmic) {
+					double va = value (a), vb = value (b);
+					auto line = [&] (samplepos_t x) { return va + (vb - va) * double (x - a) / (b - a); };
+					std::function<bool (samplepos_t, double, samplepos_t, double)> bounded;
+					bounded = [&] (samplepos_t left, double vl, samplepos_t right, double vr) {
+						if (right - left <= 1) { return true; }
+						if (std::max (std::fabs (vl - line (right)), std::fabs (vr - line (left))) <= .000001) { return true; }
+						auto mid = left + (right - left) / 2; double vm = value (mid);
+						if (std::fabs (vm - line (mid)) > .0000005) { return false; }
+						return bounded (left, vl, mid, vm) && bounded (mid, vm, right, vr);
+					};
+					if (!bounded (a, va, b, vb)) { bound = 1; }
+				}
+				if (bound > .000001 && b - a > 1) { auto mid = a + (b - a) / 2; append (a, mid); append (mid, b); return; }
+				if (result.points.size () >= 100000) { throw ExchangeError ("Region envelope exceeds conversion limit"); }
+				result.points.push_back ({double (b) / rate, b == end ? event->value : value (b), style != Evoral::ControlList::Discrete});
+			};
+			if (end <= before->when.samples ()) { throw ExchangeError ("Native region curve points collide at sample resolution"); }
+			append (before->when.samples (), end);
+		}
+		before = event;
+	}
+	return linearize_automation (result, 1.0 / rate);
+}
+
+Automation region_envelope (AudioRegion& audio, samplecnt_t rate)
+{
+	Automation result; result.unit = TimeUnit::Seconds;
+	double duration = double (audio.length_samples ()) / rate, quantum = 1.0 / rate;
+	if (audio.envelope_active ()) { result = slice_automation (region_curve (audio.envelope (), rate), 0, duration); }
+	Automation fades[2] = {{TimeUnit::Seconds, {}}, {TimeUnit::Seconds, {}}}; double lengths[2] = {0, 0};
+	for (bool in : {true, false}) {
+		if (!(in ? audio.fade_in_active () : audio.fade_out_active ())) { continue; }
+		auto list = in ? audio.fade_in () : audio.fade_out ();
+		auto fade = region_curve (list, rate);
+		if (fade.points.empty ()) { continue; }
+		double length = fade.points.back ().time;
+		lengths[in ? 0 : 1] = length;
+		if (in) {
+			if (length > quantum && fade.points.back ().value != 1) {
+				float v; auto at = Temporal::timepos_t (samples (length - quantum, rate)); list->curve ().get_vector (at, at, &v, 1);
+				while (fade.points.size () > 1 && fade.points.back ().time >= length - quantum - 1e-10) { fade.points.pop_back (); }
+				fade.points.push_back ({length - quantum, v, true}); fade.points.push_back ({length, 1, true});
+			}
+		} else {
+			double offset = duration - length;
+			for (auto& point : fade.points) { point.time += offset; }
+			if (offset > quantum && fade.points.front ().value != 1) { fade.points.insert (fade.points.begin (), {offset - quantum, 1, true}); }
+		}
+		fades[in ? 0 : 1] = slice_automation (fade, 0, duration);
+	}
+	Automation combined {TimeUnit::Seconds, {}};
+	double overlap_start = duration - lengths[1], overlap_end = lengths[0];
+	if (!fades[0].points.empty () && !fades[1].points.empty () && overlap_start < overlap_end) {
+		// AudioRegion::read_at mixes both contributions where its own fades
+		// overlap. For opaque regions the second contribution also applies
+		// the inverse fade-out to the first contribution.
+		auto first = fades[0];
+		if (audio.opaque ()) {
+			Automation inverse {TimeUnit::Seconds, {}};
+			if (audio.inverse_fade_out ()) { inverse = region_curve (audio.inverse_fade_out (), rate); }
+			else {
+				inverse = region_curve (audio.fade_out (), rate);
+				for (auto& p : inverse.points) { p.value = 1 - p.value; }
+			}
+			for (auto& p : inverse.points) { p.time += overlap_start; }
+			first = multiply_automation (first, slice_automation (inverse, 0, duration), quantum);
+		}
+		std::set<double> points;
+		for (auto const& curve : {first, fades[0], fades[1]}) { for (auto const& p : curve.points) { points.insert (p.time); } }
+		for (double boundary : {overlap_start, overlap_end}) {
+			if (boundary > 0 && boundary < duration) { points.insert (boundary); }
+			if (boundary > quantum && boundary <= duration) { points.insert (boundary - quantum); }
+		}
+		combined.unit = TimeUnit::Seconds;
+		for (double t : points) {
+			double v = t < overlap_start - quantum * .001 ? automation_value (fades[0], t)
+			           : t >= overlap_end - quantum * .001 ? automation_value (fades[1], t)
+			           : automation_value (first, t) + automation_value (fades[1], t);
+			combined.points.push_back ({t, v, true});
+		}
+	} else { combined = multiply_automation (fades[0], fades[1], quantum); }
+	return multiply_automation (result, combined, quantum);
 }
 
 /* Only direct, one-to-one stereo connections can be represented by the
@@ -712,8 +842,17 @@ Project collect (Session& session, AudioAssets& assets, const CancelCheck& cance
 					clip.offset = Time (double (region->start_sample ()) / session.sample_rate (), TimeUnit::Seconds);
 					clip.gain = audio->scale_amplitude ();
 					if (audio->envelope_active () || audio->fade_in_active () || audio->fade_out_active ()) {
-						unsupported (project, clip.name, "Region envelopes and fades cannot yet be exchanged");
+						if (!session.config.get_use_region_fades () && (audio->fade_in_active () || audio->fade_out_active ())) {
+							unsupported (project, clip.name, "Globally disabled region fades need an explicit conversion choice");
+						}
+						try { clip.envelope = region_envelope (*audio, session.sample_rate ()); }
+						catch (const ExchangeError& e) { throw ExchangeError (clip.name + ": " + e.what ()); }
+						project.report.push_back ({Disposition::Transformed, clip.name, "Region envelope and fade shapes combined into editable gain points, sampled at audio resolution"});
+						if (audio->fade_in_active () && audio->fade_out_active () && audio->fade_in ()->when (false).samples () + audio->fade_out ()->when (false).samples () > audio->length_samples ()) {
+							project.report.push_back ({Disposition::Transformed, clip.name, "Overlapping native fades retain their mixing behavior; abrupt overlap edges use a one-sample gain transition"});
+						}
 					}
+					if (audio->has_region_fx ()) { unsupported (project, clip.name, "Region effects require rendering or compatible plugin transfer"); }
 					if (region->opaque ()) {
 						for (auto const& other : *regions) {
 							if (other != region && other->position () < region->end_position () && region->position () < other->end_position ()) {
@@ -1012,11 +1151,6 @@ SessionExchange::export_dawproject (Session& session, const std::string& destina
 	AudioAssets assets;
 	Project project = collect (session, assets, cancel);
 	report = project.report;
-	for (auto const& track : project.tracks) {
-		for (auto const& clip : track.clips) {
-			if (clip.gain != 1) { unsupported (project, clip.name, "Audio region gain is not yet converted to DAWproject"); }
-		}
-	}
 	report = project.report;
 	for (auto const& item : project.report) {
 		if (item.disposition == Disposition::Unsupported) { throw ExchangeError (item.object + ": " + item.detail); }
@@ -1136,6 +1270,13 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 			item.set_property ("color", clip.color);
 			item.set_property ("enabled", clip.enabled ? "true" : "false");
 			item.set_property ("gain", clip.gain);
+			if (!clip.envelope.points.empty ()) {
+				XMLNode& envelope = *item.add_child ("GainAutomation");
+				for (auto const& p : clip.envelope.points) {
+					XMLNode& point = *envelope.add_child ("Point");
+					point.set_property ("time", p.time); point.set_property ("value", p.value); point.set_property ("linear", p.linear ? "true" : "false");
+				}
+			}
 			TimeUnit unit = audio ? TimeUnit::Seconds : TimeUnit::Beats;
 			double position = timing.convert (clip.position, unit);
 			double length = timing.duration (Time (clip.duration, clip.position.unit), clip.position, unit);

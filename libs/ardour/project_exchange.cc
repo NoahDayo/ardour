@@ -230,6 +230,84 @@ convert_automation (const Automation& input, const TimeMap& timing, TimeUnit uni
 	return output;
 }
 
+double
+automation_value (const Automation& curve, double time)
+{
+	if (curve.points.empty ()) { return 1; }
+	auto after = std::upper_bound (curve.points.begin (), curve.points.end (), time,
+	                             [] (double t, const AutomationPoint& p) { return t < p.time; });
+	if (after == curve.points.begin ()) { return after->value; }
+	auto before = std::prev (after);
+	if (after == curve.points.end () || !before->linear) { return before->value; }
+	return before->value + (after->value - before->value) * (time - before->time) / (after->time - before->time);
+}
+
+Automation
+slice_automation (const Automation& input, double start, double end)
+{
+	require (std::isfinite (start) && std::isfinite (end) && end > start, "Invalid envelope slice");
+	Automation result; result.unit = input.unit;
+	if (input.points.empty ()) { return result; }
+	bool linear = true;
+	for (auto const& point : input.points) { if (point.time <= start) { linear = point.linear; } else { break; } }
+	result.points.push_back ({0, automation_value (input, start), linear});
+	for (auto point : input.points) {
+		if (point.time > start && point.time < end) { point.time -= start; result.points.push_back (point); }
+	}
+	result.points.push_back ({end - start, automation_value (input, end), true});
+	return result;
+}
+
+Automation
+linearize_automation (const Automation& input, double quantum)
+{
+	require (std::isfinite (quantum) && quantum > 0, "Invalid envelope resolution");
+	Automation output; output.unit = input.unit;
+	for (size_t i = 0; i < input.points.size (); ++i) {
+		auto point = input.points[i]; point.time = std::round (point.time / quantum) * quantum;
+		if (i) {
+			// A boundary converted through beats and seconds can differ from
+			// the same explicit point by a few floating-point ulps.
+			if (point.time == output.points.back ().time &&
+			    std::fabs (input.points[i].time - input.points[i - 1].time) <= 64 * std::numeric_limits<double>::epsilon () * std::max (1.0, std::fabs (input.points[i].time)) &&
+			    std::fabs (point.value - output.points.back ().value) <= 1e-12 * std::max (1.0, std::fabs (point.value))) { continue; }
+			require (point.time > output.points.back ().time, "Envelope points collide at audio resolution");
+			if (!input.points[i - 1].linear && input.points[i - 1].value != point.value && point.time - quantum > output.points.back ().time + quantum * .001) {
+				output.points.push_back ({point.time - quantum, input.points[i - 1].value, true});
+			}
+		}
+		point.linear = true; output.points.push_back (point);
+		require (output.points.size () <= 100000, "Envelope exceeds the event limit");
+	}
+	return output;
+}
+
+Automation
+multiply_automation (const Automation& first, const Automation& second, double quantum, double tolerance)
+{
+	if (first.points.empty ()) { return linearize_automation (second, quantum); }
+	if (second.points.empty ()) { return linearize_automation (first, quantum); }
+	require (first.unit == second.unit && tolerance > 0 && std::isfinite (tolerance), "Incompatible envelopes");
+	auto a = linearize_automation (first, quantum), b = linearize_automation (second, quantum);
+	std::set<double> times;
+	for (auto const& curve : {a, b}) { for (auto const& point : curve.points) { times.insert (point.time); } }
+	Automation output; output.unit = a.unit;
+	auto value = [&] (double t) { double v = automation_value (a, t) * automation_value (b, t); require (std::isfinite (v), "Envelope amplitude overflow"); return v; };
+	output.points.push_back ({*times.begin (), value (*times.begin ()), true});
+	std::function<void (double, double)> append;
+	append = [&] (double start, double end) {
+		// Product of two linear segments is quadratic. Its maximum secant
+		// error is |delta_a * delta_b| / 4. No midpoint-only heuristic.
+		double error = std::fabs ((automation_value (a, end) - automation_value (a, start)) * (automation_value (b, end) - automation_value (b, start))) / 4;
+		double mid = std::round ((start + (end - start) * .5) / quantum) * quantum;
+		if (error > tolerance && mid > start + quantum * .001 && mid < end - quantum * .001) { append (start, mid); append (mid, end); return; }
+		require (output.points.size () < 100000, "Combined envelope exceeds the event limit");
+		output.points.push_back ({end, value (end), true});
+	};
+	for (auto t = std::next (times.begin ()); t != times.end (); ++t) { append (*std::prev (t), *t); }
+	return output;
+}
+
 bool
 has_unsupported_features (const Project& project)
 {
@@ -293,6 +371,16 @@ validate_project (const Project& project)
 			         (clip.kind == ClipKind::Audio || clip.gain == 1), "Invalid clip gain");
 			require (nonnegative (clip.position.value) && nonnegative (clip.duration) && clip.duration > 0 &&
 			         std::isfinite (clip.position.value + clip.duration) && nonnegative (clip.offset.value), "Invalid clip range");
+			require (clip.envelope.unit == TimeUnit::Seconds && clip.envelope.points.size () <= 100000 &&
+			         (clip.kind == ClipKind::Audio || clip.envelope.points.empty ()), "Invalid clip envelope");
+			double previous_envelope = -1;
+			double duration = timing.duration (Time (clip.duration, clip.position.unit), clip.position, TimeUnit::Seconds);
+			auto envelope_media = media.find (clip.media);
+			double envelope_slack = envelope_media == media.end () ? 0 : 1.0 / envelope_media->second->sample_rate;
+			for (auto const& point : clip.envelope.points) {
+				require (nonnegative (point.time) && point.time > previous_envelope && point.time <= duration + envelope_slack && nonnegative (point.value), "Invalid clip envelope point");
+				previous_envelope = point.time;
+			}
 			if (clip.kind == ClipKind::Audio) {
 				require (track.kind == TrackKind::Audio && clip.notes.empty (), "Audio clip on incompatible track");
 				auto source = media.find (clip.media);

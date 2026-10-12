@@ -87,6 +87,15 @@ main (int argc, char** argv)
 			printf ("{\"position\":%" PRId64 ",\"length\":%" PRId64 ",\"offset\":%" PRId64 ",\"channels\":%d",
 			        clip->pos, clip->len, clip->essence_offset, clip->channels);
 			if (clip->gain && clip->gain->pts_cnt == 1) { printf (",\"gain\":%.12g", aafRationalToDouble (clip->gain->value[0])); }
+			aafiAudioGain* envelope = clip->automation ? clip->automation : (clip->gain && clip->gain->time ? clip->gain : NULL);
+			if (envelope) {
+				printf (",\"envelope\":[");
+				for (unsigned int i = 0; i < envelope->pts_cnt; ++i) {
+					if (i) { putchar (','); }
+					printf ("[%.12g,%.12g]", aafRationalToDouble (envelope->time[i]), aafRationalToDouble (envelope->value[i]));
+				}
+				printf ("],\"envelope_length\":%" PRId64, envelope->length);
+			}
 			putchar ('}');
 		}
 		printf ("]}");

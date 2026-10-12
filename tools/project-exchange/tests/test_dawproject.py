@@ -333,8 +333,7 @@ class DawProjectTest(unittest.TestCase):
         self.assertIn("expanded object limit", result.stderr)
 
     def test_report_prevents_unacknowledged_feature_loss(self):
-        changes = [('<Clip name="Lead"', '<Clip fadeInTime="0.1" name="Lead"'),
-                   ('<Mute value="false"/>', '<Devices><Vst3Plugin deviceName="Effect" deviceRole="audioFX"/></Devices><Mute value="false"/>'),
+        changes = [('<Mute value="false"/>', '<Devices><Vst3Plugin deviceName="Effect" deviceRole="audioFX"/></Devices><Mute value="false"/>'),
                    ('<Notes>', '<Notes vendorExtension="yes">'),
                    ('<Channel id="ca"', '<Channel name="Separate mixer label" id="ca"'),
                    ('role="master"', 'role="regular"')]
@@ -431,6 +430,68 @@ class DawProjectTest(unittest.TestCase):
             self.parse(self.timed_project(points), status=1)
         self.parse(self.timed_project('<RealPoint time="4" value="100"/>').replace('parameter="tempo-map"', 'parameter="meter-map"'), status=1)
         self.parse(self.timed_project('', meters='<TimeSignaturePoint time="2" numerator="3" denominator="3"/>'), status=1)
+
+    @staticmethod
+    def envelope_value(points, time):
+        for a, b in zip(points, points[1:]):
+            if time < b[0]:
+                return a[1] if not a[2] else a[1] + (b[1] - a[1]) * (time - a[0]) / (b[0] - a[0])
+        return points[-1][1]
+
+    def test_clip_gain_and_overlapping_fades(self):
+        xml = PROJECT.replace('name="Lead" time="8"', 'name="Lead" fadeInTime="0.9" fadeOutTime="0.9" fadeTimeUnit="seconds" time="8"')
+        gain = '<Points unit="linear"><Target expression="gain"/><RealPoint time="0" value="0.5" interpolation="linear"/><RealPoint time="2" value="1.5" interpolation="linear"/></Points>'
+        xml = xml.replace('<Audio id="source"', '<Lanes timeUnit="seconds">' + gain + '<Audio id="source"').replace('</Audio>', '</Audio></Lanes>', 1)
+        parsed = self.parse(xml)
+        self.assertFalse(any(d['disposition'] == 3 for d in parsed['report']))
+        clip = parsed['tracks'][1]['clips'][0]
+        for i in range(151):
+            t = i / 100
+            expected = (.5 + (.25 + t) / 2) * min(1, t / .9) * min(1, (1.5 - t) / .9)
+            self.assertAlmostEqual(self.envelope_value(clip['envelope'], t), expected, delta=.00008)
+        output = self.root / 'envelope.xml'
+        self.command('rewrite', self.input, output)
+        self.assert_schema(output)
+        again = json.loads(self.command('parse', output).stdout)['tracks'][1]['clips'][0]
+        for i in range(151):
+            self.assertAlmostEqual(self.envelope_value(clip['envelope'], i / 100), self.envelope_value(again['envelope'], i / 100), delta=.000001)
+        self.assertIsNotNone(ET.parse(output).find('.//Points/Target[@expression="gain"]'))
+
+    def test_crossfade_source_handle_and_invalid_fades(self):
+        xml = PROJECT.replace('name="Lead" time="8"', 'name="Lead" fadeInTime="-0.1" fadeOutTime="0.2" fadeTimeUnit="seconds" time="8"')
+        clip = self.parse(xml)['tracks'][1]['clips'][0]
+        self.assertAlmostEqual(clip['position'][0] * .6, 4.7)
+        self.assertAlmostEqual(clip['offset'][0], .15)
+        self.assertAlmostEqual(clip['duration'] * .6, 1.6)
+        self.assertAlmostEqual(self.envelope_value(clip['envelope'], .05), .5)
+        for change in ('fadeInTime="-0.3"', 'fadeInTime="2"', 'fadeInTime="nan"'):
+            self.parse(xml.replace('fadeInTime="-0.1"', change), status=1)
+        self.parse(xml.replace('fadeOutTime="0.2"', 'fadeOutTime="-1"'), status=1)
+        self.parse(xml.replace(' fadeTimeUnit="seconds"', ''), status=1)
+
+    def test_nested_clip_gain_trim(self):
+        xml = '''<Project version="1.0"><Application name="Test" version="1"/><Structure><Track id="t" contentType="audio"/></Structure>
+          <Arrangement><Lanes timeUnit="seconds"><Clips track="t"><Clip time="2" duration="1" playStart="1">
+          <Lanes><Points unit="linear"><Target expression="gain"/><RealPoint time="0" value="0.5"/></Points>
+          <Clips><Clip time="0" duration="3"><Lanes><Points unit="linear"><Target expression="gain"/>
+          <RealPoint time="0" value="0" interpolation="linear"/><RealPoint time="3" value="1"/></Points>
+          <Audio channels="2" sampleRate="48000" duration="4"><File path="audio.wav"/></Audio>
+          </Lanes></Clip></Clips></Lanes></Clip></Clips></Lanes></Arrangement></Project>'''
+        clip = self.parse(xml)['tracks'][0]['clips'][0]
+        self.assertEqual(clip['position'], [2, 'seconds'])
+        self.assertEqual(clip['offset'], [1, 'seconds'])
+        for t in (0, .25, .5, 1):
+            self.assertAlmostEqual(self.envelope_value(clip['envelope'], t), (1 + t) / 6, delta=.00001)
+
+    def test_beat_fades_across_tempo_change(self):
+        xml = self.timed_project('<RealPoint time="9" value="60"/>')
+        xml = xml.replace('name="Lead" time="8"', 'name="Lead" fadeTimeUnit="beats" fadeInTime="1.5" fadeOutTime="0.8" time="8"')
+        clip = self.parse(xml)['tracks'][1]['clips'][0]
+        for i in range(151):
+            time = i / 100
+            beat = 8 + time / .6 if time <= .6 else 9 + time - .6
+            expected = min(1, (beat - 8) / 1.5) * min(1, (9.9 - beat) / .8)
+            self.assertAlmostEqual(self.envelope_value(clip['envelope'], time), expected, delta=.00015)
 
     def test_reject_dtd_entities_and_reference_cycles(self):
         secret = self.root / "private.txt"

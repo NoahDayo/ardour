@@ -46,21 +46,6 @@ struct Note {
 	double release_velocity = 0.5;
 };
 
-enum class ClipKind { Audio, MIDI };
-struct Clip {
-	std::string name;
-	std::string color;
-	ClipKind kind = ClipKind::Audio;
-	Time position;
-	double duration = 0; // Same unit as position.
-	Time offset; // Source time, independent of arrangement position.
-	bool enabled = true;
-	double gain = 1; // Linear audio-region amplitude; MIDI clips use unity.
-	std::string media; // Audio source ID.
-	std::vector<Note> notes; // Note times use offset.unit, relative to the source.
-};
-
-enum class TrackKind { Audio, MIDI, Folder, Bus };
 struct AutomationPoint {
 	double time = 0;
 	double value = 0;
@@ -71,6 +56,22 @@ struct Automation {
 	std::vector<AutomationPoint> points;
 };
 
+enum class ClipKind { Audio, MIDI };
+struct Clip {
+	std::string name;
+	std::string color;
+	ClipKind kind = ClipKind::Audio;
+	Time position;
+	double duration = 0; // Same unit as position.
+	Time offset; // Source time, independent of arrangement position.
+	bool enabled = true;
+	double gain = 1; // Linear audio-region amplitude; MIDI clips use unity.
+	Automation envelope {TimeUnit::Seconds, {}}; // Linear amplitude, seconds from the audible clip start.
+	std::string media; // Audio source ID.
+	std::vector<Note> notes; // Note times use offset.unit, relative to the source.
+};
+
+enum class TrackKind { Audio, MIDI, Folder, Bus };
 struct Track {
 	std::string id;
 	std::string name;
@@ -148,6 +149,10 @@ LIBARDOUR_API double convert_time (Time, TimeUnit, double tempo);
 LIBARDOUR_API void append_automation_segment (Automation&, double time, double value,
                                             const std::function<double (double)>& evaluate, double tolerance = 0.0001);
 LIBARDOUR_API Automation convert_automation (const Automation&, const TimeMap&, TimeUnit);
+LIBARDOUR_API double automation_value (const Automation&, double time);
+LIBARDOUR_API Automation slice_automation (const Automation&, double start, double end);
+LIBARDOUR_API Automation linearize_automation (const Automation&, double quantum);
+LIBARDOUR_API Automation multiply_automation (const Automation&, const Automation&, double quantum, double tolerance = 0.00001);
 LIBARDOUR_API void validate_project (const Project&);
 LIBARDOUR_API bool has_unsupported_features (const Project&);
 

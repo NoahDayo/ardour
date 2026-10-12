@@ -172,7 +172,7 @@ struct Parser {
 		return value;
 	}
 
-	void points (Node node, TimeUnit unit, bool arrangement = true)
+	void points (Node node, TimeUnit unit, bool arrangement = true, Automation* expression = nullptr)
 	{
 		attributes (node, {"id", "name", "color", "timeUnit", "unit"});
 		Node target = child (node, "Target");
@@ -188,15 +188,16 @@ struct Parser {
 			if (!is (item, "Target")) { values.push_back (item); }
 		}
 		if (values.empty ()) { return; }
-		if (!arrangement || mapped == automation_targets.end () || has (target, "channel") || has (target, "key") || has (target, "controller")) {
+		bool clip_gain = !arrangement && expression && attr (target, "expression") == "gain";
+		if ((!clip_gain && (!arrangement || mapped == automation_targets.end ())) || has (target, "channel") || has (target, "key") || has (target, "controller")) {
 			diagnostic (node, "Automation target is not yet converted"); return;
 		}
-		bool pan = mapped->second.second;
-		auto& track = project.tracks.at (track_indices.at (mapped->second.first));
-		auto& curve = pan ? track.pan_automation : track.volume_automation;
+		bool pan = !clip_gain && mapped->second.second;
+		Automation& curve = clip_gain ? *expression : (pan ? project.tracks.at (track_indices.at (mapped->second.first)).pan_automation
+		                                                : project.tracks.at (track_indices.at (mapped->second.first)).volume_automation);
 		if (!curve.points.empty ()) { throw ExchangeError ("Multiple automation timelines target the same mixer parameter"); }
 		curve.unit = unit;
-		std::string value_unit = attr (node, "unit", attr (parameter, "unit"));
+		std::string value_unit = attr (node, "unit", clip_gain ? "linear" : attr (parameter, "unit"));
 		bool decibel = !pan && value_unit == "decibel";
 		if ((pan && value_unit != "normalized") || (!pan && value_unit != "linear" && !decibel)) { throw ExchangeError ("Unsupported mixer automation unit"); }
 		double previous_time = -1, previous_value = 0;
@@ -377,7 +378,10 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active, Time orig
 	attributes (node, {"name", "color", "time", "duration", "contentTimeUnit", "playStart", "playStop", "enable", "reference",
 	                  "loopStart", "loopEnd", "fadeInTime", "fadeOutTime", "fadeTimeUnit"});
 	if (has (node, "loopStart") || has (node, "loopEnd")) { throw ExchangeError ("Looped clips require explicit expansion before exchange"); }
-	if (number (node, "fadeInTime") != 0 || number (node, "fadeOutTime") != 0) { diagnostic (node, "Clip fades are not yet converted"); }
+	double fade_in = number (node, "fadeInTime"), fade_out = number (node, "fadeOutTime");
+	if (fade_out < 0) { throw ExchangeError ("Negative fade-out duration"); }
+	if ((fade_in || fade_out) && !has (node, "fadeTimeUnit")) { throw ExchangeError ("Nonzero clip fades need an explicit fadeTimeUnit"); }
+	TimeUnit fade_unit = time_unit (node, "fadeTimeUnit", parent_unit);
 	Clip outer;
 	outer.name = attr (node, "name");
 	outer.color = color (node);
@@ -403,6 +407,20 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active, Time orig
 			diagnostic (node, "Clipped the region to its content playback stop", Disposition::Transformed);
 		}
 	}
+	if (fade_in < 0) {
+		Time earlier (timing->convert (outer.position, fade_unit) + fade_in, fade_unit);
+		double extension = timing->convert (outer.position, parent_unit) - timing->convert (earlier, parent_unit);
+		outer.offset.value -= timing->duration (Time (extension, parent_unit), earlier, outer.offset.unit);
+		outer.position = Time (timing->convert (earlier, parent_unit), parent_unit);
+		outer.duration += extension;
+		if (outer.position.value < 0 || outer.offset.value < 0) { throw ExchangeError ("Crossfade extends before available timeline or source media"); }
+		fade_in = -fade_in;
+		diagnostic (node, "Expanded negative fade-in using the preceding source handle", Disposition::Transformed);
+	}
+	Time source_offset = outer.offset;
+	double clip_start = timing->convert (outer.position, TimeUnit::Seconds);
+	double clip_length = timing->duration (Time (outer.duration, parent_unit), outer.position, TimeUnit::Seconds);
+	Automation expression;
 	std::vector<Node> contents = children (node);
 	Node content = NULL;
 	if (has (node, "reference")) {
@@ -421,7 +439,7 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active, Time orig
 		content_unit = time_unit (content, "timeUnit", content_unit);
 		Node playable = NULL;
 		for (Node item : children (content)) {
-			if (is (item, "Points")) { points (item, content_unit, false); continue; }
+			if (is (item, "Points")) { points (item, time_unit (item, "timeUnit", content_unit), false, &expression); continue; }
 			if (playable) { throw ExchangeError ("Parallel clip content lanes are not yet supported"); }
 			playable = item;
 		}
@@ -433,7 +451,7 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active, Time orig
 		outer.kind = ClipKind::Audio;
 		outer.media = audio (content);
 		outer.offset = Time (timing->content (outer.offset, outer.position, outer.offset, TimeUnit::Seconds), TimeUnit::Seconds);
-		result.push_back (std::move (outer));
+		result.push_back (outer);
 	} else if (is (content, "Notes")) {
 		attributes (content, {"id", "timeUnit"});
 		outer.kind = ClipKind::MIDI;
@@ -456,7 +474,7 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active, Time orig
 			if (!children (item).empty ()) { diagnostic (item, "Per-note expression is not yet converted"); }
 			outer.notes.push_back (note);
 		}
-		result.push_back (std::move (outer));
+		result.push_back (outer);
 	} else if (is (content, "Clips")) {
 		attributes (content, {"id", "timeUnit"});
 		TimeUnit unit = time_unit (content, "timeUnit", content_unit);
@@ -471,6 +489,7 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active, Time orig
 				double begin = std::max (start, inner_start);
 				double end = std::min (stop, inner_stop);
 				if (end <= begin) { continue; }
+				inner.envelope = slice_automation (inner.envelope, begin - inner_start, end - inner_start);
 				inner.offset.value += timing->duration (Time (begin - inner_start, TimeUnit::Seconds), inner.position, inner.offset.unit);
 				inner.position = Time (timing->convert (Time (begin, TimeUnit::Seconds), parent_unit), parent_unit);
 				inner.duration = timing->duration (Time (end - begin, TimeUnit::Seconds), inner.position, parent_unit);
@@ -484,6 +503,40 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active, Time orig
 	} else {
 		throw ExchangeError ("Unsupported clip content: " + std::string (reinterpret_cast<const char*> (content->name)));
 	}
+	Automation envelope; envelope.unit = TimeUnit::Seconds;
+	if (!expression.points.empty ()) {
+		Time origin (timing->convert (outer.position, source_offset.unit) - source_offset.value, source_offset.unit);
+		for (auto& p : expression.points) { p.time += timing->convert (origin, expression.unit); }
+		envelope = slice_automation (convert_automation (expression, *timing, TimeUnit::Seconds), clip_start, clip_start + clip_length);
+	}
+	for (auto& value : result) {
+		if (value.kind != ClipKind::Audio && (fade_in || fade_out || !envelope.points.empty ())) {
+			diagnostic (node, "Audio gain/fades on MIDI content require instrument rendering"); continue;
+		}
+		if (value.kind != ClipKind::Audio) { continue; }
+		auto source = std::find_if (project.media.begin (), project.media.end (), [&] (const Media& m) { return m.id == value.media; });
+		double quantum = 1.0 / source->sample_rate;
+		Automation combined = envelope;
+		for (bool in : {true, false}) {
+			double length = in ? fade_in : fade_out;
+			if (!length) { continue; }
+			double anchor = in ? timing->convert (outer.position, fade_unit)
+			                   : timing->convert (Time (clip_start + clip_length, TimeUnit::Seconds), fade_unit) - length;
+			double begin = timing->convert (Time (anchor, fade_unit), TimeUnit::Seconds) - clip_start;
+			double end = timing->convert (Time (anchor + length, fade_unit), TimeUnit::Seconds) - clip_start;
+			if (begin < -1e-8 || end > clip_length + 1e-8) { throw ExchangeError ("Fade extends outside clip"); }
+			Automation fade {fade_unit, {{anchor, in ? 0.0 : 1.0, true}, {anchor + length, in ? 1.0 : 0.0, true}}};
+			fade = slice_automation (convert_automation (fade, *timing, TimeUnit::Seconds), clip_start, clip_start + clip_length);
+			combined = multiply_automation (combined, fade, quantum);
+		}
+		if (!combined.points.empty ()) {
+			double begin = timing->convert (value.position, TimeUnit::Seconds) - clip_start;
+			double length = timing->duration (Time (value.duration, value.position.unit), value.position, TimeUnit::Seconds);
+			value.envelope = multiply_automation (value.envelope, slice_automation (combined, begin, begin + length), quantum);
+		}
+	}
+	if (fade_in || fade_out) { diagnostic (node, "Duration-only fades converted to linear-amplitude clip envelopes; DAW-specific fade shapes are not specified", Disposition::Transformed); }
+	if (!expression.points.empty ()) { diagnostic (node, "Clip gain expression mapped to an editable sample-timed envelope; holds use a one-sample transition", Disposition::Transformed); }
 	active.erase (node);
 	return result;
 }
@@ -686,7 +739,6 @@ struct Writer {
 
 	void clip (Node parent, const Clip& clip)
 	{
-		if (clip.gain != 1) { throw ExchangeError ("Audio region gain is not yet converted to DAWproject"); }
 		Node output = element (parent, "Clip");
 		property (output, "time", clip.position.value);
 		property (output, "duration", clip.duration);
@@ -697,13 +749,27 @@ struct Writer {
 		if (!clip.name.empty ()) { property (output, "name", clip.name); }
 		if (!clip.color.empty ()) { property (output, "color", clip.color); }
 		if (clip.kind == ClipKind::Audio) {
-			if (!written_media.insert (clip.media).second) {
+			bool first = written_media.insert (clip.media).second;
+			bool processing = clip.gain != 1 || !clip.envelope.points.empty ();
+			if (!first && !processing) {
 				property (output, "reference", media_ids.at (clip.media));
 				return;
 			}
 			auto source = std::find_if (project.media.begin (), project.media.end (), [&] (const Media& m) { return m.id == clip.media; });
-			Node audio = element (output, "Audio");
-			property (audio, "id", media_ids.at (clip.media));
+			Node content = output;
+			if (processing) {
+				content = element (output, "Lanes"); property (content, "timeUnit", "seconds");
+				Node points = element (content, "Points"); property (points, "unit", "linear");
+				property (element (points, "Target"), "expression", "gain");
+				auto curve = clip.envelope;
+				if (curve.points.empty ()) { curve.points.push_back ({0, 1, true}); }
+				for (auto const& point : curve.points) {
+					Node p = element (points, "RealPoint"); property (p, "time", clip.offset.value + point.time);
+					property (p, "value", clip.gain * point.value); property (p, "interpolation", point.linear ? "linear" : "hold");
+				}
+			}
+			Node audio = element (content, "Audio");
+			if (first) { property (audio, "id", media_ids.at (clip.media)); }
 			property (audio, "timeUnit", "seconds");
 			property (audio, "duration", source->duration);
 			property (audio, "sampleRate", source->sample_rate);

@@ -217,6 +217,33 @@ class LogicWriterTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('collide', result.stderr)
 
+    def test_clip_gain_envelopes(self):
+        for track in self.root.findall('AudioTrack'):
+            clip = track.find('Clip')
+            curve = ET.SubElement(clip, 'GainAutomation')
+            for at, value in ((0, .2), (.1, 1.4), (.3, .5), (.5, 0)):
+                ET.SubElement(curve, 'Point', time=str(at), value=str(value), linear='true')
+        result = self.run_writer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        extracted = self.directory / 'envelope-audio'
+        extracted.mkdir()
+        result = subprocess.run([self.probe, str(self.output / 'Project.aaf'), str(extracted)], capture_output=True, text=True, encoding='utf-8', timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for track in json.loads(result.stdout)['tracks']:
+            clip = track['clips'][0]
+            self.assertEqual(clip['envelope_length'], 24000)
+            for actual, expected in zip(clip['envelope'], ((0, .075), (.2, .525), (.6, .1875), (1, 0))):
+                self.assertAlmostEqual(actual[0], expected[0])
+                self.assertAlmostEqual(actual[1], expected[1])
+            self.assertEqual(len(clip['envelope']), 4)
+
+    def test_rejects_clip_envelope_outside_range(self):
+        curve = ET.SubElement(self.root.find('AudioTrack/Clip'), 'GainAutomation')
+        ET.SubElement(curve, 'Point', time='0.6', value='.5', linear='true')
+        result = self.run_writer()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('outside clip', result.stderr)
+
     def test_refuses_existing_output(self):
         sentinel = self.output / "Project.aaf"
         sentinel.write_bytes(b"existing project")

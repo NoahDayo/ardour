@@ -82,6 +82,12 @@ static void dump (const Project& p)
 			std::cout << ",\"color\":"; quoted (c.color);
 			std::cout << ",\"kind\":" << static_cast<int> (c.kind) << ",\"position\":"; time_json (c.position);
 			std::cout << ",\"duration\":" << c.duration << ",\"offset\":"; time_json (c.offset);
+			std::cout << ",\"gain\":" << c.gain << ",\"envelope\":[";
+			for (size_t i = 0; i < c.envelope.points.size (); ++i) {
+				auto const& point = c.envelope.points[i]; if (i) { std::cout << ','; }
+				std::cout << '[' << point.time << ',' << point.value << ',' << (point.linear ? "true" : "false") << ']';
+			}
+			std::cout << ']';
 			std::cout << ",\"enabled\":" << (c.enabled ? "true" : "false") << ",\"media\":"; quoted (c.media);
 			std::cout << ",\"notes\":[";
 			bool first_note = true;
