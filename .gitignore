@@ -152,3 +152,6 @@ waf3-*
 
 # misc custom files git should ignore
 /local
+
+# Local build and test evidence for the project exchange mod.
+/build-evidence/

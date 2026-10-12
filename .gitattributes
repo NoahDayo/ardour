@@ -1,2 +1,8 @@
 /* export-ignore
 /README-GITHUB.txt -export-ignore
+
+# Shell entry points and templates must run from Windows checkouts as well.
+*.sh text eol=lf
+*.sh.in text eol=lf
+/gtk2_ardour/ardev text eol=lf
+/tools/project-exchange/msys2-packages.txt text eol=lf
