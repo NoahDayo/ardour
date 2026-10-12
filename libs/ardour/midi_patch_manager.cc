@@ -46,16 +46,25 @@ MidiPatchManager* MidiPatchManager::_manager = 0;
 MidiPatchManager::MidiPatchManager ()
 	: no_patch_changed_messages (false)
 	, stop_thread (false)
+	, _midnam_load_thread (nullptr)
 {
 	add_search_path (midi_patch_search_path ());
 }
 
 MidiPatchManager::~MidiPatchManager ()
 {
-	_manager = 0;
-
 	stop_thread = true;
-	_midnam_load_thread->join ();
+	if (_midnam_load_thread) {
+		_midnam_load_thread->join ();
+		delete _midnam_load_thread;
+	}
+	_manager = 0;
+}
+
+void
+MidiPatchManager::destroy ()
+{
+	delete _manager;
 }
 
 void
@@ -279,18 +288,19 @@ MidiPatchManager::load_midnams ()
 	{
 		PBD::Unwinder<bool> npc (no_patch_changed_messages, true);
 		for (Searchpath::const_iterator i = _search_path.begin(); i != _search_path.end(); ++i) {
+			if (stop_thread) { break; }
 			PBD::Mutex::Lock lm (_lock);
 			add_midnam_files_from_directory (*i);
 		}
 	}
 
-	PatchesChanged (); /* EMIT SIGNAL */
+	if (!stop_thread) { PatchesChanged (); /* EMIT SIGNAL */ }
 }
 
 void
 MidiPatchManager::load_midnams_in_thread ()
 {
-	if (!g_getenv ("ARDOUR_NO_PATCHFILES")) {
+	if (!_midnam_load_thread && !g_getenv ("ARDOUR_NO_PATCHFILES")) {
 		_midnam_load_thread = PBD::Thread::create (std::bind (&MidiPatchManager::load_midnams, this), "MIDNAMLoader");
 	}
 }

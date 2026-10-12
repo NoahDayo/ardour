@@ -23,6 +23,8 @@
 #ifndef MIDI_PATCH_MANAGER_H_
 #define MIDI_PATCH_MANAGER_H_
 
+#include <atomic>
+
 #include "midi++/midnam_patch.h"
 
 #include "pbd/event_loop.h"
@@ -60,6 +62,7 @@ public:
 		}
 		return *_manager;
 	}
+	static void destroy ();
 
 	PBD::Signal<void()> PatchesChanged;
 
@@ -171,7 +174,7 @@ private:
 
 	PBD::Mutex _lock;
 	bool no_patch_changed_messages;
-	bool stop_thread;
+	std::atomic<bool> stop_thread;
 	PBD::Thread* _midnam_load_thread;
 	void load_midnams ();
 };

@@ -853,6 +853,10 @@ ARDOUR::cleanup ()
 	ARDOUR::AudioEngine::destroy ();
 	ARDOUR::TransportMasterManager::destroy ();
 
+	/* The patch loader parses XML in the background. It must finish before
+	 * lrdf_cleanup() releases libxml's process-wide state. */
+	MIDI::Name::MidiPatchManager::destroy ();
+
 	delete Library;
 #ifdef HAVE_LRDF
 	lrdf_cleanup ();

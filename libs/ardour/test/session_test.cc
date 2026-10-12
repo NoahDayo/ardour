@@ -3,6 +3,8 @@
 #include <glibmm/miscutils.h>
 
 #include <stdexcept>
+#include <chrono>
+#include <future>
 
 #include "pbd/textreceiver.h"
 #include "pbd/file_utils.h"
@@ -10,6 +12,8 @@
 #include "ardour/audioengine.h"
 #include "ardour/smf_source.h"
 #include "ardour/midi_model.h"
+#include "ardour/midi_patch_manager.h"
+#include "ardour/search_paths.h"
 
 #include "test_util.h"
 
@@ -20,6 +24,54 @@ CPPUNIT_TEST_SUITE_REGISTRATION (SessionTest);
 using namespace std;
 using namespace ARDOUR;
 using namespace PBD;
+
+void
+SessionTest::midnam_shutdown ()
+{
+	using MIDI::Name::MidiPatchManager;
+	/* Stop the loader started by ARDOUR::init(), then cover both destruction
+	 * without a worker and repeated cleanup without creating a new singleton. */
+	MidiPatchManager::destroy ();
+	MidiPatchManager::instance ();
+	MidiPatchManager::destroy ();
+	MidiPatchManager::destroy ();
+
+	auto& manager = MidiPatchManager::instance ();
+	manager.remove_search_path (midi_patch_search_path ());
+	if (g_getenv ("ARDOUR_NO_PATCHFILES")) {
+		manager.load_midnams_in_thread ();
+		MidiPatchManager::destroy ();
+		return;
+	}
+
+	std::promise<void> entered, release;
+	auto entered_future = entered.get_future ();
+	auto release_future = release.get_future ();
+	PBD::ScopedConnection connection;
+	manager.PatchesChanged.connect_same_thread (connection, [&] {
+		entered.set_value ();
+		release_future.wait ();
+	});
+	manager.load_midnams_in_thread ();
+	bool running = entered_future.wait_for (std::chrono::seconds (5)) == std::future_status::ready;
+	if (!running) {
+		release.set_value ();
+		MidiPatchManager::destroy ();
+		CPPUNIT_FAIL ("MIDI patch worker did not reach the shutdown test barrier");
+	}
+	std::promise<void> stopping;
+	auto stopping_future = stopping.get_future ();
+	auto finished = std::async (std::launch::async, [&] {
+		stopping.set_value ();
+		MidiPatchManager::destroy ();
+	});
+	stopping_future.wait ();
+	bool waited = finished.wait_for (std::chrono::milliseconds (50)) == std::future_status::timeout;
+	/* Release before asserting, so a failing assertion cannot strand the worker. */
+	release.set_value ();
+	finished.get ();
+	CPPUNIT_ASSERT_MESSAGE ("Shutdown returned while the patch worker was still active", waited);
+}
 
 void
 SessionTest::new_session ()
