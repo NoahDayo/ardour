@@ -184,6 +184,7 @@ libardour_sources = [
         'presentation_info.cc',
         'process_thread.cc',
         'processor.cc',
+        'project_archive.cc',
         'quantize.cc',
         'rc_configuration.cc',
         'readable.cc',
@@ -302,6 +303,7 @@ def configure(conf):
     autowaf.check_pkg(conf, 'aubio', uselib_store='AUBIO4',
                       atleast_version='0.4.0', mandatory=False)
     autowaf.check_pkg(conf, 'libxml-2.0', uselib_store='XML')
+    autowaf.check_pkg(conf, 'libarchive', uselib_store='ARCHIVE', atleast_version='3.2.0')
     if not Options.options.no_lrdf:
         autowaf.check_pkg(conf, 'lrdf', uselib_store='LRDF',
                           atleast_version='0.4.0', mandatory=False)
@@ -407,7 +409,7 @@ def build(bld):
     obj.target       = 'ardour'
     obj.uselib       = ['GLIBMM','GTHREAD','AUBIO','SIGCPP','XML','UUID', 'LO', 'USB',
                         'SNDFILE','SAMPLERATE','LRDF','AUDIOUNITS', 'GIOMM', 'FFTW3F',
-                        'LILV','SERD','SORD', 'SRATOM',
+                        'LILV','SERD','SORD', 'SRATOM', 'ARCHIVE',
                         'OSX','BOOST','CURL','TAGLIB','VAMPSDK','VAMPHOSTSDK','RUBBERBAND']
     obj.use          = ['libpbd','libmidipp','libevoral',
                         'libaudiographer',
