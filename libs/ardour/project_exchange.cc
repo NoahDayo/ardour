@@ -51,6 +51,10 @@ validate_project (const Project& project)
 	         (project.denominator & (project.denominator - 1)) == 0, "Invalid project meter");
 	text (project.application);
 	text (project.application_version);
+	for (auto const& marker : project.markers) {
+		text (marker.name);
+		require (nonnegative (marker.position.value), "Invalid marker time");
+	}
 	std::map<std::string, const Media*> media;
 	std::set<std::string> paths;
 	std::set<std::string> ids;

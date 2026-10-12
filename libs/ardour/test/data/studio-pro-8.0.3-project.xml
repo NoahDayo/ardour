@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Project version="0.1">
+	<Application version="8.0.3.111164" name="Studio Pro"/>
+	<Transport>
+		<Tempo id="id0" value="120.000000" max="400.000000" min="10.000000" unit="bpm"/>
+		<TimeSignature id="id1" numerator="4" denominator="4"/>
+	</Transport>
+	<Structure>
+		<Track id="id2" contentType="audio" loaded="true" name="Soft pulse" color="#DC8855FF">
+			<Channel id="id3" role="regular" audioChannels="2" destination="id12">
+				<Volume id="id4" unit="linear" min="0.000000" max="3.162200" value="1.000000"/>
+				<Pan id="id5" unit="normalized" min="0.000000" max="1.000000" value="0.500000"/>
+			</Channel>
+		</Track>
+		<Track id="id6" contentType="audio" loaded="true" name="Chords" color="#55AACCFF">
+			<Channel id="id7" role="regular" audioChannels="2" destination="id12">
+				<Volume id="id8" unit="linear" min="0.000000" max="3.162200" value="1.000000"/>
+				<Pan id="id9" unit="normalized" min="0.000000" max="1.000000" value="0.500000"/>
+			</Channel>
+		</Track>
+		<Track id="id10" contentType="notes" loaded="true" name="MIDI notes" color="#88BB55FF">
+			<Channel id="id11" role="regular"/>
+		</Track>
+		<Channel id="id12" role="master" name="Main" audioChannels="2"/>
+	</Structure>
+	<Arrangement id="id13">
+		<Lanes id="id14" timeUnit="beats">
+			<Lanes id="id16" track="id2">
+				<Clips id="id17">
+					<Clip name="Soft pulse" contentTimeUnit="seconds" fadeTimeUnit="seconds" time="0.000000" playStop="16.000000"
+					      playStart="0.000000">
+						<Clips id="id18" timeUnit="seconds">
+							<Clip contentTimeUnit="seconds" fadeTimeUnit="seconds" time="0.000000" duration="16.000000">
+								<Audio id="id19" sampleRate="48000" duration="16.000000" channels="2">
+									<File external="false" path="audio/track1(2).wav"/>
+								</Audio>
+							</Clip>
+						</Clips>
+					</Clip>
+				</Clips>
+				<Points id="id20" color="#29D8FFFF" name="Volume" unit="linear">
+					<Target parameter="id4"/>
+				</Points>
+				<Points id="id21" color="#3AFFC7FF" name="Pan L/R" unit="normalized">
+					<Target parameter="id5"/>
+				</Points>
+			</Lanes>
+			<Lanes id="id22" track="id6">
+				<Clips id="id23">
+					<Clip name="Chords" contentTimeUnit="seconds" fadeTimeUnit="seconds" time="0.000000" playStop="16.000000"
+					      playStart="0.000000">
+						<Clips id="id24" timeUnit="seconds">
+							<Clip contentTimeUnit="seconds" fadeTimeUnit="seconds" time="0.000000" duration="16.000000">
+								<Audio id="id25" sampleRate="48000" duration="16.000000" channels="2">
+									<File external="false" path="audio/track2(2).wav"/>
+								</Audio>
+							</Clip>
+						</Clips>
+					</Clip>
+				</Clips>
+				<Points id="id26" color="#29D8FFFF" name="Volume" unit="linear">
+					<Target parameter="id8"/>
+				</Points>
+				<Points id="id27" color="#3AFFC7FF" name="Pan L/R" unit="normalized">
+					<Target parameter="id9"/>
+				</Points>
+			</Lanes>
+			<Lanes id="id28" track="id10">
+				<Clips id="id29">
+					<Clip name="MIDI notes" contentTimeUnit="beats" fadeTimeUnit="beats" time="0.000000" duration="32.000000"
+					      playStart="0.000000">
+						<Lanes id="id30">
+							<Notes id="id31">
+								<Note time="0.000000" duration="0.750000" key="60" vel="0.650000"/>
+								<Note time="1.000000" duration="0.750000" key="64" vel="0.650000"/>
+								<Note time="2.000000" duration="0.750000" key="67" vel="0.650000"/>
+								<Note time="3.000000" duration="0.750000" key="72" vel="0.650000"/>
+								<Note time="4.000000" duration="0.750000" key="60" vel="0.650000"/>
+								<Note time="5.000000" duration="0.750000" key="64" vel="0.650000"/>
+								<Note time="6.000000" duration="0.750000" key="67" vel="0.650000"/>
+								<Note time="7.000000" duration="0.750000" key="72" vel="0.650000"/>
+								<Note time="8.000000" duration="0.750000" key="60" vel="0.650000"/>
+								<Note time="9.000000" duration="0.750000" key="64" vel="0.650000"/>
+								<Note time="10.000000" duration="0.750000" key="67" vel="0.650000"/>
+								<Note time="11.000000" duration="0.750000" key="72" vel="0.650000"/>
+								<Note time="12.000000" duration="0.750000" key="60" vel="0.650000"/>
+								<Note time="13.000000" duration="0.750000" key="64" vel="0.650000"/>
+								<Note time="14.000000" duration="0.750000" key="67" vel="0.650000"/>
+								<Note time="15.000000" duration="0.750000" key="72" vel="0.650000"/>
+								<Note time="16.000000" duration="0.750000" key="60" vel="0.650000"/>
+								<Note time="17.000000" duration="0.750000" key="64" vel="0.650000"/>
+								<Note time="18.000000" duration="0.750000" key="67" vel="0.650000"/>
+								<Note time="19.000000" duration="0.750000" key="72" vel="0.650000"/>
+								<Note time="20.000000" duration="0.750000" key="60" vel="0.650000"/>
+								<Note time="21.000000" duration="0.750000" key="64" vel="0.650000"/>
+								<Note time="22.000000" duration="0.750000" key="67" vel="0.650000"/>
+								<Note time="23.000000" duration="0.750000" key="72" vel="0.650000"/>
+								<Note time="24.000000" duration="0.750000" key="60" vel="0.650000"/>
+								<Note time="25.000000" duration="0.750000" key="64" vel="0.650000"/>
+								<Note time="26.000000" duration="0.750000" key="67" vel="0.650000"/>
+								<Note time="27.000000" duration="0.750000" key="72" vel="0.650000"/>
+								<Note time="28.000000" duration="0.750000" key="60" vel="0.650000"/>
+								<Note time="29.000000" duration="0.750000" key="64" vel="0.650000"/>
+								<Note time="30.000000" duration="0.750000" key="67" vel="0.650000"/>
+								<Note time="31.000000" duration="0.750000" key="72" vel="0.650000"/>
+							</Notes>
+						</Lanes>
+					</Clip>
+				</Clips>
+			</Lanes>
+		</Lanes>
+		<Markers id="id15" timeUnit="beats">
+			<Marker time="0.000000" name="Start"/>
+			<Marker time="600.000000" name="End"/>
+		</Markers>
+	</Arrangement>
+	<Scenes/>
+</Project>

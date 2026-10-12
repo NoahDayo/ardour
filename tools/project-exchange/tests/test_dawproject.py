@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Independent DAWproject fixtures; these are not exports from a target DAW."""
+"""Independent fixtures plus project XML from an actual Studio Pro export."""
 import argparse
 import hashlib
 import io
@@ -195,6 +195,58 @@ class DawProjectTest(unittest.TestCase):
         xml = PROJECT.replace('<Notes>', '<Notes timeUnit="seconds">')
         project = self.parse(xml)
         self.assertEqual(project["tracks"][2]["clips"][0]["offset"], [0.6, "seconds"])
+
+    def studio_pro_xml(self):
+        path = Path(__file__).resolve().parents[3] / "libs/ardour/test/data/studio-pro-8.0.3-project.xml"
+        return path.read_text(encoding="utf-8-sig")
+
+    def test_actual_studio_pro_export_structure(self):
+        before = self.parse(self.studio_pro_xml())
+        self.assertFalse(any(d["disposition"] == 3 for d in before["report"]))
+        self.assertEqual([t["name"] for t in before["tracks"]], ["Soft pulse", "Chords", "MIDI notes", "Main"])
+        self.assertEqual([t["color"] for t in before["tracks"][:3]], ["#DC8855", "#55AACC", "#88BB55"])
+        self.assertEqual(before["markers"], [{"name": "Start", "position": [0, "beats"]}, {"name": "End", "position": [600, "beats"]}])
+        for track in before["tracks"][:2]:
+            clip = track["clips"][0]
+            self.assertEqual((clip["position"], clip["duration"], clip["offset"]), ([0, "beats"], 32, [0, "seconds"]))
+            self.assertEqual(clip["name"], track["name"])
+        notes = before["tracks"][2]["clips"][0]["notes"]
+        self.assertEqual(len(notes), 32)
+        for index, note in enumerate(notes):
+            self.assertEqual(note, [index, .75, (60, 64, 67, 72)[index % 4], 0, .65, .5])
+        output = self.root / "studio-pro-roundtrip.xml"
+        self.command("rewrite", self.input, output)
+        self.assert_schema(output)
+        self.assertEqual(self.semantic(before), self.semantic(json.loads(self.command("parse", output).stdout)))
+
+    def test_nested_note_lane_time_units(self):
+        xml = PROJECT.replace('<Notes>', '<Lanes timeUnit="seconds"><Lanes><Notes>').replace('</Notes>', '</Notes></Lanes></Lanes>')
+        clip = self.parse(xml)["tracks"][2]["clips"][0]
+        self.assertEqual(clip["offset"], [0.6, "seconds"])
+        self.assertEqual(clip["notes"][1], [1, .5, 67, 3, .6, .2])
+        parallel = xml.replace('</Notes>', '</Notes><Notes/>', 1)
+        self.assertIn("Parallel", self.parse(parallel, status=1).stderr)
+
+    def test_empty_automation_is_harmless_but_points_are_reported(self):
+        root = ET.fromstring(self.studio_pro_xml())
+        points = root.find('.//Points')
+        ET.SubElement(points, 'RealPoint', time='1', value='.7')
+        parsed = self.parse(ET.tostring(root, encoding='unicode'))
+        self.assertTrue(any(d['disposition'] == 3 and 'Automation points' in d['detail'] for d in parsed['report']))
+        self.command('rewrite', self.input, self.root / 'blocked.xml', status=1)
+        self.parse(self.studio_pro_xml().replace('parameter="id4"', 'parameter="missing"'), status=1)
+        self.parse(self.studio_pro_xml().replace('<Target parameter="id4"/>', ''), status=1)
+
+    def test_markers_and_rgba_color_validation(self):
+        self.parse(self.studio_pro_xml().replace('time="600.000000"', 'time="-1"'), status=1)
+        self.parse(self.studio_pro_xml().replace('time="600.000000"', 'time="NaN"'), status=1)
+        self.parse(self.studio_pro_xml().replace('#DC8855FF', 'invalid'), status=1)
+        parsed = self.parse(self.studio_pro_xml().replace('#DC8855FF', '#DC885580'))
+        self.assertTrue(any(d['disposition'] == 3 and 'transparency' in d['detail'] for d in parsed['report']))
+        xml = self.studio_pro_xml().replace('<Marker time="600.000000"', '<Marker vendorExtension="unmapped" time="600.000000"')
+        self.assertTrue(any(d['disposition'] == 3 for d in self.parse(xml)['report']))
+        parsed = self.parse(self.studio_pro_xml().replace('<Markers id="id15" timeUnit="beats">', '<Markers id="id15" timeUnit="seconds">'))
+        self.assertEqual(parsed['markers'][1]['position'], [600, 'seconds'])
 
     def test_whitespace_and_decibel_gain(self):
         xml = PROJECT.replace('value="100"', 'value=" 100 "').replace('unit="linear" value="0.8"', 'unit="decibel" value="-6.020599913279624"')

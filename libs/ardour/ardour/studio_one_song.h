@@ -8,10 +8,7 @@
 
 namespace ARDOUR { namespace ProjectExchange {
 
-struct SongMarker {
-	std::string name;
-	Time position;
-};
+using SongMarker = Marker;
 
 /* Native .song data. External media is resolved only inside the selected
  * song's directory, including after that directory has been relocated. */

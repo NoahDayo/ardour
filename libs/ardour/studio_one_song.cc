@@ -463,6 +463,7 @@ StudioOneSongData Reader::read ()
 	for (Node n : children (child (root_node, "List", "Tracks"))) { if (is (n, "MediaTrack")) { destinations[value (child (n, "UID", "channelID"), "uid")] = value (n, "trackID"); } }
 	for (auto& t : result.project.tracks) { auto i = destinations.find (t.destination); if (i != destinations.end ()) { t.destination = i->second; } }
 	if (result.has_range) { require (convert_time (result.end, TimeUnit::Seconds, result.project.tempo) > convert_time (result.start, TimeUnit::Seconds, result.project.tempo), "Invalid native song boundaries"); }
+	result.project.markers = result.markers;
 	validate_project (result.project);
 	result.project.report.push_back ({Disposition::Preserved, "Native Studio One song", "Audio, MIDI notes, clip positions, track names, colors, static mixer controls and constant tempo/meter read directly from the .song file"});
 	return result;

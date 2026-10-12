@@ -141,7 +141,7 @@ void native_package (Fixture& fixture, bool processing = false)
 	song.add_text ("Song/song.xml", std::string (R"(<Song><Attributes x:id="Root"><Attributes x:id="timeContext">
 <TempoMap x:id="tempoMap"><TempoMapSegment start="0" tempo="0.6"/></TempoMap>
 <TimeSignatureMap x:id="timeSignatureMap"><TimeSignatureMapSegment start="0" numerator="3" denominator="4"/></TimeSignatureMap>
-</Attributes><List x:id="Tracks"><MarkerTrack timeFormat="2"><MarkerEvent markerType="2"/><MarkerEvent markerType="3" start="12"/></MarkerTrack>
+</Attributes><List x:id="Tracks"><MarkerTrack timeFormat="2"><MarkerEvent markerType="2"/><MarkerEvent markerType="3" start="12"/><MarkerEvent name="Verse" start="8"/></MarkerTrack>
 <MediaTrack trackID="audio" mediaType="Audio" name="Native audio" timeFormat="0" color="FF34AB12"><UID x:id="channelID" uid="channel"/>
 <List x:id="Events"><AudioEvent clipID="media" start="1.25" length="0.5" offset="0.375" name="Native clip" gain=")") + (processing ? "0.5" : "1") + R"("/></List></MediaTrack></List></Attributes></Song>)");
 	song.add_text ("Song/mediapool.xml", "<MediaPool><Attributes x:id=\"documentPath\" url=\"" + uri (fixture.path ("input.song")) + "\"/><AudioClip mediaID=\"media\"><Url x:id=\"path\" url=\"" + uri (fixture.path ("source.wav")) + "\"/><Attributes x:id=\"format\" sampleRate=\"" + std::to_string (project.media[0].sample_rate) + "\" numChannels=\"2\" frameCount=\"" + std::to_string (project.media[0].sample_rate * 2) + "\"/></AudioClip></MediaPool>");
@@ -181,6 +181,8 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (native_song_import);
 	CPPUNIT_TEST (native_song_cancel);
 	CPPUNIT_TEST (native_song_unsupported);
+	CPPUNIT_TEST (marker_roundtrip);
+	CPPUNIT_TEST (studio_pro_export);
 	CPPUNIT_TEST_SUITE_END ();
 public:
 	void roundtrip ();
@@ -197,9 +199,139 @@ public:
 	void native_song_import ();
 	void native_song_cancel ();
 	void native_song_unsupported ();
+	void marker_roundtrip ();
+	void studio_pro_export ();
 };
 
 CPPUNIT_TEST_SUITE_REGISTRATION (ProjectSessionTest);
+
+void ProjectSessionTest::marker_roundtrip ()
+{
+	Fixture fixture;
+	auto input = example (fixture);
+	input.markers = {{"Intro", PX::Time (0)}, {u8"Refrain 音楽", PX::Time (12.5)}, {"Cue", PX::Time (2.1, PX::TimeUnit::Seconds)}};
+	package (fixture, input);
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"), fixture.path ("Markers"), "Markers", fixture.report);
+	CPPUNIT_ASSERT (!fixture.session->unnamed ());
+	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& item) {
+		return item.disposition == PX::Disposition::Transformed && item.detail.find ("Marker converted to the session time basis") != std::string::npos;
+	}));
+	AudioEngine::instance ()->remove_session ();
+	fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("Markers"), "Markers", nullptr, "", true));
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("markers.dawproject"));
+	auto output = PX::DawProject::read (fixture.path ("markers.dawproject"));
+	CPPUNIT_ASSERT_EQUAL (input.markers.size (), output.markers.size ());
+	for (size_t i = 0; i < input.markers.size (); ++i) {
+		CPPUNIT_ASSERT_EQUAL (input.markers[i].name, output.markers[i].name);
+		CPPUNIT_ASSERT (output.markers[i].position.unit == PX::TimeUnit::Beats);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (PX::convert_time (input.markers[i].position, PX::TimeUnit::Beats, input.tempo), output.markers[i].position.value, 1e-6);
+	}
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (7.5, double (fixture.session->locations ()->session_range_location ()->end_sample ()) / fixture.session->sample_rate (), 1e-6);
+	auto sample_position = Temporal::timepos_t (fixture.session->sample_rate () * 3);
+	auto sample_marker = new Location (*fixture.session, sample_position, sample_position, "Sample marker", Location::IsMark);
+	sample_marker->set_time_domain (Temporal::AudioTime);
+	fixture.session->locations ()->add (sample_marker);
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("mixed-markers.dawproject"), fixture.report);
+	auto mixed = PX::DawProject::read (fixture.path ("mixed-markers.dawproject"));
+	CPPUNIT_ASSERT_EQUAL (size_t (4), mixed.markers.size ());
+	for (auto const& marker : mixed.markers) {
+		CPPUNIT_ASSERT (marker.position.unit == PX::TimeUnit::Seconds);
+		double expected = marker.name == "Intro" ? 0 : (marker.name == "Sample marker" ? 3 : (marker.name == "Cue" ? 2.1 : 7.5));
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (expected, marker.position.value, 1e-6);
+	}
+	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& item) {
+		return item.disposition == PX::Disposition::Transformed && item.object == "Markers";
+	}));
+	auto start = Temporal::timepos_t (0), end = Temporal::timepos_t (fixture.session->sample_rate ());
+	fixture.session->locations ()->add (new Location (*fixture.session, start, end, "Range", Location::IsRangeMarker));
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("unsupported-range.dawproject"), fixture.report), PX::ExchangeError);
+	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("unsupported-range.dawproject"), Glib::FILE_TEST_EXISTS));
+}
+
+void ProjectSessionTest::studio_pro_export ()
+{
+	Fixture fixture;
+	std::string archive_path;
+	if (const char* external = g_getenv ("ARDOUR_STUDIO_PRO_TEST_PROJECT")) {
+		archive_path = external;
+		std::cout << "\nTesting actual Studio Pro DAWproject: " << archive_path << std::endl;
+	} else {
+		/* This XML is a Studio Pro 8.0.3.111164 export. The default test's
+		 * audio is synthesized; an explicit package can test actual media. */
+		std::string xml = Glib::file_get_contents (Glib::build_filename (test_search_path ().front (), "studio-pro-8.0.3-project.xml"));
+		auto model = PX::DawProject::parse_xml (xml);
+		archive_path = fixture.path ("studio-pro.dawproject");
+		PX::ProjectArchiveWriter archive (archive_path);
+		archive.add_text ("project.xml", xml);
+		for (size_t i = 0; i < model.media.size (); ++i) {
+			auto const& media = model.media[i];
+			SF_INFO info = {};
+			info.channels = media.channels; info.samplerate = media.sample_rate; info.format = SF_FORMAT_WAV | SF_FORMAT_FLOAT;
+			std::string path = fixture.path ("studio-" + std::to_string (i) + ".wav");
+			SNDFILE* file = sf_open (path.c_str (), SFM_WRITE, &info);
+			CPPUNIT_ASSERT (file);
+			std::vector<float> block (4096 * media.channels);
+			for (size_t sample = 0; sample < block.size (); ++sample) { block[sample] = float (int ((sample + i * 13) % 101) - 50) / 128; }
+			sf_count_t frames = std::llround (media.duration * media.sample_rate);
+			for (sf_count_t at = 0; at < frames; at += 4096) {
+				sf_count_t count = std::min (sf_count_t (4096), frames - at);
+				CPPUNIT_ASSERT_EQUAL (count, sf_writef_float (file, block.data (), count));
+			}
+			CPPUNIT_ASSERT_EQUAL (0, sf_close (file));
+			archive.add_file (media.path, path);
+		}
+		archive.finish ();
+	}
+	auto input = PX::DawProject::read (archive_path);
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), archive_path, fixture.path ("Studio"), "Studio", fixture.report);
+	CPPUNIT_ASSERT (!fixture.session->unnamed ());
+	CPPUNIT_ASSERT (Glib::file_get_contents (fixture.path ("Studio/Studio.ardour")).find ("Master/audio_in") == std::string::npos);
+	AudioEngine::instance ()->remove_session ();
+	fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("Studio"), "Studio", nullptr, "", true));
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("studio-output.dawproject"));
+	auto output = PX::DawProject::read (fixture.path ("studio-output.dawproject"));
+	CPPUNIT_ASSERT_EQUAL (size_t (4), output.tracks.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (2), output.media.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (2), output.markers.size ());
+	CPPUNIT_ASSERT_EQUAL (std::string ("Start"), output.markers[0].name);
+	CPPUNIT_ASSERT_EQUAL (std::string ("End"), output.markers[1].name);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (300, PX::convert_time (output.markers[1].position, PX::TimeUnit::Seconds, output.tempo), 1e-6);
+	CPPUNIT_ASSERT_EQUAL (std::string ("#dc8855"), track_named (output, "Soft pulse").color);
+	auto const& notes = track_named (output, "MIDI notes").clips[0].notes;
+	CPPUNIT_ASSERT_EQUAL (size_t (32), notes.size ());
+	int keys[] = {60, 64, 67, 72};
+	for (size_t i = 0; i < notes.size (); ++i) {
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (double (i), notes[i].time, 1e-6);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (0.75, notes[i].duration, 1e-6);
+		CPPUNIT_ASSERT_EQUAL (keys[i % 4], notes[i].key);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (83.0 / 127, notes[i].velocity, 1e-6);
+	}
+	for (auto const& name : {"Soft pulse", "Chords"}) {
+		auto const& before = track_named (input, name).clips[0];
+		auto const& after = track_named (output, name).clips[0];
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (0, after.position.value, 1e-6);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (16, PX::convert_time (PX::Time (after.duration, after.position.unit), PX::TimeUnit::Seconds, output.tempo), 1e-6);
+		auto in_media = std::find_if (input.media.begin (), input.media.end (), [&] (const PX::Media& m) { return m.id == before.media; });
+		auto out_media = std::find_if (output.media.begin (), output.media.end (), [&] (const PX::Media& m) { return m.id == after.media; });
+		CPPUNIT_ASSERT (in_media != input.media.end () && out_media != output.media.end ());
+		PX::ProjectArchive (archive_path).copy_file (in_media->path, fixture.path ("before.wav"));
+		PX::ProjectArchive (fixture.path ("studio-output.dawproject")).copy_file (out_media->path, fixture.path ("after.wav"));
+		{
+			SndFileImportableSource original (fixture.path ("before.wav")), converted (fixture.path ("after.wav"));
+			CPPUNIT_ASSERT_EQUAL (original.length (), converted.length ());
+			CPPUNIT_ASSERT_EQUAL (original.channels (), converted.channels ());
+			std::vector<float> a (original.length () * original.channels ()), b (a.size ());
+			CPPUNIT_ASSERT_EQUAL (samplecnt_t (a.size ()), original.read (a.data (), a.size ()));
+			CPPUNIT_ASSERT_EQUAL (samplecnt_t (b.size ()), converted.read (b.data (), b.size ()));
+			CPPUNIT_ASSERT (a == b);
+		}
+		CPPUNIT_ASSERT_EQUAL (0, g_unlink (fixture.path ("before.wav").c_str ()));
+		CPPUNIT_ASSERT_EQUAL (0, g_unlink (fixture.path ("after.wav").c_str ()));
+	}
+	std::cout << "\nStudio Pro session round trip preserved audio, MIDI and markers: " << fixture.path ("studio-output.dawproject") << std::endl;
+}
 
 void ProjectSessionTest::native_song_import ()
 {
@@ -218,6 +350,10 @@ void ProjectSessionTest::native_song_import ()
 	auto output = PX::DawProject::read (fixture.path ("native-output.dawproject"));
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (100, output.tempo, 1e-6);
 	CPPUNIT_ASSERT_EQUAL (3U, output.numerator);
+	CPPUNIT_ASSERT_EQUAL (size_t (1), output.markers.size ());
+	CPPUNIT_ASSERT_EQUAL (std::string ("Verse"), output.markers[0].name);
+	CPPUNIT_ASSERT (output.markers[0].position.unit == PX::TimeUnit::Beats);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (8, output.markers[0].position.value, 1e-6);
 	auto const& audio = track_named (output, "Native audio");
 	CPPUNIT_ASSERT_EQUAL (std::string ("#12ab34"), audio.color);
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (0.75, audio.volume, 1e-6);

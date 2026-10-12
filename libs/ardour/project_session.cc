@@ -239,6 +239,11 @@ void populate (Session& session, const Project& project, const std::map<std::str
 
 	std::map<std::string, std::shared_ptr<Route>> routes;
 	std::map<std::string, std::shared_ptr<RouteGroup>> folders;
+	/* Some exporters list the master last. Rename it before tracks are
+	 * created, so their automatic connection names cannot retain "Master". */
+	for (auto const& track : project.tracks) {
+		if (track.master && session.master_out ()) { session.master_out ()->set_name (track.name); }
+	}
 	for (auto const& track : project.tracks) {
 		if (track.kind == TrackKind::Folder) {
 			std::string name = track.name;
@@ -354,6 +359,18 @@ void populate (Session& session, const Project& project, const std::map<std::str
 		}
 	}
 	if (!folders.empty ()) { report.push_back ({Disposition::Transformed, "Track folders", "Folders represented by buses and route groups; parent relationships retained for exchange"}); }
+	for (auto const& marker : project.markers) {
+		cancelled (cancel);
+		auto pos = marker.position.unit == TimeUnit::Beats ? Temporal::timepos_t (beats (marker.position.value))
+		           : Temporal::timepos_t (samples (marker.position.value, session.sample_rate ()));
+		auto location = new Location (session, pos, pos, marker.name, Location::IsMark);
+		session.locations ()->add (location);
+		if (location->name () != marker.name) { report.push_back ({Disposition::Transformed, "Unnamed marker", "Assigned marker name " + location->name ()}); }
+		if (location->start ().time_domain () != pos.time_domain ()) {
+			report.push_back ({Disposition::Transformed, marker.name, "Marker converted to the session time basis at the current constant tempo"});
+		}
+		end = std::max (end, pos.samples ());
+	}
 	report.push_back ({Disposition::Transformed, "Panning", "Stereo channels use Ardour's balance panner; pan laws can differ between applications"});
 	session.set_session_extents (Temporal::timepos_t (0), Temporal::timepos_t (std::max (end, samplepos_t (session.sample_rate ()))));
 	if (!ARDOUR::LuaAPI::wait_for_process_callback (2, 2000)) { throw ExchangeError ("Audio engine did not finish applying imported controls"); }
@@ -415,8 +432,20 @@ Project collect (Session& session, AudioAssets& assets, const CancelCheck& cance
 	}
 	for (auto const& location : session.locations ()->list ()) {
 		if (!location->is_session_range () && !location->is_auto_loop () && !location->is_auto_punch ()) {
-			unsupported (project, location->name (), "Markers and ranges cannot yet be exchanged");
+			if (location->flags () != Location::IsMark || !location->cd_info.empty ()) {
+				unsupported (project, location->name (), "Ranges and markers with special playback or CD semantics cannot yet be exchanged");
+			} else {
+				auto pos = location->start ();
+				Time time = pos.time_domain () == Temporal::BeatTime ? Time (beat_value (pos.beats ()), TimeUnit::Beats)
+				            : Time (double (pos.samples ()) / session.sample_rate (), TimeUnit::Seconds);
+				project.markers.push_back ({location->name (), time});
+			}
 		}
+	}
+	if (!project.markers.empty () && std::any_of (project.markers.begin (), project.markers.end (), [&] (const Marker& marker) {
+		return marker.position.unit != project.markers.front ().position.unit;
+	})) {
+		project.report.push_back ({Disposition::Transformed, "Markers", "Mixed musical and sample-time markers exported in seconds at the current constant tempo"});
 	}
 	RouteList routes (*session.get_routes ());
 	routes.remove_if ([] (const std::shared_ptr<Route>& route) { return route->is_auditioner () || route->is_monitor (); });
@@ -707,10 +736,6 @@ SessionExchange::import_studio_one (AudioEngine& engine, const std::string& file
 	                       [&] (Session& session) {
 		                       auto position = [&] (Time t) { return Temporal::timepos_t (samples (convert_time (t, TimeUnit::Seconds, song.project.tempo), session.sample_rate ())); };
 		                       if (song.has_range) { session.set_session_extents (position (song.start), position (song.end)); }
-		                       for (auto const& marker : song.markers) {
-			                       auto pos = position (marker.position);
-			                       session.locations ()->add (new Location (session, pos, pos, marker.name, Location::IsMark));
-		                       }
 	                       });
 }
 

@@ -1,6 +1,6 @@
 #include <getopt.h>
-#ifdef PLATFORM_WINDOWS
 #include <cstdlib>
+#ifdef PLATFORM_WINDOWS
 #include <windows.h>
 #endif
 
@@ -13,6 +13,7 @@
 #include <cppunit/BriefTestProgressListener.h>
 
 #include "pbd/debug.h"
+#include "pbd/pthread_utils.h"
 #include "ardour/ardour.h"
 #include "temporal/types.h"
 #include "test_ui.h"
@@ -72,7 +73,8 @@ main(int argc, char* argv[])
 
 	CppUnit::TestRunner testrunner;
 	testrunner.addTest (CppUnit::TestFactoryRegistry::getRegistry ().makeTest ());
-	testrunner.run (testresult);
+	const char* filter = std::getenv ("ARDOUR_TEST_FILTER");
+	testrunner.run (testresult, filter ? filter : "");
 
 	CppUnit::CompilerOutputter compileroutputter (&collectedresults, std::cerr);
 	compileroutputter.write ();
@@ -80,6 +82,8 @@ main(int argc, char* argv[])
 	delete test_ui;
 
 	ARDOUR::cleanup ();
+	/* Match the application and SessionUtils shutdown sequence. */
+	pthread_cancel_all ();
 
 	return collectedresults.wasSuccessful () ? 0 : 1;
 }

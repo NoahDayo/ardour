@@ -105,6 +105,7 @@ class NativeSongTest(unittest.TestCase):
         self.assertEqual(m["clips"][0]["offset"], [1, "beats"])
         self.assertTrue(master["master"])
         self.assertEqual(song["markers"], [["Verse", [8, "beats"]]])
+        self.assertEqual(p["markers"], [{"name": "Verse", "position": [8, "beats"]}])
         self.assertEqual((song["start"], song["end"], song["has_range"]), ([0, "beats"], [32, "beats"], True))
         self.assertFalse(any(d["disposition"] == 3 for d in p["report"]))
 

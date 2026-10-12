@@ -4,7 +4,6 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 root=$(pwd -P)
-libs="$root/build/libs"
 mkdir -p build-evidence
 
 build=false
@@ -18,14 +17,50 @@ for argument in "$@"; do
         *) echo "Usage: $0 [--build] [--exchange-only|--all|--debug]" >&2; exit 2 ;;
     esac
 done
+# Read only the configured output path; never execute the lock file, which
+# also contains the configuring process's environment. Custom Waf output
+# directories must not make this runner execute stale tests from ./build.
+configured_build_dir() {
+    python - <<'PY'
+import ast
+import pathlib
+import sys
+path = pathlib.Path('.lock-waf_' + sys.platform + '_build')
+if not path.is_file():
+    candidates = list(pathlib.Path('.').glob('.lock-waf_*_build'))
+    if len(candidates) != 1:
+        raise SystemExit('Cannot identify the configured Waf output directory')
+    path = candidates[0]
+for node in ast.parse(path.read_text()).body:
+    if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == 'out_dir' for target in node.targets):
+        print(pathlib.Path(ast.literal_eval(node.value)).resolve().as_posix())
+        break
+else:
+    raise SystemExit('Waf output directory is missing')
+PY
+}
+configured=$(configured_build_dir)
+build_dir=${ARDOUR_TEST_BUILD_DIR:-$configured}
+case "$(uname -s)" in MINGW*|MSYS*) build_dir=$(cygpath -u -- "$build_dir");; esac
+build_dir=$(cd "$build_dir" && pwd -P)
+libs="$build_dir/libs"
 if $build; then
+    if [[ -n ${ARDOUR_TEST_BUILD_DIR:-} && $configured != "$(python -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve().as_posix())' "$build_dir")" ]]; then
+        echo 'Configure Waf for ARDOUR_TEST_BUILD_DIR before requesting a build.' >&2
+        exit 1
+    fi
     targets=unit-test-project-session,unit-test-session
     if [[ $mode == all ]]; then
         targets=libardour-tests,libpbd-tests,libtemporal-tests
     fi
     python waf --targets="$targets,dummy_audiobackend,libardour_panbalance,libardour_pan1in2out,libardour_pan2in2out" \
         -j"${ARDOUR_BUILD_JOBS:-4}"
+    if [[ $(configured_build_dir) != "$configured" ]]; then
+        echo 'Waf output directory changed during the build; refusing to run unverified test binaries.' >&2
+        exit 1
+    fi
 fi
+echo "Session test binaries: $libs"
 
 # This runner does not depend on the GUI wrapper being built. Keep its profile
 # isolated from the user's installed DAW and retain it beside the test logs.
@@ -36,8 +71,8 @@ cp -R "$root/libs/ardour/test/data" "$profile/test-data"
 export XDG_CONFIG_HOME="$profile"
 export XDG_CACHE_HOME="$profile/cache"
 export ARDOUR_DLL_PATH="$libs"
-export ARDOUR_CONFIG_PATH="$root:$root/gtk2_ardour:$root/build:$root/build/gtk2_ardour"
-export ARDOUR_DATA_PATH="$root/share:$root/build:$root/gtk2_ardour:$root/build/gtk2_ardour"
+export ARDOUR_CONFIG_PATH="$root:$root/gtk2_ardour:$build_dir:$build_dir/gtk2_ardour"
+export ARDOUR_DATA_PATH="$root/share:$build_dir:$root/gtk2_ardour:$build_dir/gtk2_ardour"
 export ARDOUR_BACKEND_PATH="$libs/backends/dummy"
 export ARDOUR_PANNER_PATH="$libs/panners"
 export ARDOUR_TEST_PATH="$profile/test-data"

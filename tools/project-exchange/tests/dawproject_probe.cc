@@ -47,6 +47,7 @@ static void dump (const Project& p)
 		if (!first) { std::cout << ','; } first = false;
 		std::cout << "{\"id\":"; quoted (t.id);
 		std::cout << ",\"name\":"; quoted (t.name);
+		std::cout << ",\"color\":"; quoted (t.color);
 		std::cout << ",\"parent\":"; quoted (t.parent);
 		std::cout << ",\"destination\":"; quoted (t.destination);
 		std::cout << ",\"kind\":" << static_cast<int> (t.kind) << ",\"channels\":" << t.channels
@@ -56,6 +57,7 @@ static void dump (const Project& p)
 		for (auto const& c : t.clips) {
 			if (!first_clip) { std::cout << ','; } first_clip = false;
 			std::cout << "{\"name\":"; quoted (c.name);
+			std::cout << ",\"color\":"; quoted (c.color);
 			std::cout << ",\"kind\":" << static_cast<int> (c.kind) << ",\"position\":"; time_json (c.position);
 			std::cout << ",\"duration\":" << c.duration << ",\"offset\":"; time_json (c.offset);
 			std::cout << ",\"enabled\":" << (c.enabled ? "true" : "false") << ",\"media\":"; quoted (c.media);
@@ -68,6 +70,13 @@ static void dump (const Project& p)
 			std::cout << "]}";
 		}
 		std::cout << "]}";
+	}
+	std::cout << "],\"markers\":[";
+	first = true;
+	for (auto const& marker : p.markers) {
+		if (!first) { std::cout << ','; } first = false;
+		std::cout << "{\"name\":"; quoted (marker.name);
+		std::cout << ",\"position\":"; time_json (marker.position); std::cout << '}';
 	}
 	std::cout << "],\"report\":[";
 	first = true;

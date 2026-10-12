@@ -75,6 +75,11 @@ struct Track {
 	std::vector<Clip> clips;
 };
 
+struct Marker {
+	std::string name;
+	Time position;
+};
+
 struct Project {
 	std::string application;
 	std::string application_version;
@@ -83,6 +88,7 @@ struct Project {
 	unsigned int denominator = 4;
 	std::vector<Media> media;
 	std::vector<Track> tracks;
+	std::vector<Marker> markers;
 	std::vector<Diagnostic> report;
 };
 

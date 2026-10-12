@@ -154,6 +154,36 @@ struct Parser {
 		}
 	}
 
+	std::string color (Node node)
+	{
+		std::string value = attr (node, "color");
+		if (value.size () == 9 && value[0] == '#') {
+			if (g_ascii_strcasecmp (value.c_str () + 7, "ff")) {
+				diagnostic (node, "Color transparency cannot be represented by an RGB project color");
+			}
+			value.resize (7);
+		}
+		if (!value.empty () && (value.size () != 7 || value[0] != '#' ||
+		    value.find_first_not_of ("0123456789abcdefABCDEF", 1) != std::string::npos)) {
+			throw ExchangeError ("Invalid project color");
+		}
+		return value;
+	}
+
+	void points (Node node)
+	{
+		attributes (node, {"id", "name", "color", "timeUnit", "unit"});
+		Node target = child (node, "Target");
+		if (!target) { throw ExchangeError ("Automation is missing its target"); }
+		attributes (target, {"parameter", "expression", "channel", "key", "controller"});
+		if (has (target, "parameter") == has (target, "expression")) { throw ExchangeError ("Invalid automation target"); }
+		if (has (target, "parameter") && !ids.count (attr (target, "parameter"))) { throw ExchangeError ("Unknown automation target"); }
+		if (!children (target).empty ()) { throw ExchangeError ("Invalid automation target content"); }
+		for (Node item : children (node)) {
+			if (!is (item, "Target")) { diagnostic (node, "Automation points are not yet converted"); break; }
+		}
+	}
+
 	void index (Node node, size_t depth = 0)
 	{
 		if (++node_count > 250000 || depth > 128) { throw ExchangeError ("Project XML exceeds object or nesting limits"); }
@@ -193,7 +223,7 @@ struct Parser {
 	{
 		attributes (node, {"id", "name", "color", "audioChannels", "destination", "role", "solo"});
 		if ((has (node, "name") && attr (node, "name") != track.name) ||
-		    (has (node, "color") && attr (node, "color") != track.color)) {
+		    (has (node, "color") && color (node) != track.color)) {
 			diagnostic (node, "A separate channel name or color cannot be represented by the track metadata");
 		}
 		std::string role = attr (node, "role", "regular");
@@ -237,7 +267,7 @@ struct Parser {
 		Track track;
 		track.id = model_id (node);
 		track.name = attr (node, "name");
-		track.color = attr (node, "color");
+		track.color = color (node);
 		track.parent = parent;
 		if (is (node, "Channel")) {
 			track.kind = TrackKind::Bus;
@@ -311,7 +341,7 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active)
 	if (number (node, "fadeInTime") != 0 || number (node, "fadeOutTime") != 0) { diagnostic (node, "Clip fades are not yet converted"); }
 	Clip outer;
 	outer.name = attr (node, "name");
-	outer.color = attr (node, "color");
+	outer.color = color (node);
 	outer.position = Time (number (node, "time", 0, true), parent_unit);
 	outer.enabled = boolean (node, "enable", true);
 	TimeUnit content_unit = time_unit (node, "contentTimeUnit", parent_unit);
@@ -343,6 +373,20 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active)
 	} else {
 		if (contents.size () != 1) { throw ExchangeError ("Clip must have exactly one content timeline"); }
 		content = contents.front ();
+	}
+	/* Studio Pro wraps note content in one or more parallel-timeline
+	 * containers, even when there is only one playable lane. */
+	while (is (content, "Lanes")) {
+		attributes (content, {"id", "timeUnit"});
+		content_unit = time_unit (content, "timeUnit", content_unit);
+		Node playable = NULL;
+		for (Node item : children (content)) {
+			if (is (item, "Points")) { points (item); continue; }
+			if (playable) { throw ExchangeError ("Parallel clip content lanes are not yet supported"); }
+			playable = item;
+		}
+		if (!playable) { throw ExchangeError ("Clip lanes contain no playable content"); }
+		content = playable;
 	}
 	std::vector<Clip> result;
 	if (is (content, "Audio")) {
@@ -408,6 +452,7 @@ Parser::timeline (Node node, TimeUnit inherited_unit, const std::string& inherit
 {
 	TimeUnit unit = time_unit (node, "timeUnit", inherited_unit);
 	std::string track = attr (node, "track", inherited_track);
+	if (is (node, "Points")) { points (node); return; }
 	attributes (node, {"id", "timeUnit", "track"});
 	if (is (node, "Lanes")) {
 		for (Node item : children (node)) { timeline (item, unit, track); }
@@ -432,7 +477,9 @@ Parser::timeline (Node node, TimeUnit inherited_unit, const std::string& inherit
 Project
 Parser::parse (Node root)
 {
-	if (!root || !is (root, "Project") || required (root, "version") != "1.0") { throw ExchangeError ("Unsupported DAWproject version or root element"); }
+	if (!root || !is (root, "Project")) { throw ExchangeError ("Unsupported DAWproject root element"); }
+	std::string version = required (root, "version");
+	if (version != "1.0" && version != "0.1") { throw ExchangeError ("Unsupported DAWproject version"); }
 	index (root);
 	attributes (root, {"version"});
 	Node application = child (root, "Application");
@@ -478,8 +525,18 @@ Parser::parse (Node root)
 			throw ExchangeError ("Tempo and meter automation are not yet supported by this converter");
 		}
 		if (Node lanes = child (arrangement, "Lanes")) { timeline (lanes, TimeUnit::Beats, ""); }
+		if (Node markers = child (arrangement, "Markers")) {
+			attributes (markers, {"id", "timeUnit"});
+			TimeUnit unit = time_unit (markers, "timeUnit", TimeUnit::Beats);
+			for (Node item : children (markers)) {
+				if (!is (item, "Marker")) { diagnostic (item, "Unknown marker element"); continue; }
+				attributes (item, {"name", "time"});
+				if (!children (item).empty ()) { throw ExchangeError ("Invalid marker content"); }
+				project.markers.push_back ({attr (item, "name"), Time (number (item, "time", 0, true), unit)});
+			}
+		}
 		for (Node item : children (arrangement)) {
-			if (!is (item, "Lanes")) { diagnostic (item, "Arrangement data is not yet converted"); }
+			if (!is (item, "Lanes") && !is (item, "Markers")) { diagnostic (item, "Arrangement data is not yet converted"); }
 		}
 	}
 	for (Node item : children (root)) {
@@ -633,6 +690,19 @@ struct Writer {
 				Node clips = element (lane, "Clips");
 				property (clips, "timeUnit", unit_name (c.position.unit));
 				clip (clips, c);
+			}
+		}
+		if (!project.markers.empty ()) {
+			Node markers = element (arrangement, "Markers");
+			/* A single marker lane has one unit; preserve absolute positions
+			 * when the source session mixes musical and sample-time markers. */
+			TimeUnit unit = project.markers.front ().position.unit;
+			for (auto const& marker : project.markers) { if (marker.position.unit != unit) { unit = TimeUnit::Seconds; break; } }
+			property (markers, "timeUnit", unit_name (unit));
+			for (auto const& marker : project.markers) {
+				Node item = element (markers, "Marker");
+				property (item, "name", marker.name);
+				property (item, "time", convert_time (marker.position, unit, project.tempo));
 			}
 		}
 		xmlChar* buffer = NULL;
