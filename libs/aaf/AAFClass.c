@@ -35,6 +35,7 @@
 #include "aaf/AAFTypes.h"
 
 #include "aaf/AAFDefs/AAFClassDefUIDs.h"
+#include "aaf/AAFDefs/AAFExtensionClassUIDs.h"
 #include "aaf/AAFDefs/AAFPropertyIDs.h"
 #include "aaf/AAFDefs/AAFTypeDefUIDs.h"
 
@@ -979,6 +980,15 @@ aafclass_setDefaultClasses (AAF_Data* aafd)
 	}
 
 	/* The TypeDefinitionCharacter class does not define any additional properties. */
+
+	/* Bootstrap this extension before traversing TypeDefinitions. Its dynamic
+	 * CharacterSize property is defined by the file's ClassDefinition. Without
+	 * the class itself, even its Identification/Name are lost before the file's
+	 * extended dictionary can be registered. This does not add character-data
+	 * decoding; unknown properties remain reported by the core reader. */
+	if (aafclass_defineNewClass (aafd, &AAFClassID_TypeDefinitionGenericCharacter, CONCRETE, TypeDef) == NULL) {
+		return -1;
+	}
 
 	aafClass* TypeDefEnum = aafclass_defineNewClass (aafd, &AAFClassID_TypeDefinitionEnumeration, CONCRETE, TypeDef);
 

@@ -9,6 +9,14 @@
 #include "aaf/libaaf.h"
 #include "evoral/SMF.h"
 #include "ardour/audioengine.h"
+#include "ardour/audioregion.h"
+#include "ardour/audiosource.h"
+#include "ardour/gain_control.h"
+#include "ardour/logic_project.h"
+#include "ardour/midi_region.h"
+#include "ardour/midi_model.h"
+#include "ardour/playlist.h"
+#include "ardour/track.h"
 #include "ardour/project_session.h"
 #include "ardour/session.h"
 #include "test_util.h"
@@ -36,6 +44,7 @@ struct Fixture {
 		SNDFILE* file = sf_open (path ("source.wav").c_str (), SFM_WRITE, &info);
 		CPPUNIT_ASSERT (file);
 		std::vector<float> pcm (rate * 4, level);
+		for (size_t i = 1; i < pcm.size (); i += 2) { pcm[i] = -level; }
 		CPPUNIT_ASSERT_EQUAL (sf_count_t (rate * 2), sf_writef_float (file, pcm.data (), rate * 2));
 		CPPUNIT_ASSERT_EQUAL (0, sf_close (file));
 		project.media.push_back ({"source", "audio/source.wav", rate, 2, 2});
@@ -84,6 +93,9 @@ class LogicSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (writer_missing_outputs);
 	CPPUNIT_TEST (cancel_running_writer);
 	CPPUNIT_TEST (out_of_range_audio);
+	CPPUNIT_TEST (coordinated_import);
+	CPPUNIT_TEST (import_cancel_and_failure);
+	CPPUNIT_TEST (midi_validation);
 	CPPUNIT_TEST_SUITE_END ();
 public:
 	void saved_session_export ();
@@ -93,6 +105,9 @@ public:
 	void writer_missing_outputs ();
 	void cancel_running_writer ();
 	void out_of_range_audio ();
+	void coordinated_import ();
+	void import_cancel_and_failure ();
+	void midi_validation ();
 };
 CPPUNIT_TEST_SUITE_REGISTRATION (LogicSessionTest);
 
@@ -136,7 +151,7 @@ void LogicSessionTest::saved_session_export ()
 		std::vector<float> pcm (info.frames * info.channels);
 		CPPUNIT_ASSERT_EQUAL (info.frames, sf_readf_float (file, pcm.data (), info.frames));
 		CPPUNIT_ASSERT_EQUAL (0, sf_close (file));
-		for (float sample : pcm) { CPPUNIT_ASSERT_EQUAL (.125f, sample); }
+		for (size_t i = 0; i < pcm.size (); ++i) { CPPUNIT_ASSERT_EQUAL (i % 2 ? -.125f : .125f, pcm[i]); }
 		++count;
 	}
 	CPPUNIT_ASSERT_EQUAL (1u, count);
@@ -230,4 +245,134 @@ void LogicSessionTest::out_of_range_audio ()
 	Fixture fixture (1.25f);
 	CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_logic (*fixture.session, fixture.path ("Output"), fixture.report), PX::ExchangeError);
 	fixture.clean_failure ();
+}
+
+void LogicSessionTest::coordinated_import ()
+{
+	Fixture fixture;
+	for (auto const& route : *fixture.session->get_routes ()) {
+		if (auto track = std::dynamic_pointer_cast<Track> (route)) {
+			auto regions = track->playlist ()->region_list ();
+			for (auto const& region : *regions) {
+				if (auto audio = std::dynamic_pointer_cast<AudioRegion> (region)) { if (!audio->muted ()) { audio->set_scale_amplitude (.375); } }
+			}
+		}
+	}
+	PX::SessionExchange::export_logic (*fixture.session, fixture.path ("Transfer"), fixture.report);
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("Transfer/Project.aaf"),
+	                    fixture.path ("Transfer/Project.mid"), fixture.path ("Imported"), "Imported", fixture.report);
+	CPPUNIT_ASSERT_EQUAL (0, g_unlink (fixture.path ("Transfer/Project.aaf").c_str ()));
+	CPPUNIT_ASSERT_EQUAL (0, g_unlink (fixture.path ("Transfer/Project.mid").c_str ()));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("Imported"), "Imported", nullptr, "", true));
+	AudioEngine::instance ()->set_session (fixture.session.get ());
+	unsigned audio_count = 0, midi_count = 0;
+	for (auto const& route : *fixture.session->get_routes ()) {
+		auto track = std::dynamic_pointer_cast<Track> (route);
+		if (!track) { continue; }
+		auto regions = track->playlist ()->region_list ();
+		for (auto const& region : *regions) {
+			if (auto audio = std::dynamic_pointer_cast<AudioRegion> (region)) {
+				CPPUNIT_ASSERT_EQUAL (std::string ("Stereo"), route->name ());
+				CPPUNIT_ASSERT_DOUBLES_EQUAL (.75, route->gain_control ()->get_value (), 1e-7);
+				CPPUNIT_ASSERT_EQUAL (samplepos_t (.375 * fixture.session->sample_rate ()), audio->start_sample ());
+				CPPUNIT_ASSERT_EQUAL (samplecnt_t (.5 * fixture.session->sample_rate ()), audio->length_samples ());
+				bool first = audio->position_sample () == samplepos_t (1.25 * fixture.session->sample_rate ());
+				CPPUNIT_ASSERT_DOUBLES_EQUAL (first ? .375 : 0, audio->scale_amplitude (), 1e-7);
+				if (!first) { CPPUNIT_ASSERT_EQUAL (samplepos_t (2.5 * fixture.session->sample_rate ()), audio->position_sample ()); }
+				CPPUNIT_ASSERT_EQUAL (uint32_t (2), audio->n_channels ());
+				for (unsigned channel = 0; channel < 2; ++channel) {
+					auto source = std::dynamic_pointer_cast<AudioSource> (audio->source (channel));
+					std::array<float, 31> samples {};
+					CPPUNIT_ASSERT_EQUAL (samplecnt_t (samples.size ()), source->read (samples.data (), 0, samples.size ()));
+					for (float sample : samples) { CPPUNIT_ASSERT_EQUAL (channel ? -.125f : .125f, sample); }
+				}
+				++audio_count;
+			} else if (auto midi = std::dynamic_pointer_cast<MidiRegion> (region)) {
+				CPPUNIT_ASSERT_EQUAL (std::string ("Notes"), route->name ());
+				CPPUNIT_ASSERT_EQUAL (size_t (1), midi->model ()->n_notes ());
+				auto note = *midi->model ()->notes ().begin ();
+				CPPUNIT_ASSERT_DOUBLES_EQUAL (4.25, double (note->time ().to_ticks ()) / Temporal::Beats::PPQN, 1e-7);
+				CPPUNIT_ASSERT_DOUBLES_EQUAL (1.5, double (note->length ().to_ticks ()) / Temporal::Beats::PPQN, 1e-7);
+				CPPUNIT_ASSERT_EQUAL (uint8_t (60), note->note ());
+				CPPUNIT_ASSERT_EQUAL (uint8_t (2), note->channel ());
+				++midi_count;
+			}
+		}
+	}
+	CPPUNIT_ASSERT_EQUAL (2u, audio_count); CPPUNIT_ASSERT_EQUAL (1u, midi_count);
+	PX::SessionExchange::export_logic (*fixture.session, fixture.path ("Reexport"), fixture.report);
+	PX::LogicProject reloaded (fixture.path ("Reexport/Project.aaf"), fixture.path ("Reexport/Project.mid"));
+	CPPUNIT_ASSERT (!PX::has_unsupported_features (reloaded.project ()));
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (100, reloaded.project ().tempo, 1e-7);
+	CPPUNIT_ASSERT_EQUAL (3u, reloaded.project ().numerator);
+	CPPUNIT_ASSERT_EQUAL (size_t (1), reloaded.project ().markers.size ());
+	CPPUNIT_ASSERT_EQUAL (std::string (u8"Refrain 音楽"), reloaded.project ().markers[0].name);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (12.5, reloaded.project ().markers[0].position.value, 1e-7);
+}
+
+void LogicSessionTest::import_cancel_and_failure ()
+{
+	Fixture fixture;
+	PX::SessionExchange::export_logic (*fixture.session, fixture.path ("Transfer"), fixture.report);
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	bool copying = false;
+	auto cancel = [&] {
+		for (auto const& name : Glib::Dir (fixture.root)) {
+			if (name.find (".ardour-exchange-") == 0 && Glib::file_test (fixture.path (name + "/input-0.media"), Glib::FILE_TEST_EXISTS)) { copying = true; }
+		}
+		return copying;
+	};
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("Transfer/Project.aaf"),
+	                      fixture.path ("Transfer/Project.mid"), fixture.path ("Output"), "Imported", fixture.report, cancel), PX::ArchiveCancelled);
+	CPPUNIT_ASSERT (copying); fixture.clean_failure ();
+	std::ofstream (fixture.path ("broken.aaf"), std::ios::binary) << std::string (512, 'x');
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("broken.aaf"), "",
+	                      fixture.path ("Output"), "Imported", fixture.report), PX::ExchangeError);
+	fixture.clean_failure ();
+	std::ofstream (fixture.path ("broken.mid"), std::ios::binary) << "not MIDI";
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("Transfer/Project.aaf"), fixture.path ("broken.mid"),
+	                      fixture.path ("Output"), "Imported", fixture.report), PX::ExchangeError);
+	fixture.clean_failure ();
+	CPPUNIT_ASSERT_EQUAL (0, g_mkdir (fixture.path ("Output").c_str (), 0700));
+	std::ofstream (fixture.path ("Output/keep")) << "existing";
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("Transfer/Project.aaf"), fixture.path ("Transfer/Project.mid"),
+	                      fixture.path ("Output"), "Imported", fixture.report), PX::ExchangeError);
+	CPPUNIT_ASSERT_EQUAL (std::string ("existing"), Glib::file_get_contents (fixture.path ("Output/keep")));
+}
+
+void LogicSessionTest::midi_validation ()
+{
+	const std::string root = new_test_output_dir ("project-midi"), path = Glib::build_filename (root, "input.mid");
+	const std::vector<unsigned char> valid = {
+		0, 0xff, 0x51, 3, 9, 0x27, 0xc0, // 100 BPM
+		0, 0xff, 0x58, 4, 3, 2, 24, 8, // 3/4
+		0, 0xff, 0x54, 5, 0x20, 0, 0, 0, 0, // 25fps, zero origin
+		0, 0xff, 3, 4, 'K', 'e', 'y', 's',
+		0, 0x92, 60, 93, 0, 62, 77, // running status
+		0x81, 0x70, 0x82, 60, 45, 0, 62, 64,
+		0, 0xff, 0x2f, 0
+	};
+	auto write = [&] (const std::vector<unsigned char>& payload) {
+		std::vector<unsigned char> bytes = {'M','T','h','d',0,0,0,6,0,0,0,1,1,0xe0,'M','T','r','k'};
+		for (int shift = 24; shift >= 0; shift -= 8) { bytes.push_back ((payload.size () >> shift) & 255); }
+		bytes.insert (bytes.end (), payload.begin (), payload.end ());
+		Glib::file_set_contents (path, std::string (bytes.begin (), bytes.end ()));
+	};
+	write (valid);
+	PX::Project project; PX::read_project_midi (path, project, 0);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (100, project.tempo, 1e-7);
+	CPPUNIT_ASSERT_EQUAL (3u, project.numerator);
+	CPPUNIT_ASSERT_EQUAL (std::string ("Keys"), project.tracks[0].name);
+	CPPUNIT_ASSERT_EQUAL (size_t (2), project.tracks[0].clips[0].notes.size ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.5, project.tracks[0].clips[0].notes[0].duration, 1e-7);
+	CPPUNIT_ASSERT_THROW (PX::read_project_midi (path, project, 3600), PX::ExchangeError);
+	CPPUNIT_ASSERT_THROW (PX::read_project_midi (path, project, 0, [] { return true; }), PX::ArchiveCancelled);
+	auto broken = valid; broken.pop_back (); write (broken);
+	CPPUNIT_ASSERT_THROW (PX::read_project_midi (path, project, 0), PX::ExchangeError);
+	broken = valid; broken.insert (broken.end () - 4, {0, 0xb2, 64, 127}); write (broken);
+	CPPUNIT_ASSERT_THROW (PX::read_project_midi (path, project, 0), PX::ExchangeError);
+	broken = valid; broken.insert (broken.end () - 4, {0, 0xff, 0x51, 3, 7, 0xa1, 0x20}); write (broken);
+	CPPUNIT_ASSERT_THROW (PX::read_project_midi (path, project, 0), PX::ExchangeError);
 }

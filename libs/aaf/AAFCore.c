@@ -1557,8 +1557,11 @@ retrieveMetaDictionaryClass (AAF_Data* aafd, aafObject* TargetClassDef)
 		aafObject* TypeDef = aaf_get_ObjectByWeakRef (TypeDefs, WeakRefToType);
 
 		if (!TypeDef) {
-			error ("Could not retrieve TypeDefinition from dictionary.");
-			return NULL;
+			/* Exporters can include unused extension definitions without their
+			 * types. Keep the definition, but reject it if an object actually
+			 * stores this property (see retrieveObjectProperties). */
+			warning ("Unresolved extension type for %s::%s", Class->name, PDef->name);
+			continue;
 		}
 
 		aafUID_t* typeUID = aaf_get_propertyValue (TypeDef, PID_MetaDefinition_Identification, &AAFTypeID_AUID);
@@ -2023,6 +2026,12 @@ retrieveObjectProperties (AAF_Data* aafd, aafObject* Obj)
 			         aaft_PIDToText (aafd, Prop._pid),
 			         aaft_ClassIDToText (aafd, Obj->Class->ID));
 			continue;
+		}
+
+		if (PDef->meta && aafUIDCmp (&PDef->type, &AAFUID_NULL)) {
+			error ("Cannot read property 0x%04x with an unresolved extension type on %s",
+			       Prop._pid, aaf_get_ObjectPath (Obj));
+			goto err;
 		}
 
 		rc = retrieveProperty (aafd, Obj, PDef, &Prop, value, Header._byteOrder);

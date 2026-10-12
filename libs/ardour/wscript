@@ -188,6 +188,8 @@ libardour_sources = [
         'project_archive.cc',
         'project_exchange.cc',
         'project_session.cc',
+        'project_midi.cc',
+        'logic_project.cc',
         'studio_one_song.cc',
         'quantize.cc',
         'rc_configuration.cc',
@@ -408,14 +410,14 @@ def build(bld):
         obj.defines      = []
 
     obj.export_includes = ['.']
-    obj.includes     = ['.', '../vst3/', '../ctrl-interface/control_protocol', '..']
+    obj.includes     = ['.', '../vst3/', '../ctrl-interface/control_protocol', '..', '../aaf']
     obj.name         = 'libardour'
     obj.target       = 'ardour'
     obj.uselib       = ['GLIBMM','GTHREAD','AUBIO','SIGCPP','XML','UUID', 'LO', 'USB',
                         'SNDFILE','SAMPLERATE','LRDF','AUDIOUNITS', 'GIOMM', 'FFTW3F',
                         'LILV','SERD','SORD', 'SRATOM', 'ARCHIVE',
                         'OSX','BOOST','CURL','TAGLIB','VAMPSDK','VAMPHOSTSDK','RUBBERBAND']
-    obj.use          = ['libpbd','libmidipp','libevoral',
+    obj.use          = ['libpbd','libmidipp','libevoral', 'libaaf',
                         'libaudiographer',
                         'libtemporal',
                         'liblua',

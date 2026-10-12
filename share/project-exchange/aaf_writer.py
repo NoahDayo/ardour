@@ -213,8 +213,12 @@ def write_aaf(root, destination):
                 if channels == 2:
                     segment = output.create.OperationGroup(combiner, length, media_kind="sound")
                     segment.segments.extend(references)
+                clip_gain = number(clip, "gain") if "gain" in clip.attrib else 1
+                require(clip_gain >= 0, "Invalid clip gain")
                 if clip.attrib.get("enabled") != "true":
-                    segment = apply_constant(output, segment, mono_gain if channels == 1 else stereo_gain, amplitude, 0)
+                    clip_gain = 0
+                if clip_gain != 1:
+                    segment = apply_constant(output, segment, mono_gain if channels == 1 else stereo_gain, amplitude, clip_gain)
                 for field in ("name", "color"):
                     if clip.attrib.get(field):
                         segment["UserComments"].append(output.create.TaggedValue("Ardour." + field, clip.attrib[field]))

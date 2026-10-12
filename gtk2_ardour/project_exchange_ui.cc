@@ -7,6 +7,7 @@
 #include <glibmm/fileutils.h>
 #include <glibmm/miscutils.h>
 #include <ytkmm/entry.h>
+#include <ytkmm/checkbutton.h>
 #include <ytkmm/actiongroup.h>
 #include <ytkmm/filechooserbutton.h>
 #include <ytkmm/filechooserdialog.h>
@@ -24,6 +25,7 @@
 #include "ardour/audioengine.h"
 #include "ardour/project_session.h"
 #include "ardour/studio_one_song.h"
+#include "ardour/logic_project.h"
 #include "ardour/rc_configuration.h"
 #include "ardour/session.h"
 #include "ardour_dialog.h"
@@ -38,6 +40,7 @@ namespace {
 bool exchange_active = false;
 
 bool native_song (const std::string& path) { return path.size () >= 5 && !g_ascii_strcasecmp (path.c_str () + path.size () - 5, ".song"); }
+bool aaf_project (const std::string& path) { return path.size () >= 4 && !g_ascii_strcasecmp (path.c_str () + path.size () - 4, ".aaf"); }
 
 void show_report (Gtk::Window& parent, const std::string& title, const std::string& message,
                   const std::vector<PX::Diagnostic>& report = {})
@@ -72,12 +75,16 @@ class ImportDialog : public ArdourDialog {
 public:
 	ImportDialog (Gtk::Window& parent, const std::string& archive)
 		: ArdourDialog (parent, _("Import Project"), true)
-		, source (_("Choose a Studio One song or DAWproject file"), Gtk::FILE_CHOOSER_ACTION_OPEN)
+		, source (_("Choose a Studio One song, DAWproject or AAF file"), Gtk::FILE_CHOOSER_ACTION_OPEN)
+		, midi_source (_("Choose the companion MIDI file"), Gtk::FILE_CHOOSER_ACTION_OPEN)
+		, include_midi (_("Include companion MIDI (AAF only)"))
 		, folder (_("Choose the session location"), Gtk::FILE_CHOOSER_ACTION_SELECT_FOLDER)
 	{
 		get_vbox ()->set_spacing (10);
 		get_vbox ()->set_border_width (12);
-		filter.set_name (_("Studio One songs and DAWproject files"));
+		filter.set_name (_("Studio One songs, DAWproject and AAF files"));
+		filter.add_pattern ("*.aaf");
+		filter.add_pattern ("*.AAF");
 		filter.add_pattern ("*.song");
 		filter.add_pattern ("*.SONG");
 		filter.add_pattern ("*.dawproject");
@@ -87,6 +94,12 @@ public:
 		Gtkmm2ext::add_volume_shortcuts (folder);
 		folder.set_current_folder (ARDOUR::Config->get_default_session_parent_dir ());
 		add_row (_("Project file"), source);
+		midi_filter.set_name (_("Standard MIDI files"));
+		for (auto const* pattern : {"*.mid", "*.MID", "*.midi", "*.MIDI"}) { midi_filter.add_pattern (pattern); }
+		midi_source.add_filter (midi_filter);
+		Gtkmm2ext::add_volume_shortcuts (midi_source);
+		get_vbox ()->pack_start (include_midi, false, false);
+		add_row (_("Companion MIDI"), midi_source);
 		add_row (_("Session name"), name);
 		add_row (_("Save in"), folder);
 		Gtk::Label* hint = Gtk::manage (new Gtk::Label (_("Creates a new Ardour session with copied audio and MIDI clips.")));
@@ -100,14 +113,19 @@ public:
 		source.signal_selection_changed ().connect (sigc::mem_fun (*this, &ImportDialog::update));
 		folder.signal_selection_changed ().connect (sigc::mem_fun (*this, &ImportDialog::update));
 		name.signal_changed ().connect (sigc::mem_fun (*this, &ImportDialog::update));
+		include_midi.signal_toggled ().connect (sigc::mem_fun (*this, &ImportDialog::update));
+		midi_source.signal_selection_changed ().connect (sigc::mem_fun (*this, &ImportDialog::update));
 		if (!archive.empty ()) {
 			source.set_filename (archive);
 			name.set_text (PBD::basename_nosuffix (archive));
+			source_chosen ();
 		}
+		update ();
 		set_default_size (600, -1);
 		show_all_children ();
 	}
 	std::string archive () const { return source.get_filename (); }
+	std::string midi () const { return aaf_project (archive ()) && include_midi.get_active () ? midi_source.get_filename ().raw () : std::string (); }
 	std::string snapshot () const { return name.get_text (); }
 	std::string destination () const { return Glib::build_filename (folder.get_filename (), snapshot ()); }
 private:
@@ -124,18 +142,29 @@ private:
 	void source_chosen ()
 	{
 		name.set_text (PBD::basename_nosuffix (source.get_filename ()));
+		midi_source.unselect_all ();
+		std::string candidate = Glib::build_filename (Glib::path_get_dirname (archive ()), PBD::basename_nosuffix (archive ()) + ".mid");
+		bool companion = aaf_project (archive ()) && Glib::file_test (candidate, Glib::FILE_TEST_IS_REGULAR);
+		if (companion) { midi_source.set_filename (candidate); }
+		include_midi.set_active (companion);
 		update ();
 	}
 	void update ()
 	{
 		std::string value = snapshot ();
+		include_midi.set_sensitive (aaf_project (archive ()));
+		midi_source.set_sensitive (aaf_project (archive ()) && include_midi.get_active ());
 		bool valid = !archive ().empty () && !folder.get_filename ().empty () && !value.empty () &&
 		             value != "." && value != ".." && value.find_first_of ("/\\:;<>\"|?*") == std::string::npos &&
 		             ARDOUR::Session::session_name_is_legal (value).empty ();
+		if (aaf_project (archive ()) && include_midi.get_active () && midi ().empty ()) { valid = false; }
 		set_response_sensitive (Gtk::RESPONSE_ACCEPT, valid);
 	}
 	Gtk::FileFilter filter;
 	Gtk::FileChooserButton source;
+	Gtk::FileFilter midi_filter;
+	Gtk::FileChooserButton midi_source;
+	Gtk::CheckButton include_midi;
 	Gtk::FileChooserButton folder;
 	Gtk::Entry name;
 };
@@ -182,6 +211,8 @@ private:
 
 bool ProjectExchangeUI::is_importable_project (std::string const& path)
 {
+	/* Keep Open's existing AAF workflow available while advanced AAF features
+	 * are being added to the coordinated Session > Import Project workflow. */
 	return native_song (path) || (path.size () >= 11 && !g_ascii_strcasecmp (path.c_str () + path.size () - 11, ".dawproject"));
 }
 
@@ -197,10 +228,12 @@ bool ProjectExchangeUI::prepare_import (Gtk::Window* parent, std::string const& 
 		if (Glib::file_test (dialog.destination (), Glib::FILE_TEST_EXISTS)) { throw PX::ExchangeError (_("That session folder already exists. Choose another session name.")); }
 		ExchangeProgress progress (*parent, _("Checking Project"));
 		auto check = [&] { return progress.check (); };
-		auto project = native_song (dialog.archive ()) ? PX::StudioOneSong::read (dialog.archive (), check).project : PX::DawProject::read (dialog.archive (), check);
+		auto project = aaf_project (dialog.archive ()) ? PX::LogicProject (dialog.archive (), dialog.midi (), check).project () :
+		               native_song (dialog.archive ()) ? PX::StudioOneSong::read (dialog.archive (), check).project : PX::DawProject::read (dialog.archive (), check);
 		report = project.report;
 		if (PX::has_unsupported_features (project)) { throw PX::ExchangeError (_("This project contains features that cannot yet be imported.")); }
 		request.archive = dialog.archive ();
+		request.midi = dialog.midi ();
 		request.destination = dialog.destination ();
 		request.snapshot = dialog.snapshot ();
 		request.sample_rate = project.media.empty () ? 48000 : project.media.front ().sample_rate;
@@ -255,7 +288,9 @@ bool ProjectExchangeUI::import_prepared (Gtk::Window* parent, ImportRequest cons
 	try {
 		ExchangeProgress progress (*parent, _("Importing Project"));
 		auto check = [&] { return progress.check (); };
-		auto session = native_song (archive)
+		auto session = aaf_project (archive)
+		    ? PX::SessionExchange::import_logic (engine, archive, request.midi, destination, snapshot, report, check)
+		    : native_song (archive)
 		    ? PX::SessionExchange::import_studio_one (engine, archive, destination, snapshot, report, check)
 		    : PX::SessionExchange::import_dawproject (engine, archive, destination, snapshot, report, check);
 		engine.remove_session ();

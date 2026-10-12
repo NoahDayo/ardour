@@ -7,6 +7,7 @@ namespace Gtk { class Window; }
 namespace ProjectExchangeUI {
 struct ImportRequest {
 	std::string archive;
+	std::string midi;
 	std::string destination;
 	std::string snapshot;
 	double sample_rate = 48000;

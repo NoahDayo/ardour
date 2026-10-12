@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "ardour/project_session.h"
 #include "ardour/studio_one_song.h"
+#include "ardour/logic_project.h"
 
 #include <algorithm>
 #include <array>
@@ -350,6 +351,7 @@ void populate (Session& session, const Project& project, const std::map<std::str
 				report.push_back ({Disposition::Transformed, clip.name, "Clip color retained for exchange; Ardour displays the track color"});
 			}
 			if (auto audio = std::dynamic_pointer_cast<AudioRegion> (region)) {
+				audio->set_scale_amplitude (clip.gain);
 				audio->set_fade_in_active (false);
 				audio->set_fade_out_active (false);
 			}
@@ -536,8 +538,9 @@ Project collect (Session& session, AudioAssets& assets, const CancelCheck& cance
 					clip.position = Time (double (region->position_sample ()) / session.sample_rate (), TimeUnit::Seconds);
 					clip.duration = double (region->length_samples ()) / session.sample_rate ();
 					clip.offset = Time (double (region->start_sample ()) / session.sample_rate (), TimeUnit::Seconds);
-					if (audio->scale_amplitude () != 1 || audio->envelope_active () || audio->fade_in_active () || audio->fade_out_active ()) {
-						unsupported (project, clip.name, "Region gain, envelopes, and fades cannot yet be exchanged");
+					clip.gain = audio->scale_amplitude ();
+					if (audio->envelope_active () || audio->fade_in_active () || audio->fade_out_active ()) {
+						unsupported (project, clip.name, "Region envelopes and fades cannot yet be exchanged");
 					}
 					if (region->opaque ()) {
 						for (auto const& other : *regions) {
@@ -785,6 +788,16 @@ void copy_native_audio (const std::string& source, const std::string& destinatio
 } // namespace
 
 std::unique_ptr<Session>
+SessionExchange::import_logic (AudioEngine& engine, const std::string& aaf, const std::string& midi,
+                              const std::string& destination, const std::string& snapshot,
+                              std::vector<Diagnostic>& report, CancelCheck cancel)
+{
+	LogicProject project (aaf, midi, cancel);
+	return import_session (engine, project.project (), destination, snapshot, report, cancel,
+	                       [&] (const Media& media, const std::string& path) { project.copy_media (media, path); });
+}
+
+std::unique_ptr<Session>
 SessionExchange::import_dawproject (AudioEngine& engine, const std::string& archive_path, const std::string& destination,
                                    const std::string& snapshot, std::vector<Diagnostic>& report, CancelCheck cancel)
 {
@@ -826,6 +839,12 @@ SessionExchange::export_dawproject (Session& session, const std::string& destina
 	cancelled (cancel);
 	AudioAssets assets;
 	Project project = collect (session, assets, cancel);
+	report = project.report;
+	for (auto const& track : project.tracks) {
+		for (auto const& clip : track.clips) {
+			if (clip.gain != 1) { unsupported (project, clip.name, "Audio region gain is not yet converted to DAWproject"); }
+		}
+	}
 	report = project.report;
 	for (auto const& item : project.report) {
 		if (item.disposition == Disposition::Unsupported) { throw ExchangeError (item.object + ": " + item.detail); }
@@ -915,6 +934,7 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 			item.set_property ("name", clip.name);
 			item.set_property ("color", clip.color);
 			item.set_property ("enabled", clip.enabled ? "true" : "false");
+			item.set_property ("gain", clip.gain);
 			TimeUnit unit = audio ? TimeUnit::Seconds : TimeUnit::Beats;
 			double position = convert_time (clip.position, unit, project.tempo);
 			double length = convert_time (Time (clip.duration, clip.position.unit), unit, project.tempo);

@@ -6,6 +6,16 @@
 #include "aaf/libaaf.h"
 
 static void
+reader_log (struct aafLog* log, void* context, int library, int type,
+            const char* source, const char* function, int line, const char* message, void* user)
+{
+	(void) context; (void) library; (void) source; (void) function; (void) line;
+	if (type == VERB_ERROR) { ++*(unsigned*) user; }
+	if (type == VERB_ERROR || type == VERB_WARNING) { fprintf (stderr, "%s\n", message); }
+	LOG_BUFFER_RESET (log);
+}
+
+static void
 json_string (const char* text)
 {
 	const unsigned char* p = (const unsigned char*) (text ? text : "");
@@ -30,14 +40,15 @@ main (int argc, char** argv)
 	aafiAudioTrack* track;
 	aafiAudioEssenceFile* essence;
 	unsigned int count = 0;
+	unsigned int errors = 0;
 	if (argc != 3) {
 		fprintf (stderr, "Usage: aaf-probe INPUT.aaf EXTRACTION-DIRECTORY\n");
 		return 2;
 	}
 	aafi = aafi_alloc (NULL);
 	if (!aafi) { return 3; }
-	aafi_set_debug (aafi, VERB_WARNING, 0, stderr, NULL, NULL);
-	if (aafi_load_file (aafi, argv[1]) != 0) {
+	aafi_set_debug (aafi, VERB_WARNING, 0, stderr, reader_log, &errors);
+	if (aafi_load_file (aafi, argv[1]) != 0 || errors) {
 		aafi_release (&aafi);
 		return 4;
 	}
@@ -77,7 +88,7 @@ main (int argc, char** argv)
 		char filename[64];
 		snprintf (filename, sizeof (filename), "essence-%u", count);
 		if (!essence->is_embedded || aafi_extractAudioEssenceFile (aafi, essence, AAFI_EXTRACT_WAV,
-		        argv[2], 0, 0, filename, NULL) != 0) {
+		        argv[2], 0, 0, filename, NULL) != 0 || errors) {
 			aafi_release (&aafi);
 			return 5;
 		}

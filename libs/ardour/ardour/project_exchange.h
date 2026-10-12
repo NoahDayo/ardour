@@ -54,6 +54,7 @@ struct Clip {
 	double duration = 0; // Same unit as position.
 	Time offset; // Source time, independent of arrangement position.
 	bool enabled = true;
+	double gain = 1; // Linear audio-region amplitude; MIDI clips use unity.
 	std::string media; // Audio source ID.
 	std::vector<Note> notes; // Note times use offset.unit, relative to the source.
 };

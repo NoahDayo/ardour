@@ -23,6 +23,10 @@ public:
 	static std::unique_ptr<Session> import_studio_one (AudioEngine&, const std::string& song,
 	                                                const std::string& destination, const std::string& snapshot,
 	                                                std::vector<Diagnostic>&, CancelCheck = CancelCheck ());
+	/* Same engine and transaction requirements as import_dawproject. */
+	static std::unique_ptr<Session> import_logic (AudioEngine&, const std::string& aaf, const std::string& midi,
+	                                            const std::string& destination, const std::string& snapshot,
+	                                            std::vector<Diagnostic>&, CancelCheck = CancelCheck ());
 	/* Run on the session's owning control thread with editing suspended.
 	 * Transport must be stopped. An existing destination is never replaced. */
 	static std::vector<Diagnostic> export_dawproject (Session&, const std::string& destination, CancelCheck = CancelCheck ());

@@ -615,6 +615,7 @@ struct Writer {
 
 	void clip (Node parent, const Clip& clip)
 	{
+		if (clip.gain != 1) { throw ExchangeError ("Audio region gain is not yet converted to DAWproject"); }
 		Node output = element (parent, "Clip");
 		property (output, "time", clip.position.value);
 		property (output, "duration", clip.duration);

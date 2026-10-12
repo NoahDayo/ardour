@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include "aaf/AAFDefs/AAFClassDefUIDs.h"
+#include "aaf/AAFDefs/AAFExtensionClassUIDs.h"
 #include "aaf/AAFDefs/AAFCompressionDefs.h"
 #include "aaf/AAFDefs/AAFContainerDefs.h"
 #include "aaf/AAFDefs/AAFDataDefs.h"
@@ -2220,6 +2221,8 @@ aaft_ClassIDToText (AAF_Data* aafd, const aafUID_t* auid)
 		return "AAFClassID_TypeDefinitionOpaque";
 	if (aafUIDCmp (auid, &AAFClassID_TypeDefinitionCharacter))
 		return "AAFClassID_TypeDefinitionCharacter";
+	if (aafUIDCmp (auid, &AAFClassID_TypeDefinitionGenericCharacter))
+		return "AAFClassID_TypeDefinitionGenericCharacter";
 	if (aafUIDCmp (auid, &AAFClassID_MetaDefinition))
 		return "AAFClassID_MetaDefinition";
 	if (aafUIDCmp (auid, &AAFClassID_MetaDictionary))

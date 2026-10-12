@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <map>
+#include <limits>
 #include <set>
 #include <glib.h>
 
@@ -86,6 +87,8 @@ validate_project (const Project& project)
 		for (auto const& clip : track.clips) {
 			text (clip.name);
 			text (clip.color);
+			require (nonnegative (clip.gain) && clip.gain <= std::numeric_limits<float>::max () &&
+			         (clip.kind == ClipKind::Audio || clip.gain == 1), "Invalid clip gain");
 			require (nonnegative (clip.position.value) && nonnegative (clip.duration) && clip.duration > 0 &&
 			         std::isfinite (clip.position.value + clip.duration) && nonnegative (clip.offset.value), "Invalid clip range");
 			if (clip.kind == ClipKind::Audio) {

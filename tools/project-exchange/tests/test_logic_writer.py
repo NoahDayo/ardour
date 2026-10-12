@@ -79,7 +79,7 @@ def fixture(directory):
         track = ET.SubElement(root, "AudioTrack", name="Audio %d café" % channels, channels=str(channels),
                               gain="0.75", pan="0.25" if channels == 1 else "0.5", color="#123456")
         ET.SubElement(track, "Clip", name="Offset 音楽", time="12000", length="24000", offset="6000",
-                      enabled="true", media="source-%d" % channels, color="#abcdef")
+                      enabled="true", media="source-%d" % channels, color="#abcdef", gain="0.375")
         ET.SubElement(track, "Clip", name="Muted", time="48000", length="12000", offset="30000",
                       enabled="false", media="source-%d" % channels)
     track = ET.SubElement(root, "MidiTrack", name="Notes café")
@@ -129,7 +129,7 @@ class LogicWriterTest(unittest.TestCase):
             if i == 1:
                 self.assertEqual(track["pan"], .25)
             self.assertEqual(track["clips"], [
-                {"position": 12000, "length": 24000, "offset": 6000, "channels": i},
+                {"position": 12000, "length": 24000, "offset": 6000, "channels": i, "gain": .375},
                 {"position": 48000, "length": 12000, "offset": 30000, "channels": i, "gain": 0}])
         for media in parsed["media"]:
             with wave.open(media["path"], "rb") as source:
@@ -164,6 +164,37 @@ class LogicWriterTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(sentinel.read_bytes(), b"existing project")
         self.assertFalse((self.output / "Project.mid").exists())
+
+    def test_reader_rejects_used_unresolved_extension_type(self):
+        result = self.run_writer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        original = self.output / "Project.aaf"
+        for stored in (False, True):
+            with self.subTest(stored=stored):
+                path = self.directory / ("extension-%s.aaf" % stored)
+                path.write_bytes(original.read_bytes())
+                with aaf2.open(str(path), "rw") as output:
+                    composition = next(output.content.toplevel())
+                    definition = composition.classdef.register_propertydef(
+                        "ExchangeTestExtension", "84f8e1e6-89e8-45ed-a263-1ba76aa2199f",
+                        None, "aafUInt8", True)
+                    if stored:
+                        composition["ExchangeTestExtension"].value = 7
+                    # Break the dictionary reference while leaving the object's
+                    # encoded property intact, as in an incomplete vendor file.
+                    definition.property_entries[aaf2.metadict.PID_TYPE].data = aaf2.auid.AUID(
+                        "f128d426-62af-427f-950a-26d120bd53eb").bytes_le
+                    definition.write_properties()
+                extracted = self.directory / ("extension-media-%s" % stored)
+                extracted.mkdir()
+                result = subprocess.run([self.probe, str(path), str(extracted)], capture_output=True,
+                                        text=True, encoding="utf-8", timeout=30)
+                if stored:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("with an unresolved extension type", result.stderr)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(len(json.loads(result.stdout)["tracks"]), 2)
 
     def test_reader_preserves_stereo_gain_automation(self):
         result = self.run_writer()

@@ -592,6 +592,7 @@ SessionDialog::setup_existing_box ()
 	FileFilter aaf_filter;
 	aaf_filter.add_pattern (string_compose(X_("*%1"), ARDOUR::advanced_authoring_format_suffix));
 	aaf_filter.set_name (_("Advanced Authoring Format (AAF)"));
+	aaf_filter.add_pattern ("*.AAF");
 	existing_session_chooser.add_filter (aaf_filter);
 
 	FileFilter dawproject_filter;
@@ -614,6 +615,7 @@ SessionDialog::setup_existing_box ()
 	all_filter.add_pattern ("*.DAWPROJECT");
 	all_filter.add_pattern ("*.song");
 	all_filter.add_pattern ("*.SONG");
+	all_filter.add_pattern ("*.AAF");
 	all_filter.set_name (_("All supported files"));
 	existing_session_chooser.add_filter (all_filter);
 
