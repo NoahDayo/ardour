@@ -1,0 +1,306 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Independent DAWproject fixtures; these are not exports from a target DAW."""
+import argparse
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+import wave
+import xml.etree.ElementTree as ET
+import zipfile
+
+
+PROJECT = '''<Project version="1.0">
+  <Application name="Independent fixture" version="1"/>
+  <Transport><Tempo unit="bpm" value="100"/><TimeSignature numerator="7" denominator="8"/></Transport>
+  <Structure>
+    <Track id="folder" name="Band &amp; Friends"><Channel id="cf" audioChannels="2" destination="master"/>
+      <Track id="audio" name="Stereo café" contentType="audio" color="#abcdef">
+        <Channel id="ca" audioChannels="2" destination="master" solo="true">
+          <Mute value="false"/><Pan unit="normalized" value="0.25"/><Volume unit="linear" value="0.8"/>
+        </Channel>
+      </Track>
+      <Track id="midi" name="Keys" contentType="notes"><Channel id="cm" audioChannels="2" destination="master"/></Track>
+    </Track>
+    <Channel id="master" name="Main" role="master" audioChannels="2"/>
+  </Structure>
+  <Arrangement><Lanes timeUnit="beats">
+    <Lanes track="audio" timeUnit="seconds"><Clips timeUnit="beats">
+      <Clip name="Lead" time="8" contentTimeUnit="seconds" playStart="0.25" playStop="1.75">
+        <Audio id="source" timeUnit="seconds" duration="4" channels="2" sampleRate="48000"><File path="audio/波形.wav"/></Audio>
+      </Clip>
+      <Clip name="Echo" time="16" duration="1.25" contentTimeUnit="seconds" playStart="1" reference="source" enable="false"/>
+    </Clips></Lanes>
+    <Lanes track="midi"><Clips><Clip time="4" duration="4" playStart="1" name="Notes">
+      <Notes><Note time="0" duration="0.5" key="60" vel="0.7"/>
+        <Note time="1" duration="0.5" key="67" channel="3" vel="0.6" rel="0.2"/>
+      </Notes>
+    </Clip></Clips></Lanes>
+  </Lanes></Arrangement>
+</Project>'''
+
+
+def pcm_wave():
+    data = bytes(range(256)) * 3000  # Four seconds of stereo PCM16 at 48 kHz.
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setparams((2, 2, 48000, 192000, "NONE", "not compressed"))
+        wav.writeframes(data)
+    return output.getvalue()
+
+
+class DawProjectTest(unittest.TestCase):
+    probe = None
+    schema = None
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="ardour-dawproject-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.input = self.root / "project.xml"
+
+    def command(self, *args, status=0):
+        result = subprocess.run([self.probe, *map(str, args)], capture_output=True,
+                                text=True, encoding="utf-8", timeout=30, env=os.environ)
+        self.assertEqual(result.returncode, status, result.stderr)
+        return result
+
+    def parse(self, xml=PROJECT, status=0):
+        self.input.write_text(xml, encoding="utf-8")
+        result = self.command("parse", self.input, status=status)
+        return json.loads(result.stdout) if status == 0 else result
+
+    def package(self, xml=PROJECT, media=True):
+        path = self.root / "input.dawproject"
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as output:
+            output.writestr("project.xml", xml)
+            output.writestr("metadata.xml", "<MetaData/>")
+            if media:
+                output.writestr("audio/波形.wav", pcm_wave())
+        return path
+
+    def assert_schema(self, path):
+        if self.schema is not None:
+            self.command("schema", path, self.schema)
+
+    def semantic(self, parsed):
+        result = json.loads(json.dumps(parsed))
+        names = {t["id"]: t["name"] for t in result["tracks"]}
+        media = {m["id"]: m["path"] for m in result["media"]}
+        for source in result["media"]:
+            del source["id"]
+        for track in result["tracks"]:
+            del track["id"]
+            track["parent"] = names.get(track["parent"], "")
+            track["destination"] = names.get(track["destination"], "")
+            for clip in track["clips"]:
+                clip["media"] = media.get(clip["media"], "")
+        del result["report"]
+        return result
+
+    def test_independent_audio_midi_timing_and_mixer_fixture(self):
+        project = self.parse()
+        self.assertEqual(project["tempo"], 100)
+        self.assertEqual(project["meter"], [7, 8])
+        self.assertEqual(project["report"], [])
+        self.assertEqual([t["name"] for t in project["tracks"]], ["Band & Friends", "Stereo café", "Keys", "Main"])
+        self.assertEqual([t["kind"] for t in project["tracks"]], [2, 0, 1, 3])
+        self.assertEqual(project["media"], [{"id": "source", "path": "audio/波形.wav", "channels": 2, "rate": 48000, "duration": 4}])
+        track = project["tracks"][1]
+        self.assertEqual((track["parent"], track["destination"]), ("folder", "master"))
+        self.assertEqual((track["volume"], track["pan"], track["solo"]), (0.8, 0.25, True))
+        lead, echo = track["clips"]
+        self.assertEqual((lead["position"], lead["duration"], lead["offset"]), ([8, "beats"], 2.5, [0.25, "seconds"]))
+        self.assertEqual((echo["position"], echo["duration"], echo["offset"], echo["enabled"]), ([16, "beats"], 1.25, [1, "seconds"], False))
+        midi = project["tracks"][2]["clips"][0]
+        self.assertEqual((midi["position"], midi["duration"], midi["offset"]), ([4, "beats"], 4, [1, "beats"]))
+        self.assertEqual(midi["notes"], [[0, 0.5, 60, 0, 0.7, 0.5], [1, 0.5, 67, 3, 0.6, 0.2]])
+
+    def test_xml_round_trip(self):
+        before = self.parse()
+        output = self.root / "rewritten.xml"
+        self.command("rewrite", self.input, output)
+        self.assert_schema(output)
+        after = json.loads(self.command("parse", output).stdout)
+        self.assertEqual(self.semantic(after), self.semantic(before))
+        root = ET.parse(output).getroot()
+        self.assertEqual(len(root.findall(".//Audio")), 1)
+        self.assertEqual(len(root.findall(".//Clip[@reference]")), 1)
+        self.assertEqual(len(root.findall(".//Note")), 2)
+        self.assertEqual(root.find(".//Track[@name='Stereo café']").get("color"), "#abcdef")
+
+    def test_official_schema(self):
+        if self.schema is None:
+            self.skipTest("Pass --schema with the official DAWproject Project.xsd")
+        self.parse()
+        output = self.root / "schema-output.xml"
+        self.command("rewrite", self.input, output)
+        self.command("schema", output, self.schema)
+
+    def test_self_contained_zip_export_and_media_bytes(self):
+        source = self.package()
+        destination = self.root / "交換.dawproject"
+        media = self.root / "extracted"
+        media.mkdir()
+        before = json.loads(self.command("read", source).stdout)
+        self.command("repack", source, destination, media)
+        source.unlink()
+        for path in media.iterdir():
+            path.unlink()
+        after = json.loads(self.command("read", destination).stdout)
+        self.assertEqual(self.semantic(after), self.semantic(before))
+        with zipfile.ZipFile(destination) as output:
+            self.assertIsNone(output.testzip())
+            self.assertEqual(hashlib.sha256(output.read("audio/波形.wav")).digest(), hashlib.sha256(pcm_wave()).digest())
+            self.input.write_bytes(output.read("project.xml"))
+            self.assert_schema(self.input)
+
+    def test_nested_clip_flattening_and_trim_offsets(self):
+        nested = '''<Project version="1.0"><Application name="Fixture" version="1"/>
+          <Structure><Track id="t" contentType="audio"/></Structure>
+          <Arrangement><Lanes><Clips track="t"><Clip time="10" duration="8" contentTimeUnit="seconds" playStart="2" playStop="6" enable="false" name="Comp">
+            <Clips timeUnit="seconds"><Clip time="1" duration="3" playStart="0.5">
+              <Audio id="a" channels="1" sampleRate="48000" duration="10"><File path="a.wav"/></Audio>
+            </Clip><Clip time="5" duration="3" reference="a"/></Clips>
+          </Clip></Clips></Lanes></Arrangement></Project>'''
+        project = self.parse(nested)
+        clips = project["tracks"][0]["clips"]
+        self.assertEqual(len(clips), 2)
+        self.assertEqual((clips[0]["position"], clips[0]["duration"], clips[0]["offset"]), ([10, "beats"], 4, [1.5, "seconds"]))
+        self.assertEqual((clips[1]["position"], clips[1]["duration"], clips[1]["offset"]), ([16, "beats"], 2, [0, "seconds"]))
+        self.assertTrue(all(not c["enabled"] and c["name"] == "Comp" for c in clips))
+        self.assertEqual([r["disposition"] for r in project["report"]], [1])
+        output = self.root / "flat.xml"
+        self.command("rewrite", self.input, output)
+        self.assert_schema(output)
+        self.assertEqual(self.semantic(json.loads(self.command("parse", output).stdout)), self.semantic(project))
+
+    def test_forward_references_and_inferred_track_kind(self):
+        root = ET.fromstring(PROJECT)
+        clips = root.find(".//Lanes[@track='audio']/Clips")
+        first, second = list(clips)
+        clips.remove(second)
+        clips.insert(0, second)
+        root.find(".//Track[@id='midi']").attrib.pop("contentType")
+        parsed = self.parse(ET.tostring(root, encoding="unicode"))
+        self.assertEqual(parsed["tracks"][1]["clips"][0]["name"], "Echo")
+        self.assertEqual(len(parsed["media"]), 1)
+        self.assertEqual(parsed["tracks"][2]["kind"], 1)
+
+    def test_mixed_midi_content_units(self):
+        xml = PROJECT.replace('<Notes>', '<Notes timeUnit="seconds">')
+        project = self.parse(xml)
+        self.assertEqual(project["tracks"][2]["clips"][0]["offset"], [0.6, "seconds"])
+
+    def test_whitespace_and_decibel_gain(self):
+        xml = PROJECT.replace('value="100"', 'value=" 100 "').replace('unit="linear" value="0.8"', 'unit="decibel" value="-6.020599913279624"')
+        self.assertAlmostEqual(self.parse(xml)["tracks"][1]["volume"], 0.5, places=14)
+
+    def test_feedback_routing_is_rejected(self):
+        xml = PROJECT.replace('id="ca" audioChannels="2" destination="master"', 'id="ca" audioChannels="2" destination="cm"')
+        xml = xml.replace('id="cm" audioChannels="2" destination="master"', 'id="cm" audioChannels="2" destination="ca"')
+        self.assertIn("Cyclic", self.parse(xml, status=1).stderr)
+
+    def test_reference_expansion_is_bounded(self):
+        root = ET.fromstring('<Project version="1.0"><Application name="Expansion" version="1"/><Structure><Track id="t" contentType="audio"/></Structure><Arrangement><Lanes><Clips track="t"><Clip time="0" duration="1" reference="level19"/></Clips></Lanes></Arrangement><Scenes/></Project>')
+        scenes = root.find("Scenes")
+        for level in range(20):
+            timeline = ET.SubElement(ET.SubElement(ET.SubElement(scenes, "Scene"), "Lanes"), "Clips", id=f"level{level}")
+            if level == 0:
+                clip = ET.SubElement(timeline, "Clip", time="0", duration="1", contentTimeUnit="seconds")
+                audio = ET.SubElement(clip, "Audio", id="a", duration="1", channels="1", sampleRate="48000")
+                ET.SubElement(audio, "File", path="a.wav")
+            else:
+                for _ in range(2):
+                    ET.SubElement(timeline, "Clip", time="0", duration="1", reference=f"level{level-1}")
+        result = self.parse(ET.tostring(root, encoding="unicode"), status=1)
+        self.assertIn("limit", result.stderr)
+        root = ET.fromstring(PROJECT)
+        arrangement = root.find("Arrangement")
+        arrangement.clear()
+        clips = ET.SubElement(ET.SubElement(arrangement, "Lanes"), "Clips", track="midi")
+        notes = ET.SubElement(ET.SubElement(clips, "Clip", time="0", duration="1"), "Notes", id="manyNotes")
+        for _ in range(500):
+            ET.SubElement(notes, "Note", time="0", duration="0.5", key="60")
+        for index in range(600):
+            ET.SubElement(clips, "Clip", time=str(index + 1), duration="1", reference="manyNotes")
+        result = self.parse(ET.tostring(root, encoding="unicode"), status=1)
+        self.assertIn("expanded object limit", result.stderr)
+
+    def test_report_prevents_unacknowledged_feature_loss(self):
+        changes = [('<Clip name="Lead"', '<Clip fadeInTime="0.1" name="Lead"'),
+                   ('<Mute value="false"/>', '<Devices><Vst3Plugin deviceName="Effect" deviceRole="audioFX"/></Devices><Mute value="false"/>'),
+                   ('<Notes>', '<Notes vendorExtension="yes">'),
+                   ('<Channel id="ca"', '<Channel name="Separate mixer label" id="ca"'),
+                   ('role="master"', 'role="regular"')]
+        for old, new in changes:
+            with self.subTest(feature=new):
+                project = self.parse(PROJECT.replace(old, new))
+                self.assertTrue(any(r["disposition"] == 3 for r in project["report"]))
+                target = self.root / "lost.xml"
+                self.command("rewrite", self.input, target, status=1)
+                self.assertFalse(target.exists())
+
+    def test_reject_malformed_and_out_of_range_values(self):
+        changes = [('version="1.0"', 'version="2.0"'), ('value="100"', 'value="NaN"'),
+                   ('value="100"', 'value="0"'), ('denominator="8"', 'denominator="3"'),
+                   ('time="8"', 'time="INF"'), ('playStart="0.25"', 'playStart="-1"'),
+                   ('duration="1.25"', 'duration="0"'), ('playStart="1" reference', 'playStart="4" reference'),
+                   ('channels="2" sampleRate', 'channels="0" sampleRate'), ('channel="3"', 'channel="16"'),
+                   ('vel="0.6"', 'vel="1.01"'), ('key="67"', 'key="128"'), ('id="midi"', 'id="audio"'),
+                   ('track="audio"', 'track="missing"'), ('reference="source"', 'reference="missing"'),
+                   ('enable="false"', 'enable="maybe"'), ('contentTimeUnit="seconds"', 'contentTimeUnit="samples"'),
+                   ('<Clip name="Lead"', '<Clip loopStart="0" loopEnd="1" name="Lead"'),
+                   ('<Clip name="Lead"', '<Clip reference="source" name="Lead"'),
+                   ('<Project version', '<Project xmlns="urn:unknown" version')]
+        for old, new in changes:
+            with self.subTest(change=new):
+                self.parse(PROJECT.replace(old, new, 1), status=1)
+
+    def test_reject_tempo_changes_until_mapped(self):
+        xml = PROJECT.replace('</Arrangement>', '<TempoAutomation><RealPoint time="4" value="80"/></TempoAutomation></Arrangement>')
+        result = self.parse(xml, status=1)
+        self.assertIn("Tempo", result.stderr)
+
+    def test_reject_dtd_entities_and_reference_cycles(self):
+        secret = self.root / "private.txt"
+        secret.write_text("MUST_NOT_APPEAR", encoding="utf-8")
+        for declaration in [f'<!DOCTYPE Project SYSTEM "{secret.as_uri()}">',
+                            '<!DOCTYPE Project [<!ENTITY internal "MUST_NOT_APPEAR">]>',
+                            f'<!DOCTYPE Project [<!ENTITY external SYSTEM "{secret.as_uri()}">]>']:
+            with self.subTest(declaration=declaration):
+                result = self.parse(declaration + PROJECT, status=1)
+                self.assertNotIn("MUST_NOT_APPEAR", result.stdout + result.stderr)
+        cycle = '''<Project version="1.0"><Application name="Cycle" version="1"/><Structure><Track id="t" contentType="audio"/></Structure>
+          <Arrangement><Lanes><Clips id="cycle" track="t"><Clip time="0" duration="1" reference="cycle"/></Clips></Lanes></Arrangement></Project>'''
+        self.assertIn("Cyclic", self.parse(cycle, status=1).stderr)
+
+    def test_missing_external_media_and_invalid_package(self):
+        self.command("read", self.package(media=False), status=1)
+        self.command("read", self.package(PROJECT.replace('path="audio/波形.wav"', 'path="audio/波形.wav" external="true"')), status=1)
+        self.command("read", self.package(PROJECT.replace('path="audio/波形.wav"', 'path="../outside.wav"')), status=1)
+        empty = self.root / "empty.dawproject"
+        with zipfile.ZipFile(empty, "w"):
+            pass
+        self.command("read", empty, status=1)
+
+    def test_invalid_or_deep_xml(self):
+        for xml in ["", "not XML", "<Project>", "<Different/>", '<Project version="1.0"/>',
+                    '<Project version="1.0">' + '<Lanes>' * 130 + '</Lanes>' * 130 + '</Project>']:
+            self.parse(xml, status=1)
+        self.parse(PROJECT.replace('<Volume unit="linear" value="0.8"/>', '<Volume unit="linear" value="0.8"><Unknown/></Volume>'), status=1)
+        self.parse(PROJECT.replace('<Arrangement>', '<Arrangement>unexpected text'), status=1)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--probe", required=True, type=Path)
+    parser.add_argument("--schema", type=Path, help="Optional official Project.xsd for independent output validation")
+    args = parser.parse_args()
+    DawProjectTest.probe = str(args.probe.resolve())
+    DawProjectTest.schema = str(args.schema.resolve()) if args.schema else None
+    unittest.main(argv=[__file__], verbosity=2)
