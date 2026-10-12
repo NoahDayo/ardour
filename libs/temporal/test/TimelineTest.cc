@@ -1,5 +1,5 @@
 #include <iostream>
-#include <stdlib.h>
+#include <random>
 
 #include "temporal/timeline.h"
 
@@ -15,7 +15,7 @@ TimelineTest::createTest()
 	using namespace Temporal;
 	using namespace std;
 
-	srandom (time (0));
+	std::mt19937 random (0);
 
 	vector<timepos_t> times;
 

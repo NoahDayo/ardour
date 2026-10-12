@@ -1,6 +1,7 @@
 #include "windows_timer_utils_test.h"
 
 #include "pbd/windows_timer_utils.h"
+#include "pbd/microseconds.h"
 
 #include <windows.h>
 
@@ -13,17 +14,14 @@ CPPUNIT_TEST_SUITE_REGISTRATION (WindowsTimerUtilsTest);
 void
 WindowsTimerUtilsTest::testQPC ()
 {
-	// performs basically the same test
-	CPPUNIT_ASSERT (PBD::QPC::check_timer_valid());
-
-	int64_t last_timer_val = PBD::QPC::get_microseconds ();
-	CPPUNIT_ASSERT (last_timer_val >= 0);
+	int64_t last_timer_val = PBD::get_microseconds ();
+	CPPUNIT_ASSERT (last_timer_val > 0);
 
 	int64_t min_interval = 1000000;
 	int64_t max_interval = 0;
 
 	for (int i = 0; i < 10000; ++i) {
-		int64_t timer_val = PBD::QPC::get_microseconds ();
+		int64_t timer_val = PBD::get_microseconds ();
 		CPPUNIT_ASSERT (timer_val >= 0);
 		// try and test for non-syncronized TSC(AMD K8/etc)
 		CPPUNIT_ASSERT (timer_val >= last_timer_val);
@@ -126,7 +124,9 @@ WindowsTimerUtilsTest::testMMTimers ()
 {
 	uint32_t min_timer_res = 0;
 	CPPUNIT_ASSERT (PBD::MMTIMERS::get_min_resolution (min_timer_res));
-	CPPUNIT_ASSERT (min_timer_res == 1);
+	TIMECAPS caps;
+	CPPUNIT_ASSERT_EQUAL (MMRESULT (TIMERR_NOERROR), timeGetDevCaps (&caps, sizeof (caps)));
+	CPPUNIT_ASSERT_EQUAL (uint32_t (caps.wPeriodMin), min_timer_res);
 
 	uint32_t avg_orig_res_tgt_elapsed = 0;
 
@@ -143,22 +143,13 @@ WindowsTimerUtilsTest::testMMTimers ()
 
 	test_tgt_granularity ("Minimum Timer Resolution", avg_min_res_tgt_elapsed);
 
-	// In a heavily loaded system and without running this test with raised
-	// scheduling priority we can't assume that the granularity is the same as
-	// the minimum timer resolution so give it a few ms of slack, if it is
-	// greater than that then there likely is a problem that needs investigating.
-	CPPUNIT_ASSERT (avg_min_res_tgt_elapsed <= 5);
-
 	uint32_t avg_min_res_sleep_elapsed = 0;
 
-	// This should have roughly the same granularity as the tgt test above
+	// These measurements are diagnostic, not scheduling deadlines. Sleep does
+	// not guarantee immediate scheduling when its interval expires, and Windows
+	// 11 may disregard the requested resolution for invisible applications.
+	// https://learn.microsoft.com/windows/win32/api/timeapi/nf-timeapi-timebeginperiod
 	test_sleep_granularity ("Minimum Timer Resolution", avg_min_res_sleep_elapsed);
 
-	CPPUNIT_ASSERT (avg_min_res_sleep_elapsed <= 5);
-
 	CPPUNIT_ASSERT (PBD::MMTIMERS::reset_resolution());
-
-	// You can't test setting the max timer resolution because AFAIR Windows
-	// will use the minimum requested resolution of all the applications on the
-	// system.
 }

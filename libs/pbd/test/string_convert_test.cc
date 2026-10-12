@@ -25,9 +25,10 @@ public:
 	// previous setting when going out of scope
 	LocaleGuard (const std::string& locale)
 	{
-		m_previous_locale = setlocale (LC_ALL, NULL);
-
-		CPPUNIT_ASSERT (m_previous_locale != NULL);
+		const char* previous = setlocale (LC_ALL, NULL);
+		CPPUNIT_ASSERT (previous != NULL);
+		// setlocale may invalidate its returned buffer on the next call.
+		m_previous_locale = previous;
 
 		const char* new_locale = setlocale (LC_ALL, locale.c_str ());
 
@@ -40,11 +41,11 @@ public:
 
 	~LocaleGuard ()
 	{
-		CPPUNIT_ASSERT (setlocale (LC_ALL, m_previous_locale) != NULL);
+		CPPUNIT_ASSERT (setlocale (LC_ALL, m_previous_locale.c_str ()) != NULL);
 	}
 
 private:
-	const char* m_previous_locale;
+	std::string m_previous_locale;
 };
 
 static
@@ -91,9 +92,9 @@ static std::vector<std::string> get_supported_locales ()
 	std::vector<std::string> locales = get_locale_list ();
 	std::vector<std::string> supported_locales;
 
-	const char * m_orig_locale = setlocale (LC_ALL, NULL);
-
-	CPPUNIT_ASSERT (m_orig_locale != NULL);
+	const char* original = setlocale (LC_ALL, NULL);
+	CPPUNIT_ASSERT (original != NULL);
+	const std::string m_orig_locale (original);
 
 	std::cerr << std::endl << "Original locale: " << m_orig_locale << std::endl;
 
@@ -122,7 +123,7 @@ static std::vector<std::string> get_supported_locales ()
 		supported_locales.push_back (*it);
 	}
 
-	if (setlocale (LC_ALL, m_orig_locale) == NULL) {
+	if (setlocale (LC_ALL, m_orig_locale.c_str ()) == NULL) {
 		std::cerr << "ERROR: Unable to restore original locale " << m_orig_locale
 		          << ", further tests may be invalid." << std::endl;
 	}
@@ -462,7 +463,8 @@ _test_float_conversion ()
 	string str;
 	CPPUNIT_ASSERT (float_to_string (numeric_limits<float>::max (), str));
 #ifdef PLATFORM_WINDOWS
-	CPPUNIT_ASSERT_EQUAL (MAX_FLOAT_WIN, str);
+	// Legacy MSVCRT uses three exponent digits; UCRT uses two.
+	CPPUNIT_ASSERT (str == MAX_FLOAT_WIN || str == MAX_FLOAT_STR);
 #else
 	CPPUNIT_ASSERT_EQUAL (MAX_FLOAT_STR, str);
 #endif
@@ -474,7 +476,7 @@ _test_float_conversion ()
 
 	CPPUNIT_ASSERT (float_to_string (numeric_limits<float>::min (), str));
 #ifdef PLATFORM_WINDOWS
-	CPPUNIT_ASSERT_EQUAL (MIN_FLOAT_WIN, str);
+	CPPUNIT_ASSERT (str == MIN_FLOAT_WIN || str == MIN_FLOAT_STR);
 #else
 	CPPUNIT_ASSERT_EQUAL (MIN_FLOAT_STR, str);
 #endif
@@ -490,10 +492,7 @@ _test_float_conversion ()
 	float min = numeric_limits<float>::min ();
 	CPPUNIT_ASSERT_EQUAL (min, string_to<float>(to_string<float> (min)));
 
-// check that parsing the windows float string representation with the
-// difference in the exponent part parses correctly on other platforms
-// and vice versa
-#ifdef PLATFORM_WINDOWS
+	// Sessions written by either Windows CRT must parse on every platform.
 	CPPUNIT_ASSERT (string_to_float (MAX_FLOAT_STR, val));
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (
 	    numeric_limits<float>::max (), val, numeric_limits<float>::epsilon ());
@@ -501,7 +500,6 @@ _test_float_conversion ()
 	CPPUNIT_ASSERT (string_to_float (MIN_FLOAT_STR, val));
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (
 	    numeric_limits<float>::min (), val, numeric_limits<float>::epsilon ());
-#else
 	CPPUNIT_ASSERT (string_to_float (MAX_FLOAT_WIN, val));
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (
 	    numeric_limits<float>::max (), val, numeric_limits<float>::epsilon ());
@@ -509,7 +507,6 @@ _test_float_conversion ()
 	CPPUNIT_ASSERT (string_to_float (MIN_FLOAT_WIN, val));
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (
 	    numeric_limits<float>::min (), val, numeric_limits<float>::epsilon ());
-#endif
 
 	_test_infinity_conversion<float>();
 }
