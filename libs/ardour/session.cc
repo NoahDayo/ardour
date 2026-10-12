@@ -766,11 +766,13 @@ Session::destroy ()
 	_io_graph_chain[0].reset ();
 	_io_graph_chain[1].reset ();
 
-	_io_tasklist.reset ();
-
 	_butler->drop_references ();
 	delete _butler;
 	_butler = 0;
+
+	/* The butler can still queue/refill disk work until its destructor has
+	 * joined the thread. Keep the task list alive through that join. */
+	_io_tasklist.reset ();
 
 	if (click_data != default_click) {
 		delete [] click_data;
