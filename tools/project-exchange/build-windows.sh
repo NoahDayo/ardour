@@ -8,6 +8,11 @@ if [[ ${MSYSTEM:-} != UCRT64 ]]; then
 fi
 
 cd "$(dirname "$0")/../.."
+root=$(pwd -P)
+bash tools/project-exchange/build-lilv-windows.sh
+dependency_prefix=${ARDOUR_BUILD_ROOT:-"$root/../Ardour_Build"}/dependency-runtime/ucrt64
+export PKG_CONFIG_PATH="$dependency_prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+export PATH="$dependency_prefix/bin:$PATH"
 mkdir -p build-evidence
 pacman -Q > build-evidence/msys2-packages.txt
 git rev-parse HEAD > build-evidence/source-commit.txt

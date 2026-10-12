@@ -160,17 +160,95 @@ class NativeSongTest(unittest.TestCase):
         self.read(status=1)
 
     def test_unsupported_processing_is_reported(self):
-        for before, after in [('length="1"', 'length="1" speed="2"'), ('length="1"', 'length="1" gain="0.5"'),
+        for before, after in [('length="1"', 'length="1" speed="2"'), ('length="4"', 'length="4" gain="0.5"'),
                               ('name="Trimmed"', 'name="Trimmed" unknownProcess="1"')]:
             self.entries["Song/song.xml"] = SONG.replace(before, after)
             self.assertTrue(any(d["disposition"] == 3 for d in self.read()["project"]["report"]))
 
-    def test_variable_tempo_and_instruments_reported(self):
-        self.entries["Song/song.xml"] = SONG.replace('</TempoMap>', '<TempoMapSegment start="8" tempo="0.75"/></TempoMap>')
+    def test_tempo_curves_and_instruments_reported(self):
+        self.entries["Song/song.xml"] = SONG.replace('curveType="0"', 'curveType="1"').replace('</TempoMap>', '<TempoMapSegment start="8" tempo="0.75"/></TempoMap>')
         self.entries["Devices/audiosynthfolder.xml"] = '<AudioSynthFolder><AudioSynth name="Synth"/></AudioSynthFolder>'
         report = self.read()["project"]["report"]
         self.assertTrue(any(d["object"] == "Tempo map" and d["disposition"] == 3 for d in report))
         self.assertTrue(any(d["object"] == "Instruments" and d["disposition"] == 3 for d in report))
+
+    def test_tempo_meter_steps_and_audio_gain(self):
+        self.entries["Song/song.xml"] = (SONG.replace('tempo="0.5"', 'tempo="0.5" end="8"')
+            .replace('</TempoMap>', '<TempoMapSegment start="8" end="12.5" tempo="0.75"/><TempoMapSegment start="12.5" end="1.7976931348623156e+200" tempo="0.25"/></TempoMap>')
+            .replace('</TimeSignatureMap>', '<TimeSignatureMapSegment start="8" numerator="7" denominator="8"/></TimeSignatureMap>')
+            .replace('name="Trimmed"', 'name="Trimmed" gain="0.5"'))
+        p = self.read()["project"]
+        self.assertEqual(p["tempos"], [[[0, "beats"], 120, False], [[8, "beats"], 80, False], [[12.5, "beats"], 240, False]])
+        self.assertEqual(p["meters"], [[[0, "beats"], 4, 4], [[8, "beats"], 7, 8]])
+        self.assertEqual(p["tracks"][0]["clips"][0]["gain"], .5)
+        self.assertFalse(any(d["disposition"] == 3 for d in p["report"]))
+
+    def test_audio_gain_range(self):
+        for gain in (0, .125, 1, 2):
+            with self.subTest(gain=gain):
+                self.entries["Song/song.xml"] = SONG.replace('name="Trimmed"', f'name="Trimmed" gain="{gain}"')
+                self.assertEqual(self.read()["project"]["tracks"][0]["clips"][0]["gain"], gain)
+        for gain in ('-0.5', 'nan', 'inf', '1e100'):
+            with self.subTest(gain=gain):
+                self.entries["Song/song.xml"] = SONG.replace('name="Trimmed"', f'name="Trimmed" gain="{gain}"')
+                self.read(status=1)
+
+    def test_invalid_transport_refused(self):
+        changes = [
+            ('start="0" tempo', 'start="1" tempo'),
+            ('start="0" tempo', 'start="-1" tempo'),
+            ('tempo="0.5"', 'tempo="0"'),
+            ('tempo="0.5"', 'tempo="-1"'),
+            ('tempo="0.5"', 'tempo="1e-100"'),
+            ('tempo="0.5"', 'tempo="0.5" end="0"'),
+            ('</TempoMap>', '<TempoMapSegment start="0" tempo="0.75"/></TempoMap>'),
+            ('</TempoMap>', '<TempoMapSegment start="8" tempo="0.75"/><TempoMapSegment start="4" tempo="0.5"/></TempoMap>'),
+            ('start="0" numerator', 'start="1" numerator'),
+            ('denominator="4"', 'denominator="3"'),
+            ('</TimeSignatureMap>', '<TimeSignatureMapSegment start="0" numerator="3" denominator="4"/></TimeSignatureMap>'),
+            ('</TimeSignatureMap>', '<TimeSignatureMapSegment start="8" numerator="3" denominator="4"/><TimeSignatureMapSegment start="4" numerator="4" denominator="4"/></TimeSignatureMap>'),
+        ]
+        for before, after in changes:
+            with self.subTest(after=after):
+                self.entries["Song/song.xml"] = SONG.replace(before, after)
+                self.read(status=1)
+        for end in (7, 9):
+            self.entries["Song/song.xml"] = SONG.replace('tempo="0.5"', f'tempo="0.5" end="{end}"').replace('</TempoMap>', '<TempoMapSegment start="8" tempo="0.75"/></TempoMap>')
+            self.assertIn('gap or overlap', self.read(status=1))
+
+    def test_mixed_unit_boundaries_use_tempo_map(self):
+        # At 120 BPM for eight beats then 240 BPM, beat 32 is ten seconds.
+        song = SONG.replace('</TempoMap>', '<TempoMapSegment start="8" tempo="0.25"/></TempoMap>')
+        self.entries["Song/song.xml"] = song.replace('markerType="2"', 'markerType="2" start="9" timeFormat="0"')
+        self.assertTrue(self.read()["has_range"])
+        self.entries["Song/song.xml"] = song.replace('markerType="2"', 'markerType="2" start="11" timeFormat="0"')
+        self.assertIn('boundaries', self.read(status=1))
+
+    def test_unknown_transport_data_reported(self):
+        for before, after in [('curveType="0"', 'curveType="0" swing="0.5"'),
+                              ('</TempoMap>', '<UnknownTempo start="8"/></TempoMap>'),
+                              ('numerator="4"', 'numerator="4" unknown="1"'),
+                              ('</TimeSignatureMap>', '<UnknownMeter/></TimeSignatureMap>')]:
+            self.entries["Song/song.xml"] = SONG.replace(before, after)
+            self.assertTrue(any(d["disposition"] == 3 for d in self.read()["project"]["report"]))
+
+    def test_studio_pro_transport_editor_metadata(self):
+        # Structure observed in the Studio Pro 8.0.3 native sample. The
+        # normalized editor point is redundant with the resolved segment.
+        self.entries["Song/song.xml"] = (SONG.replace('<TempoMapSegment', '<Attributes x:id="envelope"><EnvelopePoint value="0.282051282051282"/></Attributes><TempoMapSegment')
+            .replace('numerator="4"', 'numerator="4" type="0"'))
+        p = self.read()["project"]
+        self.assertEqual(p["tempo"], 120)
+        self.assertFalse(any(d["disposition"] == 3 for d in p["report"]))
+        self.entries["Song/song.xml"] = self.entries["Song/song.xml"].replace('type="0"', 'type="1"')
+        self.assertTrue(any(d["disposition"] == 3 for d in self.read()["project"]["report"]))
+
+    def test_tempo_follow_stretching_remains_explicit(self):
+        self.entries["Song/song.xml"] = (SONG.replace('mediaType="Audio"', 'mediaType="Audio" tempoFollow="2"')
+            .replace('</TempoMap>', '<TempoMapSegment start="8" tempo="0.75"/></TempoMap>'))
+        self.assertTrue(any(d["disposition"] == 3 and 'time-stretching' in d["detail"] for d in self.read()["project"]["report"]))
+        self.entries["Song/song.xml"] = self.entries["Song/song.xml"].replace('tempo="0.75"', 'tempo="0.5"')
+        self.assertFalse(any(d["disposition"] == 3 for d in self.read()["project"]["report"]))
 
     def test_empty_bipolar_automation_allowed_but_points_reported(self):
         region = '<Attributes x:id="AutomationRegionList"><AutomationRegion title="Pan"><Url x:id="points" url="media:///pan.envelopex"/></AutomationRegion></Attributes>'

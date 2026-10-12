@@ -1123,10 +1123,11 @@ SessionExchange::import_studio_one (AudioEngine& engine, const std::string& file
                                    const std::string& snapshot, std::vector<Diagnostic>& report, CancelCheck cancel)
 {
 	auto song = StudioOneSong::read (filename, cancel);
+	TimeMap timing (song.project);
 	return import_session (engine, song.project, destination, snapshot, report, cancel,
 	                       [&] (const Media& media, const std::string& path) { copy_native_audio (song.audio_files.at (media.id), path, cancel); },
 	                       [&] (Session& session) {
-		                       auto position = [&] (Time t) { return Temporal::timepos_t (samples (convert_time (t, TimeUnit::Seconds, song.project.tempo), session.sample_rate ())); };
+		                       auto position = [&] (Time t) { return Temporal::timepos_t (samples (timing.convert (t, TimeUnit::Seconds), session.sample_rate ())); };
 		                       if (song.has_range) { session.set_session_extents (position (song.start), position (song.end)); }
 	                       });
 }

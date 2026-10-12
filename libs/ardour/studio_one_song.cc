@@ -253,6 +253,7 @@ private:
 	std::string audio (const std::string& key);
 	void notes (Clip& clip, Node entry);
 	void channel (Track& track, Node n);
+	void transport (Node context);
 	void track (Node n);
 	void automation (Node n, const std::string& name);
 };
@@ -388,15 +389,68 @@ void Reader::track (Node n)
 		c.offset = Time (number (e, "offset"), midi ? TimeUnit::Beats : TimeUnit::Seconds); c.enabled = !boolean (e, "mute");
 		std::string key = value (e, "clipID"); auto entry = pool.find (key); require (entry != pool.end (), "Native event references missing media");
 		if (midi) { require (is (entry->second, "MusicClip"), "Wrong native MIDI media type"); notes (c, entry->second); }
-		else { c.media = audio (key); }
+		else { c.media = audio (key); c.gain = number (e, "gain", 1); }
 		for (const char* attr : {"transpose", "tune", "normalize", "modification", "velocity", "fadeIn", "fadeOut", "loop"}) {
 			if (number (e, attr)) { unsupported (c.name, "Native event processing is not yet supported: " + std::string (attr)); }
 		}
-		if (number (e, "speed", 1) != 1 || number (e, "gain", 1) != 1) { unsupported (c.name, "Event speed or gain adjustment is not yet supported"); }
+		if (number (e, "speed", 1) != 1) { unsupported (c.name, "Event speed adjustment is not yet supported"); }
+		if (midi && number (e, "gain", 1) != 1) { unsupported (c.name, "MIDI event gain requires instrument rendering"); }
 		if (!children (e).empty ()) { unsupported (c.name, "Event envelopes, fades or other nested processing are not yet supported"); }
 		t.clips.push_back (c);
 	}
+	if (t.kind == TrackKind::Audio && !t.clips.empty () && integer (n, "tempoFollow") == 2 &&
+	    std::any_of (result.project.tempos.begin (), result.project.tempos.end (), [&] (const TempoChange& tempo) { return tempo.bpm != result.project.tempo; })) {
+		unsupported (t.name, "Audio following a changing tempo with time-stretching requires rendering");
+	}
 	result.project.tracks.push_back (t);
+}
+
+void Reader::transport (Node context)
+{
+	/* Native transport positions are quarter-note beats; tempo is seconds
+	 * per quarter note. Keep steps in musical time, including after a meter
+	 * change. Curve types have a different, as yet unverified interpolation. */
+	Node tempos = child (context, "TempoMap", "tempoMap");
+	double previous = -1, previous_end = -1;
+	for (Node n : children (tempos)) {
+		check ();
+		/* Studio Pro also saves the editor's normalized tempo envelope.
+		 * TempoMapSegment already contains its resolved musical timing. */
+		if (is (n, "Attributes") && id (n) == "envelope") { continue; }
+		if (!is (n, "TempoMapSegment")) { unsupported ("Tempo map", "Unknown native tempo segment"); continue; }
+		attributes (n, {"start", "end", "tempo", "curveType"}, "Tempo map");
+		double start = number (n, "start"), seconds_per_beat = number (n, "tempo");
+		require (start >= 0 && start > previous && (previous >= 0 || start == 0), "Invalid or unordered native tempo map");
+		require (seconds_per_beat > 0, "Invalid native song tempo");
+		if (previous_end >= 0) { require (std::abs (previous_end - start) <= 1e-9, "Native tempo segments have a gap or overlap"); }
+		previous_end = number (n, "end", -1);
+		require (value (n, "end").empty () || previous_end > start, "Invalid native tempo segment end");
+		if (integer (n, "curveType") != 0 || !children (n).empty ()) { unsupported ("Tempo map", "Native tempo curves are not yet supported"); }
+		result.project.tempos.push_back ({Time (start), 60 / seconds_per_beat, false});
+		require (result.project.tempos.size () <= 100000, "Native tempo map exceeds the event limit");
+		previous = start;
+	}
+	require (!result.project.tempos.empty (), "Native song has no tempo");
+	result.project.tempo = result.project.tempos.front ().bpm;
+	/* A final segment normally uses a large finite sentinel for its end.
+	 * The final tempo continues beyond the arrangement. */
+	Node meters = child (context, "TimeSignatureMap", "timeSignatureMap");
+	previous = -1;
+	for (Node n : children (meters)) {
+		check ();
+		if (!is (n, "TimeSignatureMapSegment")) { unsupported ("Meter map", "Unknown native meter segment"); continue; }
+		attributes (n, {"start", "numerator", "denominator", "anchor", "type"}, "Meter map");
+		if (integer (n, "type") != 0) { unsupported ("Meter map", "Native meter type is not yet supported"); }
+		double start = number (n, "start");
+		require (start >= 0 && start > previous && (previous >= 0 || start == 0), "Invalid or unordered native meter map");
+		if (!children (n).empty ()) { unsupported ("Meter map", "Native meter segment contains additional data"); }
+		result.project.meters.push_back ({Time (start), integer (n, "numerator"), integer (n, "denominator")});
+		require (result.project.meters.size () <= 100000, "Native meter map exceeds the event limit");
+		previous = start;
+	}
+	require (!result.project.meters.empty (), "Native song has no meter");
+	result.project.numerator = result.project.meters.front ().numerator;
+	result.project.denominator = result.project.meters.front ().denominator;
 }
 
 StudioOneSongData Reader::read ()
@@ -408,20 +462,7 @@ StudioOneSongData Reader::read ()
 	result.project.application = "Studio One / Studio Pro"; result.project.application_version = metadata["Document:Generator"];
 	Node song = document ("Song/song.xml", "Song"); Node root_node = child (song, "Attributes", "Root"); require (root_node, "Native song has no arrangement");
 	Node context = child (root_node, "Attributes", "timeContext"); require (context, "Native song has no time context");
-	Node tempos = child (context, "TempoMap", "tempoMap");
-	unsigned tempo_count = 0;
-	for (Node n : children (tempos)) { if (is (n, "TempoMapSegment")) {
-		++tempo_count; double seconds_per_beat = number (n, "tempo"); require (seconds_per_beat > 0, "Invalid native song tempo");
-		if (tempo_count == 1) { result.project.tempo = 60 / seconds_per_beat; }
-		if (number (n, "start") != 0 || number (n, "curveType")) { unsupported ("Tempo map", "Variable tempo is not yet supported"); }
-	} }
-	require (tempo_count, "Native song has no tempo"); if (tempo_count > 1) { unsupported ("Tempo map", "Variable tempo is not yet supported"); }
-	Node meters = child (context, "TimeSignatureMap", "timeSignatureMap"); unsigned meter_count = 0;
-	for (Node n : children (meters)) { if (is (n, "TimeSignatureMapSegment")) {
-		++meter_count; if (meter_count == 1) { result.project.numerator = integer (n, "numerator"); result.project.denominator = integer (n, "denominator"); }
-		if (number (n, "start")) { unsupported ("Meter map", "Variable meter is not yet supported"); }
-	} }
-	require (meter_count, "Native song has no meter"); if (meter_count > 1) { unsupported ("Meter map", "Variable meter is not yet supported"); }
+	transport (context);
 	Node media = document ("Song/mediapool.xml", "MediaPool");
 	std::string original = url_path (value (child (media, "Attributes", "documentPath"), "url"));
 	File original_file = file (original); File parent (g_file_get_parent (original_file.get ()), g_object_unref);
@@ -462,10 +503,13 @@ StudioOneSongData Reader::read ()
 	std::map<std::string, std::string> destinations;
 	for (Node n : children (child (root_node, "List", "Tracks"))) { if (is (n, "MediaTrack")) { destinations[value (child (n, "UID", "channelID"), "uid")] = value (n, "trackID"); } }
 	for (auto& t : result.project.tracks) { auto i = destinations.find (t.destination); if (i != destinations.end ()) { t.destination = i->second; } }
-	if (result.has_range) { require (convert_time (result.end, TimeUnit::Seconds, result.project.tempo) > convert_time (result.start, TimeUnit::Seconds, result.project.tempo), "Invalid native song boundaries"); }
+	if (result.has_range) {
+		TimeMap timing (result.project);
+		require (timing.convert (result.end, TimeUnit::Seconds) > timing.convert (result.start, TimeUnit::Seconds), "Invalid native song boundaries");
+	}
 	result.project.markers = result.markers;
 	validate_project (result.project);
-	result.project.report.push_back ({Disposition::Preserved, "Native Studio One song", "Audio, MIDI notes, clip positions, track names, colors, static mixer controls and constant tempo/meter read directly from the .song file"});
+	result.project.report.push_back ({Disposition::Preserved, "Native Studio One song", "Audio, MIDI notes, clip positions and gain, track names, colors, static mixer controls and tempo/meter steps read directly from the .song file"});
 	return result;
 }
 

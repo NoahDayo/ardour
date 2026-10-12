@@ -96,7 +96,14 @@ while IFS= read -r -d '' library; do
 done < <(find "$libs" -type f \( -name '*.dll' -o -name '*.so' -o -name '*.so.*' -o -name '*.dylib' \) -print0)
 
 case "$(uname -s)" in
-    MINGW*|MSYS*) export PATH="${library_path}:${PATH}" ;;
+    MINGW*|MSYS*)
+        dependency_prefix=${ARDOUR_BUILD_ROOT:-"$root/../Ardour_Build"}/dependency-runtime/ucrt64
+        if [[ ! -f "$dependency_prefix/bin/liblilv-0.dll" ]]; then
+            echo 'Build the fixed LV2 runtime with tools/project-exchange/build-lilv-windows.sh first.' >&2
+            exit 1
+        fi
+        export PATH="${library_path}:$dependency_prefix/bin:${PATH}"
+        ;;
     Darwin*) export DYLD_FALLBACK_LIBRARY_PATH="${library_path}${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}" ;;
     *) export LD_LIBRARY_PATH="${library_path}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
 esac
