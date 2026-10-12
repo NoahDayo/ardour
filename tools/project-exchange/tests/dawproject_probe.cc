@@ -62,7 +62,19 @@ static void dump (const Project& p)
 		std::cout << ",\"destination\":"; quoted (t.destination);
 		std::cout << ",\"kind\":" << static_cast<int> (t.kind) << ",\"channels\":" << t.channels
 		          << ",\"master\":" << (t.master ? "true" : "false") << ",\"mute\":" << (t.mute ? "true" : "false")
-		          << ",\"solo\":" << (t.solo ? "true" : "false") << ",\"volume\":" << t.volume << ",\"pan\":" << t.pan << ",\"clips\":[";
+		          << ",\"solo\":" << (t.solo ? "true" : "false") << ",\"volume\":" << t.volume << ",\"pan\":" << t.pan;
+		for (bool pan : {false, true}) {
+			auto const& curve = pan ? t.pan_automation : t.volume_automation;
+			std::cout << (pan ? ",\"pan_automation\":" : ",\"volume_automation\":") << "{\"unit\":";
+			quoted (curve.unit == TimeUnit::Beats ? "beats" : "seconds"); std::cout << ",\"points\":[";
+			bool first_point = true;
+			for (auto const& point : curve.points) {
+				if (!first_point) { std::cout << ','; } first_point = false;
+				std::cout << '[' << point.time << ',' << point.value << ',' << (point.linear ? "true" : "false") << ']';
+			}
+			std::cout << "]}";
+		}
+		std::cout << ",\"clips\":[";
 		bool first_clip = true;
 		for (auto const& c : t.clips) {
 			if (!first_clip) { std::cout << ','; } first_clip = false;

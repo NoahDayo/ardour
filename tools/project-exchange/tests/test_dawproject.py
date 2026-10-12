@@ -228,15 +228,63 @@ class DawProjectTest(unittest.TestCase):
         parallel = xml.replace('</Notes>', '</Notes><Notes/>', 1)
         self.assertIn("Parallel", self.parse(parallel, status=1).stderr)
 
-    def test_empty_automation_is_harmless_but_points_are_reported(self):
+    def test_studio_pro_mixer_automation(self):
         root = ET.fromstring(self.studio_pro_xml())
         points = root.find('.//Points')
         ET.SubElement(points, 'RealPoint', time='1', value='.7')
         parsed = self.parse(ET.tostring(root, encoding='unicode'))
-        self.assertTrue(any(d['disposition'] == 3 and 'Automation points' in d['detail'] for d in parsed['report']))
-        self.command('rewrite', self.input, self.root / 'blocked.xml', status=1)
+        self.assertFalse(any(d['disposition'] == 3 for d in parsed['report']))
+        self.assertTrue(any(t['volume_automation']['points'] == [[1, .7, False]] for t in parsed['tracks']))
+        self.command('rewrite', self.input, self.root / 'automation.xml')
         self.parse(self.studio_pro_xml().replace('parameter="id4"', 'parameter="missing"'), status=1)
         self.parse(self.studio_pro_xml().replace('<Target parameter="id4"/>', ''), status=1)
+
+    def mixer_project(self, unit='linear'):
+        root = ET.fromstring(PROJECT)
+        volume = root.find('.//Track[@id="audio"]/Channel/Volume')
+        volume.set('id', 'volume')
+        pan = root.find('.//Track[@id="audio"]/Channel/Pan')
+        pan.set('id', 'pan')
+        lanes = root.find('Arrangement/Lanes')
+        for parameter, scale, time_unit, values in (
+                ('volume', unit, 'beats', [(0, -20 if unit == 'decibel' else .1, 'linear'), (4, 0 if unit == 'decibel' else 1, 'hold'), (8, -6 if unit == 'decibel' else .5, 'hold')]),
+                ('pan', 'normalized', 'seconds', [(0, .25, 'hold'), (2, .75, 'linear'), (4, .5, 'hold')])):
+            points = ET.SubElement(lanes, 'Points', unit=scale, timeUnit=time_unit)
+            ET.SubElement(points, 'Target', parameter=parameter)
+            for at, value, mode in values:
+                ET.SubElement(points, 'RealPoint', time=str(at), value=str(value), interpolation=mode)
+        return root
+
+    def test_mixer_automation_roundtrip(self):
+        root = self.mixer_project()
+        before = self.parse(ET.tostring(root, encoding='unicode'))
+        output = self.root / 'automation.xml'
+        self.command('rewrite', self.input, output)
+        after = self.parse(output.read_text())
+        for key in ('volume_automation', 'pan_automation'):
+            self.assertEqual(before['tracks'][1][key], after['tracks'][1][key])
+        if self.schema:
+            self.command('schema', output, self.schema)
+
+    def test_decibel_automation_curve(self):
+        parsed = self.parse(ET.tostring(self.mixer_project('decibel'), encoding='unicode'))
+        points = parsed['tracks'][1]['volume_automation']['points']
+        self.assertGreater(len(points), 3)
+        for i in range(401):
+            t = i / 100
+            a, b = next((a, b) for a, b in zip(points, points[1:]) if a[0] <= t <= b[0])
+            value = a[1] + (b[1] - a[1]) * (t - a[0]) / (b[0] - a[0])
+            self.assertAlmostEqual(value, 10 ** ((-20 + 5 * t) / 20), delta=.000101)
+        self.assertTrue(any(d['disposition'] == 1 and 'Decibel' in d['detail'] for d in parsed['report']))
+
+    def test_invalid_mixer_automation(self):
+        for attribute, value in (('time', '0'), ('time', '-1'), ('value', '-.1'), ('interpolation', 'bezier')):
+            root = self.mixer_project()
+            root.findall('Arrangement/Lanes/Points')[0].findall('RealPoint')[1].set(attribute, value)
+            self.parse(ET.tostring(root, encoding='unicode'), status=1)
+        root = self.mixer_project()
+        root.findall('Arrangement/Lanes/Points')[1].find('RealPoint').set('value', '1.1')
+        self.parse(ET.tostring(root, encoding='unicode'), status=1)
 
     def test_markers_and_rgba_color_validation(self):
         self.parse(self.studio_pro_xml().replace('time="600.000000"', 'time="-1"'), status=1)

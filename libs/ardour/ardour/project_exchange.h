@@ -3,6 +3,7 @@
 #define ARDOUR_PROJECT_EXCHANGE_H
 
 #include <stdexcept>
+#include <functional>
 #include <string>
 #include <vector>
 #include "ardour/libardour_visibility.h"
@@ -60,6 +61,16 @@ struct Clip {
 };
 
 enum class TrackKind { Audio, MIDI, Folder, Bus };
+struct AutomationPoint {
+	double time = 0;
+	double value = 0;
+	bool linear = true; // Otherwise hold until the following point.
+};
+struct Automation {
+	TimeUnit unit = TimeUnit::Beats;
+	std::vector<AutomationPoint> points;
+};
+
 struct Track {
 	std::string id;
 	std::string name;
@@ -73,6 +84,8 @@ struct Track {
 	bool solo = false;
 	double volume = 1; // Linear amplitude.
 	double pan = 0.5; // Normalized left-to-right.
+	Automation volume_automation; // Linear amplitude, absolute arrangement times.
+	Automation pan_automation; // Normalized left-to-right.
 	std::vector<Clip> clips;
 };
 
@@ -130,6 +143,11 @@ private:
 };
 
 LIBARDOUR_API double convert_time (Time, TimeUnit, double tempo);
+/* Append a monotonic curved segment as a polyline. The error test uses
+ * monotonic interval bounds, not only midpoint samples. */
+LIBARDOUR_API void append_automation_segment (Automation&, double time, double value,
+                                            const std::function<double (double)>& evaluate, double tolerance = 0.0001);
+LIBARDOUR_API Automation convert_automation (const Automation&, const TimeMap&, TimeUnit);
 LIBARDOUR_API void validate_project (const Project&);
 LIBARDOUR_API bool has_unsupported_features (const Project&);
 

@@ -172,10 +172,48 @@ def apply_constant(output, segment, definition, parameter, value):
     return group
 
 
+def automation_points(node, rate, pan=False):
+    points = []
+    if node is None:
+        return points
+    for point in node.findall("Point"):
+        time, value = number(point, "time"), number(point, "value")
+        require(time >= 0 and value >= 0 and (not pan or value <= 1), "Invalid mixer automation point")
+        at = math.floor(time * rate + .5)
+        require(at <= 2**53 and (not points or at > points[-1][0]), "Automation points collide at audio resolution")
+        require(point.attrib["linear"] in ("true", "false"), "Invalid automation interpolation")
+        points.append((at, value, point.attrib["linear"] == "true"))
+    require(0 < len(points) <= 100000, "Invalid automation point count")
+    return points
+
+
+def apply_automation(output, segment, definition, parameter, points):
+    discrete = all(not p[2] for p in points[:-1])
+    expanded = []
+    for i, (at, value, linear) in enumerate(points):
+        if i and not discrete and not points[i - 1][2] and points[i - 1][1] != value and at - 1 > expanded[-1][0]:
+            expanded.append((at - 1, points[i - 1][1]))
+        expanded.append((at, value))
+    group = output.create.OperationGroup(definition, segment.length, media_kind="sound")
+    group.segments.append(segment)
+    curve = output.create.VaryingValue(parameter, "Constant" if discrete else "Linear")
+    for at, value in expanded:
+        time = Fraction(at, segment.length)
+        level = Fraction(value).limit_denominator(1000000)
+        require(abs(time.numerator) <= 0x7fffffff and time.denominator <= 0x7fffffff
+                and abs(level.numerator) <= 0x7fffffff, "AAF automation rational out of range")
+        curve.add_keyframe(time, str(level))
+    group.parameters.append(curve)
+    return group
+
+
 def write_aaf(root, destination):
     rate = integer(root, "rate")
     require(8000 <= rate <= 768000, "Invalid audio sample rate")
     with aaf2.open(str(destination), "w") as output:
+        for name, uid in (("Linear", "5b6c85a4-0ede-11d3-80a9-006008143e6f"),
+                          ("Constant", "5b6c85a5-0ede-11d3-80a9-006008143e6f")):
+            output.dictionary.register_def(output.create.InterpolationDef(uid, name))
         amplitude = output.create.ParameterDef("e4962321-2267-11d3-8a4c-0050040ef7d2", "Amplitude", typedef="Rational")
         pan = output.create.ParameterDef("e4962322-2267-11d3-8a4c-0050040ef7d2", "Pan", typedef="Rational")
         output.dictionary.register_def(amplitude)
@@ -240,14 +278,25 @@ def write_aaf(root, destination):
                         segment["UserComments"].append(output.create.TaggedValue("Ardour." + field, clip.attrib[field]))
                 sequence.components.append(segment)
                 end = position + length
+            gain_points = automation_points(track.find("GainAutomation"), rate)
+            pan_points = automation_points(track.find("PanAutomation"), rate, pan=True)
+            automation_end = max([end, 1] + [p[0] for p in gain_points + pan_points])
+            if (gain_points or pan_points) and automation_end > end:
+                sequence.components.append(output.create.Filler("sound", automation_end - end))
+                end = automation_end
             sequence.length = end
             gain = number(track, "gain")
             require(gain >= 0, "Invalid audio gain")
-            if gain != 1:
+            if gain_points:
+                sequence = apply_automation(output, sequence, mono_gain if channels == 1 else stereo_gain, amplitude, gain_points)
+            elif gain != 1:
                 sequence = apply_constant(output, sequence, mono_gain if channels == 1 else stereo_gain, amplitude, gain)
             balance = number(track, "pan")
             require(0 <= balance <= 1, "Invalid audio pan")
-            if balance != .5:
+            if pan_points:
+                require(channels == 1, "Stereo pan automation is not yet mapped to AAF")
+                sequence = apply_automation(output, sequence, mono_pan, pan, pan_points)
+            elif balance != .5:
                 require(channels == 1, "Stereo balance is not yet mapped to AAF")
                 sequence = apply_constant(output, sequence, mono_pan, pan, balance)
             slot.segment = sequence

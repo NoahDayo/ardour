@@ -170,6 +170,66 @@ convert_time (Time value, TimeUnit unit, double tempo)
 	return result;
 }
 
+void
+append_automation_segment (Automation& output, double end, double value,
+                           const std::function<double (double)>& evaluate, double tolerance)
+{
+	require (!output.points.empty () && end > output.points.back ().time && std::isfinite (end) && std::isfinite (value) && tolerance > 0,
+	         "Invalid automation segment");
+	size_t evaluations = 0;
+	auto eval = [&] (double time) {
+		require (++evaluations <= 2000000, "Automation curve exceeds the conversion work limit");
+		double v = evaluate (time); require (std::isfinite (v), "Nonfinite automation curve"); return v;
+	};
+	std::function<void (double, double, double, double, unsigned)> split;
+	split = [&] (double a, double va, double b, double vb, unsigned depth) {
+		auto line = [&] (double t) { return va + (vb - va) * ((t - a) / (b - a)); };
+		std::function<bool (double, double, double, double, unsigned)> bounded;
+		bounded = [&] (double l, double vl, double r, double vr, unsigned level) {
+			// A monotonic curve is trapped between its endpoint values. The
+			// secant is linear, so these opposite-corner errors bound the
+			// entire interval even when its midpoint happens to lie on it.
+			double bound = std::max (std::fabs (vl - line (r)), std::fabs (vr - line (l)));
+			if (bound <= tolerance) { return true; }
+			double mid = l + (r - l) * .5;
+			if (mid == l || mid == r || level >= 48) { return false; }
+			double vm = eval (mid);
+			require (vm >= std::min (vl, vr) - tolerance * .01 && vm <= std::max (vl, vr) + tolerance * .01, "Non-monotonic automation segment");
+			if (std::fabs (vm - line (mid)) > tolerance * .5) { return false; }
+			return bounded (l, vl, mid, vm, level + 1) && bounded (mid, vm, r, vr, level + 1);
+		};
+		if (bounded (a, va, b, vb, 0)) {
+			require (output.points.size () < 100000, "Automation exceeds the event limit");
+			output.points.back ().linear = true; output.points.push_back ({b, vb, true}); return;
+		}
+		double mid = a + (b - a) * .5;
+		require (depth < 48 && mid > a && mid < b, "Automation curve exceeds conversion precision");
+		double vm = eval (mid); split (a, va, mid, vm, depth + 1); split (mid, vm, b, vb, depth + 1);
+	};
+	auto start = output.points.back ();
+	split (start.time, start.value, end, value, 0);
+}
+
+Automation
+convert_automation (const Automation& input, const TimeMap& timing, TimeUnit unit)
+{
+	if (input.unit == unit || input.points.empty ()) { return input; }
+	Automation output; output.unit = unit;
+	for (size_t i = 0; i < input.points.size (); ++i) {
+		auto const& point = input.points[i];
+		double at = timing.convert (Time (point.time, input.unit), unit);
+		if (i && input.points[i - 1].linear) {
+			auto const& before = input.points[i - 1];
+			append_automation_segment (output, at, point.value, [&] (double t) {
+				double original = timing.convert (Time (t, unit), input.unit);
+				return before.value + (point.value - before.value) * ((original - before.time) / (point.time - before.time));
+			});
+		} else { output.points.push_back ({at, point.value, point.linear}); }
+		output.points.back ().linear = point.linear;
+	}
+	return output;
+}
+
 bool
 has_unsupported_features (const Project& project)
 {
@@ -212,6 +272,15 @@ validate_project (const Project& project)
 		tracks.emplace (track.id, &track);
 		require (track.channels > 0 && track.channels <= 64, "Invalid track channel count");
 		require (nonnegative (track.volume) && normalized (track.pan), "Invalid track volume or pan");
+		for (bool pan : {false, true}) {
+			auto const& curve = pan ? track.pan_automation : track.volume_automation;
+			require (curve.points.size () <= 100000, "Automation exceeds the event limit");
+			double previous = -1;
+			for (auto const& point : curve.points) {
+				require (nonnegative (point.time) && point.time > previous && (pan ? normalized (point.value) : nonnegative (point.value)), "Invalid or unordered mixer automation");
+				previous = point.time;
+			}
+		}
 		if (track.master) {
 			++masters;
 			require (track.kind == TrackKind::Bus && track.destination.empty (), "Invalid master channel");

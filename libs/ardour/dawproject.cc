@@ -128,6 +128,7 @@ struct Parser {
 	std::map<std::string, Node> ids;
 	std::map<std::string, size_t> track_indices;
 	std::map<std::string, std::string> channel_tracks;
+	std::map<Node, std::pair<std::string, bool>> automation_targets;
 	std::set<std::string> model_ids;
 	std::set<std::string> infer_track_kind;
 	size_t generated = 0;
@@ -171,7 +172,7 @@ struct Parser {
 		return value;
 	}
 
-	void points (Node node)
+	void points (Node node, TimeUnit unit, bool arrangement = true)
 	{
 		attributes (node, {"id", "name", "color", "timeUnit", "unit"});
 		Node target = child (node, "Target");
@@ -180,9 +181,45 @@ struct Parser {
 		if (has (target, "parameter") == has (target, "expression")) { throw ExchangeError ("Invalid automation target"); }
 		if (has (target, "parameter") && !ids.count (attr (target, "parameter"))) { throw ExchangeError ("Unknown automation target"); }
 		if (!children (target).empty ()) { throw ExchangeError ("Invalid automation target content"); }
+		Node parameter = has (target, "parameter") ? ids.at (attr (target, "parameter")) : NULL;
+		auto mapped = automation_targets.find (parameter);
+		std::vector<Node> values;
 		for (Node item : children (node)) {
-			if (!is (item, "Target")) { diagnostic (node, "Automation points are not yet converted"); break; }
+			if (!is (item, "Target")) { values.push_back (item); }
 		}
+		if (values.empty ()) { return; }
+		if (!arrangement || mapped == automation_targets.end () || has (target, "channel") || has (target, "key") || has (target, "controller")) {
+			diagnostic (node, "Automation target is not yet converted"); return;
+		}
+		bool pan = mapped->second.second;
+		auto& track = project.tracks.at (track_indices.at (mapped->second.first));
+		auto& curve = pan ? track.pan_automation : track.volume_automation;
+		if (!curve.points.empty ()) { throw ExchangeError ("Multiple automation timelines target the same mixer parameter"); }
+		curve.unit = unit;
+		std::string value_unit = attr (node, "unit", attr (parameter, "unit"));
+		bool decibel = !pan && value_unit == "decibel";
+		if ((pan && value_unit != "normalized") || (!pan && value_unit != "linear" && !decibel)) { throw ExchangeError ("Unsupported mixer automation unit"); }
+		double previous_time = -1, previous_value = 0;
+		bool previous_linear = false;
+		for (Node point : values) {
+			expansion ();
+			if (!is (point, "RealPoint") || !children (point).empty ()) { throw ExchangeError ("Mixer automation requires real-valued points"); }
+			attributes (point, {"time", "value", "interpolation"});
+			double at = number (point, "time", 0, true), raw = number (point, "value", 0, true);
+			if (at < 0 || at <= previous_time) { throw ExchangeError ("Invalid or unordered mixer automation"); }
+			std::string mode = attr (point, "interpolation", "hold");
+			if (mode != "hold" && mode != "linear") { throw ExchangeError ("Unsupported mixer automation interpolation"); }
+			double value = decibel ? std::pow (10, raw / 20) : raw;
+			if (!std::isfinite (value) || value < 0 || (pan && value > 1)) { throw ExchangeError ("Mixer automation value is out of range"); }
+			if (decibel && previous_linear) {
+				append_automation_segment (curve, at, value, [&] (double t) {
+					return std::pow (10, (previous_value + (raw - previous_value) * ((t - previous_time) / (at - previous_time))) / 20);
+				});
+			} else { curve.points.push_back ({at, value, mode == "linear"}); }
+			curve.points.back ().linear = mode == "linear";
+			previous_time = at; previous_value = raw; previous_linear = mode == "linear";
+		}
+		if (decibel) { diagnostic (node, "Decibel automation converted to linear amplitude; curved segments sampled within 0.0001 amplitude before session rounding", Disposition::Transformed); }
 	}
 
 	void index (Node node, size_t depth = 0)
@@ -238,6 +275,7 @@ struct Parser {
 		track.solo = boolean (node, "solo", false);
 		for (Node item : children (node)) {
 			if (is (item, "Volume") || is (item, "Pan")) {
+				automation_targets[item] = {track.id, is (item, "Pan")};
 				attributes (item, {"id", "name", "value", "min", "max", "unit"});
 				std::string unit = required (item, "unit");
 				double value = number (item, "value", is (item, "Volume") ? 1 : 0.5);
@@ -383,7 +421,7 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active, Time orig
 		content_unit = time_unit (content, "timeUnit", content_unit);
 		Node playable = NULL;
 		for (Node item : children (content)) {
-			if (is (item, "Points")) { points (item); continue; }
+			if (is (item, "Points")) { points (item, content_unit, false); continue; }
 			if (playable) { throw ExchangeError ("Parallel clip content lanes are not yet supported"); }
 			playable = item;
 		}
@@ -455,7 +493,7 @@ Parser::timeline (Node node, TimeUnit inherited_unit, const std::string& inherit
 {
 	TimeUnit unit = time_unit (node, "timeUnit", inherited_unit);
 	std::string track = attr (node, "track", inherited_track);
-	if (is (node, "Points")) { points (node); return; }
+	if (is (node, "Points")) { points (node, unit); return; }
 	attributes (node, {"id", "timeUnit", "track"});
 	if (is (node, "Lanes")) {
 		for (Node item : children (node)) { timeline (item, unit, track); }
@@ -621,9 +659,11 @@ struct Writer {
 		Node mute = element (output, "Mute");
 		property (mute, "value", track.mute ? "true" : "false");
 		Node pan = element (output, "Pan");
+		property (pan, "id", channel_ids.at (track.id) + "-pan");
 		property (pan, "unit", "normalized");
 		property (pan, "value", track.pan);
 		Node volume = element (output, "Volume");
+		property (volume, "id", channel_ids.at (track.id) + "-volume");
 		property (volume, "unit", "linear");
 		property (volume, "value", track.volume);
 	}
@@ -717,9 +757,22 @@ struct Writer {
 		Node lanes = element (arrangement, "Lanes");
 		property (lanes, "timeUnit", "beats");
 		for (auto const& track : project.tracks) {
-			if (track.clips.empty ()) { continue; }
+			if (track.clips.empty () && track.volume_automation.points.empty () && track.pan_automation.points.empty ()) { continue; }
 			Node lane = element (lanes, "Lanes");
 			property (lane, "track", track_ids.at (track.id));
+			for (bool pan : {false, true}) {
+				auto const& curve = pan ? track.pan_automation : track.volume_automation;
+				if (curve.points.empty ()) { continue; }
+				Node points = element (lane, "Points");
+				property (points, "timeUnit", unit_name (curve.unit));
+				property (points, "unit", pan ? "normalized" : "linear");
+				property (element (points, "Target"), "parameter", channel_ids.at (track.id) + (pan ? "-pan" : "-volume"));
+				for (auto const& point : curve.points) {
+					Node item = element (points, "RealPoint");
+					property (item, "time", point.time); property (item, "value", point.value);
+					property (item, "interpolation", point.linear ? "linear" : "hold");
+				}
+			}
 			for (auto const& c : track.clips) {
 				Node clips = element (lane, "Clips");
 				property (clips, "timeUnit", unit_name (c.position.unit));

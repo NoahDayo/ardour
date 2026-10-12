@@ -180,6 +180,43 @@ class LogicWriterTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("collide", result.stderr)
 
+    def test_mixer_automation_and_operation_duration(self):
+        for track in self.root.findall('AudioTrack'):
+            curve = ET.SubElement(track, 'GainAutomation')
+            for at, value, linear in ((0, .25, True), (.5, .75, False), (2, .5, True), (3, .75, False)):
+                ET.SubElement(curve, 'Point', time=str(at), value=str(value), linear=str(linear).lower())
+        curve = ET.SubElement(self.root.find('AudioTrack'), 'PanAutomation')
+        for at, value in ((.25, .2), (2.5, .8)):
+            ET.SubElement(curve, 'Point', time=str(at), value=str(value), linear='false')
+        result = self.run_writer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        extracted = self.directory / 'extracted'
+        extracted.mkdir()
+        result = subprocess.run([self.probe, str(self.output / 'Project.aaf'), str(extracted)],
+                                capture_output=True, text=True, encoding='utf-8', timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tracks = json.loads(result.stdout)['tracks']
+        for track in tracks:
+            self.assertEqual(track['gain_length'], 144000)
+            points = track['gain_curve']
+            self.assertEqual(len(points), 5)
+            expected = [(0, .25), (.5, .75), (2 - 1 / 48000, .75), (2, .5), (3, .75)]
+            for (at, value), (time, level) in zip(points, expected):
+                self.assertAlmostEqual(at * 3, time, delta=1e-10)
+                self.assertEqual(value, level)
+        self.assertEqual(tracks[0]['pan_length'], 144000)
+        for (at, value), (time, level) in zip(tracks[0]['pan_curve'], ((.25, .2), (2.5, .8))):
+            self.assertAlmostEqual(at * 3, time, delta=1e-10)
+            self.assertEqual(value, level)
+
+    def test_rejects_mixer_automation_collision(self):
+        curve = ET.SubElement(self.root.find('AudioTrack'), 'GainAutomation')
+        for at in (1, 1.000000001):
+            ET.SubElement(curve, 'Point', time=str(at), value='.5', linear='true')
+        result = self.run_writer()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('collide', result.stderr)
+
     def test_refuses_existing_output(self):
         sentinel = self.output / "Project.aaf"
         sentinel.write_bytes(b"existing project")

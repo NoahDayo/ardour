@@ -67,8 +67,17 @@ main (int argc, char** argv)
 				printf ("[%.12g,%.12g]", aafRationalToDouble (track->gain->time[point]), aafRationalToDouble (track->gain->value[point]));
 			}
 			putchar (']');
+			printf (",\"gain_length\":%" PRId64, track->gain->length);
 		}
 		if (track->pan && track->pan->pts_cnt == 1) { printf (",\"pan\":%.12g", aafRationalToDouble (track->pan->value[0])); }
+		if (track->pan && track->pan->pts_cnt > 1) {
+			printf (",\"pan_curve\":[");
+			for (unsigned int point = 0; point < track->pan->pts_cnt; ++point) {
+				if (point) { putchar (','); }
+				printf ("[%.12g,%.12g]", aafRationalToDouble (track->pan->time[point]), aafRationalToDouble (track->pan->value[point]));
+			}
+			printf ("],\"pan_length\":%" PRId64, track->pan->length);
+		}
 		printf (",\"channels\":%u,\"rate\":[%d,%d],\"clips\":[",
 		        track->format, track->edit_rate->numerator, track->edit_rate->denominator);
 		AAFI_foreachTrackItem (track, item) {

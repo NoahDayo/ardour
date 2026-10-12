@@ -2241,6 +2241,8 @@ parse_VaryingValue (AAF_Iface* aafi, aafObject* VaryingValue, td* __ptd)
 		}
 
 		Gain->pts_cnt = (unsigned int)pts_cnt;
+		int64_t* gain_length = aaf_get_propertyValue (VaryingValue->Parent, PID_Component_Length, &AAFTypeID_LengthType);
+		if (gain_length) { Gain->length = *gain_length; }
 
 		// for ( int i = 0; i < Gain->pts_cnt; i++ ) {
 		// 	debug( "time_%i : %i/%i   value_%i : %i/%i", i, Gain->time[i].numerator, Gain->time[i].denominator, i, Gain->value[i].numerator, Gain->value[i].denominator );
@@ -2362,6 +2364,8 @@ parse_VaryingValue (AAF_Iface* aafi, aafObject* VaryingValue, td* __ptd)
 		}
 
 		Pan->pts_cnt = (unsigned int)pts_cnt;
+		int64_t* pan_length = aaf_get_propertyValue (VaryingValue->Parent, PID_Component_Length, &AAFTypeID_LengthType);
+		if (pan_length) { Pan->length = *pan_length; }
 
 		// for ( int i = 0; i < Gain->pts_cnt; i++ ) {
 		// 	debug( "time_%i : %i/%i   value_%i : %i/%i", i, Gain->time[i].numerator, Gain->time[i].denominator, i, Gain->value[i].numerator, Gain->value[i].denominator  );

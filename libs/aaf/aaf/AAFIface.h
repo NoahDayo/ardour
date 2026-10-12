@@ -206,6 +206,9 @@ typedef struct aafiTransition {
  */
 
 typedef struct aafiAudioGain {
+	/* Length of the containing OperationGroup, in its timeline edit units.
+	 * ControlPoint times are normalized to this length, not to the last clip. */
+	aafLength_t length;
 	/**
 	 * Should hold the gain type (either Constant or Variable), and if it is Variable,
 	 * the interpolation used to calculate the values between two time points.

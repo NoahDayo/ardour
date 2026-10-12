@@ -11,6 +11,9 @@
 
 #include "ardour/audioengine.h"
 #include "ardour/audioregion.h"
+#include "ardour/gain_control.h"
+#include "ardour/automation_list.h"
+#include "pbd/control_math.h"
 #include "ardour/midi_model.h"
 #include "ardour/midi_region.h"
 #include "ardour/location.h"
@@ -165,6 +168,19 @@ size_t stages (const std::string& root)
 	return count;
 }
 
+double curve_value (const PX::Automation& curve, double at)
+{
+	CPPUNIT_ASSERT (!curve.points.empty ());
+	for (size_t i = 1; i < curve.points.size (); ++i) {
+		if (at < curve.points[i].time) {
+			auto const& a = curve.points[i - 1]; auto const& b = curve.points[i];
+			if (at <= a.time || !a.linear) { return a.value; }
+			return a.value + (b.value - a.value) * (at - a.time) / (b.time - a.time);
+		}
+	}
+	return curve.points.back ().value;
+}
+
 } // namespace
 
 class ProjectSessionTest : public CppUnit::TestFixture {
@@ -188,6 +204,9 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (variable_timing);
 	CPPUNIT_TEST (second_based_ramp);
 	CPPUNIT_TEST (transport_collision);
+	CPPUNIT_TEST (mixer_automation_roundtrip);
+	CPPUNIT_TEST (native_fader_automation);
+	CPPUNIT_TEST (automation_collision);
 	CPPUNIT_TEST_SUITE_END ();
 public:
 	void roundtrip ();
@@ -209,9 +228,105 @@ public:
 	void variable_timing ();
 	void second_based_ramp ();
 	void transport_collision ();
+	void mixer_automation_roundtrip ();
+	void native_fader_automation ();
+	void automation_collision ();
 };
 
 CPPUNIT_TEST_SUITE_REGISTRATION (ProjectSessionTest);
+
+void ProjectSessionTest::mixer_automation_roundtrip ()
+{
+	Fixture fixture;
+	auto input = example (fixture);
+	input.tracks.erase (input.tracks.begin () + 1);
+	input.tracks.pop_back ();
+	input.tracks[1].parent.clear (); input.tracks[1].destination = "master"; input.tracks[1].pan = .5;
+	input.tempos = {{PX::Time (0), 100, true}, {PX::Time (4), 140, false}, {PX::Time (6), 80, false}};
+	input.tracks[1].volume_automation.points = {{0, .25, true}, {2, .75, false}, {4, .5, true}, {8, .9, false}};
+	PX::Track mono = input.tracks[1]; mono.id = "mono"; mono.name = "Mono"; mono.channels = 1;
+	mono.clips.resize (1); mono.clips[0].media = "mono-media"; mono.clips[0].name = "Mono clip";
+	mono.pan_automation.unit = PX::TimeUnit::Seconds;
+	mono.pan_automation.points = {{0, .2, false}, {1, .8, false}, {3, .5, false}};
+	input.tracks.push_back (mono);
+	SF_INFO info = {}; info.channels = 1; info.samplerate = input.media[0].sample_rate; info.format = SF_FORMAT_WAV | SF_FORMAT_FLOAT;
+	SNDFILE* file = sf_open (fixture.path ("mono.wav").c_str (), SFM_WRITE, &info);
+	CPPUNIT_ASSERT (file); std::vector<float> pcm (info.samplerate * 2, .125);
+	CPPUNIT_ASSERT_EQUAL (sf_count_t (pcm.size ()), sf_writef_float (file, pcm.data (), pcm.size ()));
+	CPPUNIT_ASSERT_EQUAL (0, sf_close (file));
+	input.media.push_back ({"mono-media", "audio/mono.wav", unsigned (info.samplerate), 1, 2});
+	PX::DawProject::write (input, fixture.path ("input.dawproject"), {{"source", fixture.path ("source.wav")}, {"mono-media", fixture.path ("mono.wav")}});
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"), fixture.path ("Mix"), "Mix", fixture.report);
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("Mix"), "Mix", nullptr, "", true));
+	AudioEngine::instance ()->set_session (fixture.session.get ());
+	auto native = fixture.session->route_by_name ("Mono"); CPPUNIT_ASSERT (native);
+	CPPUNIT_ASSERT (native->gain_control ()->automation_state () == Play);
+	CPPUNIT_ASSERT (native->gain_control ()->alist ()->time_domain () == Temporal::BeatTime);
+	CPPUNIT_ASSERT (native->pan_azimuth_control ()->alist ()->time_domain () == Temporal::AudioTime);
+	for (unsigned i = 0; i <= 32; ++i) {
+		double beat = i / 4.0;
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (curve_value (mono.volume_automation, beat), native->gain_control ()->alist ()->eval (Temporal::timepos_t (Temporal::Beats::from_double (beat))), .000001);
+	}
+	for (double t : {0.0, .5, 1.0, 2.0, 3.0, 4.0}) {
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (curve_value (mono.pan_automation, t), native->pan_azimuth_control ()->alist ()->eval (Temporal::timepos_t (samplepos_t (t * info.samplerate))), .000001);
+	}
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("mix.dawproject"));
+	auto exported = PX::DawProject::read (fixture.path ("mix.dawproject"));
+	auto const& daw = track_named (exported, "Mono");
+	for (unsigned i = 0; i <= 32; ++i) { CPPUNIT_ASSERT_DOUBLES_EQUAL (curve_value (mono.volume_automation, i / 4.0), curve_value (daw.volume_automation, i / 4.0), .000001); }
+	PX::SessionExchange::export_logic (*fixture.session, fixture.path ("AAF"), fixture.report);
+	AudioEngine::instance ()->remove_session (); native.reset (); fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("AAF/Project.aaf"), fixture.path ("AAF/Project.mid"), fixture.path ("ReturnMix"), "ReturnMix", fixture.report);
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("ReturnMix"), "ReturnMix", nullptr, "", true));
+	native = fixture.session->route_by_name ("Mono"); CPPUNIT_ASSERT (native);
+	PX::TimeMap timing (input);
+	for (unsigned i = 0; i <= 32; ++i) {
+		double beat = i / 4.0, seconds = timing.convert (PX::Time (beat), PX::TimeUnit::Seconds);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (curve_value (mono.volume_automation, beat), native->gain_control ()->alist ()->eval (Temporal::timepos_t (samplepos_t (std::llround (seconds * info.samplerate)))), .0002);
+	}
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.8, native->pan_azimuth_control ()->alist ()->eval (Temporal::timepos_t (samplepos_t (2 * info.samplerate))), .000001);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.5, native->pan_azimuth_control ()->alist ()->eval (Temporal::timepos_t (samplepos_t (4 * info.samplerate))), .000001);
+	native.reset ();
+}
+
+void ProjectSessionTest::native_fader_automation ()
+{
+	Fixture fixture;
+	package (fixture, example (fixture));
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"), fixture.path ("Fader"), "Fader", fixture.report);
+	auto control = fixture.session->route_by_name ("Stereo")->gain_control ();
+	auto list = control->alist (); list->set_time_domain (Temporal::BeatTime);
+	CPPUNIT_ASSERT (list->set_interpolation (Evoral::ControlList::Exponential));
+	list->add (Temporal::timepos_t (Temporal::Beats (0, 0)), 0, false, false);
+	list->add (Temporal::timepos_t (Temporal::Beats (4, 0)), 1.5, false, false);
+	list->add (Temporal::timepos_t (Temporal::Beats (8, 0)), .1, false, false);
+	control->set_automation_state (Play);
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("fader.dawproject"), fixture.report);
+	auto exported = PX::DawProject::read (fixture.path ("fader.dawproject"));
+	auto const& curve = track_named (exported, "Stereo").volume_automation;
+	CPPUNIT_ASSERT (curve.points.size () > 3);
+	for (unsigned i = 0; i <= 800; ++i) {
+		double t = i / 100.0;
+		double expected = t <= 4 ? interpolate_gain (0, 1.5, t / 4, control->upper ()) : interpolate_gain (1.5, .1, (t - 4) / 4, control->upper ());
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (expected, curve_value (curve, t), .000101);
+	}
+	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& d) { return d.disposition == PX::Disposition::Transformed && d.detail.find ("Native curved automation") != std::string::npos; }));
+	list.reset (); control.reset ();
+}
+
+void ProjectSessionTest::automation_collision ()
+{
+	Fixture fixture;
+	auto input = example (fixture);
+	input.tracks[2].volume_automation.unit = PX::TimeUnit::Seconds;
+	input.tracks[2].volume_automation.points = {{0, .25, true}, {1, 1, true}, {1.000000001, .5, false}};
+	package (fixture, input);
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"), fixture.path ("Collision"), "Collision", fixture.report), PX::ExchangeError);
+	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("Collision"), Glib::FILE_TEST_EXISTS));
+	CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
+}
 
 void ProjectSessionTest::variable_timing ()
 {

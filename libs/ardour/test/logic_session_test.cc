@@ -96,6 +96,7 @@ class LogicSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (coordinated_import);
 	CPPUNIT_TEST (import_cancel_and_failure);
 	CPPUNIT_TEST (midi_validation);
+	CPPUNIT_TEST (flat_mixer_automation);
 	CPPUNIT_TEST_SUITE_END ();
 public:
 	void saved_session_export ();
@@ -108,8 +109,27 @@ public:
 	void coordinated_import ();
 	void import_cancel_and_failure ();
 	void midi_validation ();
+	void flat_mixer_automation ();
 };
 CPPUNIT_TEST_SUITE_REGISTRATION (LogicSessionTest);
+
+void LogicSessionTest::flat_mixer_automation ()
+{
+	Fixture fixture;
+	auto control = fixture.session->route_by_name ("Stereo")->gain_control ();
+	control->alist ()->set_time_domain (Temporal::AudioTime);
+	CPPUNIT_ASSERT (control->alist ()->set_interpolation (Evoral::ControlList::Linear));
+	control->alist ()->add (Temporal::timepos_t (0), .5, false, false);
+	control->alist ()->add (Temporal::timepos_t (fixture.session->sample_rate () * 4), .5, false, false);
+	control->set_automation_state (Play);
+	PX::SessionExchange::export_logic (*fixture.session, fixture.path ("Flat"), fixture.report);
+	PX::LogicProject output (fixture.path ("Flat/Project.aaf"));
+	CPPUNIT_ASSERT (!PX::has_unsupported_features (output.project ()));
+	CPPUNIT_ASSERT_EQUAL (size_t (2), output.project ().tracks[1].volume_automation.points.size ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (4, output.project ().tracks[1].volume_automation.points.back ().time, 1e-9);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.5, output.project ().tracks[1].volume_automation.points.back ().value, 1e-9);
+	control.reset ();
+}
 
 void LogicSessionTest::saved_session_export ()
 {

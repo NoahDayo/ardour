@@ -58,6 +58,26 @@ struct LogicProject::Impl {
 		}
 		return rational (&gain->value[0]);
 	}
+	double mixer (aafiAudioGain* gain, Automation& curve, const aafRational_t* rate, const std::string& label, double fallback) {
+		// libAAF marks a flat two-point envelope as constant, but retains its
+		// time array. Preserve those editable points rather than discarding them.
+		if (!gain || !gain->time) { return fixed (gain, label, fallback); }
+		require ((gain->flags & AAFI_AUDIO_GAIN_MASK) && gain->value && gain->pts_cnt > 0 && gain->pts_cnt <= 100000 && gain->length > 0,
+		         "Invalid AAF mixer automation");
+		unsigned interpolation = gain->flags & AAFI_INTERPOL_MASK;
+		if (interpolation != AAFI_INTERPOL_LINEAR && interpolation != AAFI_INTERPOL_CONSTANT) {
+			project.report.push_back ({Disposition::Unsupported, label, "AAF mixer curve interpolation needs explicit conversion"}); return fallback;
+		}
+		curve.unit = TimeUnit::Seconds;
+		double duration = seconds (gain->length, rate), previous = -1;
+		for (unsigned i = 0; i < gain->pts_cnt; ++i) {
+			double fraction = rational (&gain->time[i]);
+			require (fraction >= 0 && fraction <= 1 && fraction > previous, "Invalid or unordered AAF automation times");
+			curve.points.push_back ({fraction * duration, rational (&gain->value[i]), interpolation == AAFI_INTERPOL_LINEAR});
+			previous = fraction;
+		}
+		return curve.points.front ().value;
+	}
 	std::string media (aafiAudioClip* clip) {
 		std::vector<Channel> selected;
 		for (auto ptr = clip->essencePointerList; ptr; ptr = ptr->next) {
@@ -132,10 +152,10 @@ LogicProject::LogicProject (const std::string& path, const std::string& midi, Ca
 			project.report.push_back ({Disposition::Transformed, output.name, "Empty AAF track has no channel layout; imported as mono"});
 		}
 		require (output.channels == 1 || output.channels == 2, "Unsupported AAF track channel layout");
-		output.volume = self.fixed (track->gain, output.name + " gain", 1);
-		output.pan = self.fixed (track->pan, output.name + " pan", .5);
+		output.volume = self.mixer (track->gain, output.volume_automation, track->edit_rate, output.name + " gain", 1);
+		output.pan = self.mixer (track->pan, output.pan_automation, track->edit_rate, output.name + " pan", .5);
 		output.mute = track->mute; output.solo = track->solo;
-		if (output.channels == 2 && output.pan != .5) { project.report.push_back ({Disposition::Unsupported, output.name, "AAF stereo panning semantics require explicit conversion"}); }
+		if (output.channels == 2 && (output.pan != .5 || !output.pan_automation.points.empty ())) { project.report.push_back ({Disposition::Unsupported, output.name, "AAF stereo panning semantics require explicit conversion"}); }
 		aafiTimelineItem* item; unsigned clip_number = 0;
 		AAFI_foreachTrackItem (track, item) {
 			self.check ();
@@ -169,7 +189,7 @@ LogicProject::LogicProject (const std::string& path, const std::string& midi, Ca
 		if (!duplicate) { project.markers.push_back (value); }
 	}
 	project.report.push_back ({Disposition::Transformed, "AAF timeline", "Composition start is mapped to session zero; original timecode origin was " + std::to_string (origin) + " seconds"});
-	project.report.push_back ({Disposition::Transformed, "AAF mixer", "Static audio gain and mono pan are imported; source and Ardour pan laws may differ"});
+	project.report.push_back ({Disposition::Transformed, "AAF mixer", "Audio gain and mono pan, including linear/hold automation, use Ardour controls; source and Ardour pan laws may differ"});
 	project.report.push_back ({Disposition::Transformed, "AAF audio", "Selected source channels are copied as 32-bit floating-point audio for the Ardour session"});
 	project.report.push_back ({Disposition::Transformed, "AAF clip metadata", "Clip names use AAF subclip or source names; external metadata sidecars and colors are not yet restored"});
 	validate_project (project);

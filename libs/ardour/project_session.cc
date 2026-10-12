@@ -23,6 +23,7 @@
 #include <glibmm/miscutils.h>
 
 #include "pbd/controllable.h"
+#include "pbd/control_math.h"
 #include "pbd/scoped_file_descriptor.h"
 #include "pbd/xml++.h"
 #include "temporal/tempo.h"
@@ -287,6 +288,41 @@ SourceList midi_source (Session& session, const Clip& clip, const TimeMap& timin
 	return SourceList (1, source);
 }
 
+void populate_automation (Session& session, const Automation& curve, std::shared_ptr<AutomationControl> control,
+                          const std::string& name, std::vector<Diagnostic>& report)
+{
+	if (curve.points.empty ()) { return; }
+	if (!control || !control->alist ()) { throw ExchangeError (name + ": automation control is unavailable"); }
+	bool discrete = std::all_of (curve.points.begin (), std::prev (curve.points.end ()), [] (const AutomationPoint& p) { return !p.linear; });
+	bool transformed = false;
+	auto position = [&] (double t) { return curve.unit == TimeUnit::Beats ? Temporal::timepos_t (beats (t)) : Temporal::timepos_t (samples (t, session.sample_rate ())); };
+	std::vector<std::pair<Temporal::timepos_t, double>> points;
+	for (size_t i = 0; i < curve.points.size (); ++i) {
+		auto const& p = curve.points[i];
+		if (p.value < control->lower () || p.value > control->upper ()) { throw ExchangeError (name + ": automation exceeds Ardour's control range"); }
+		auto at = position (p.time);
+		double converted = curve.unit == TimeUnit::Beats ? beat_value (at.beats ()) : double (at.samples ()) / session.sample_rate ();
+		transformed |= std::fabs (p.time - converted) > 1e-10;
+		if (i) {
+			if (at <= points.back ().first) { throw ExchangeError (name + ": automation points collide at session resolution"); }
+			if (!discrete && !curve.points[i - 1].linear && curve.points[i - 1].value != p.value) {
+				auto guard = curve.unit == TimeUnit::Beats ? Temporal::timepos_t (at.beats () - Temporal::Beats (0, 1))
+				             : Temporal::timepos_t (at.samples () - 1);
+				if (guard > points.back ().first) { points.push_back ({guard, curve.points[i - 1].value}); }
+				transformed = true;
+			}
+		}
+		points.push_back ({at, p.value});
+	}
+	auto list = control->alist ();
+	list->clear (); list->set_time_domain (curve.unit == TimeUnit::Beats ? Temporal::BeatTime : Temporal::AudioTime);
+	if (!list->set_interpolation (discrete ? Evoral::ControlList::Discrete : Evoral::ControlList::Linear)) { throw ExchangeError ("Cannot set automation interpolation"); }
+	list->freeze ();
+	for (auto const& p : points) { list->fast_simple_add (p.first, p.second); }
+	list->thaw (); control->set_automation_state (Play);
+	if (transformed) { report.push_back ({Disposition::Transformed, name, "Automation rounded to session resolution; mixed hold/linear steps use a one-sample or one-tick transition"}); }
+}
+
 void populate (Session& session, const Project& project, const std::map<std::string, std::string>& assets,
                std::vector<Diagnostic>& report, const CancelCheck& cancel)
 {
@@ -387,12 +423,17 @@ void populate (Session& session, const Project& project, const std::map<std::str
 		route->mute_control ()->set_value (track.mute ? 1 : 0, PBD::Controllable::NoGroup);
 		route->solo_control ()->set_value (track.solo ? 1 : 0, PBD::Controllable::NoGroup);
 		if (auto pan = route->pan_azimuth_control ()) { pan->set_value (track.pan, PBD::Controllable::NoGroup); }
+		populate_automation (session, track.volume_automation, route->gain_control (), track.name + " volume", report);
+		populate_automation (session, track.pan_automation, route->pan_azimuth_control (), track.name + " pan", report);
 	}
 
 	samplepos_t end = 0;
 	for (auto const& track : project.tracks) {
 		cancelled (cancel);
 		auto route = routes.at (track.id);
+		for (auto const& curve : {track.volume_automation, track.pan_automation}) {
+			if (!curve.points.empty ()) { end = std::max (end, samples (timing.convert (Time (curve.points.back ().time, curve.unit), TimeUnit::Seconds), session.sample_rate ())); }
+		}
 		XMLNode* metadata = new XMLNode ("ProjectExchange");
 		metadata->set_property ("folder", track.kind == TrackKind::Folder);
 		if (!track.parent.empty ()) { metadata->set_property ("parent", routes.at (track.parent)->id ().to_s ()); }
@@ -481,6 +522,34 @@ void check_control (Project& project, const std::string& object, std::shared_ptr
 	if (control && control->alist () && (!control->alist ()->empty () || control->automation_state () != Off)) {
 		unsupported (project, object, "Automation is not yet supported by session exchange");
 	}
+}
+
+Automation collect_automation (Project& project, const std::string& object, std::shared_ptr<AutomationControl> control, samplecnt_t rate)
+{
+	Automation curve;
+	if (!control || !control->alist () || control->alist ()->empty ()) { return curve; }
+	if (control->automation_state () == Off) { unsupported (project, object, "Inactive stored automation needs an explicit conversion choice"); return curve; }
+	auto list = control->alist ();
+	curve.unit = list->time_domain () == Temporal::BeatTime ? TimeUnit::Beats : TimeUnit::Seconds;
+	auto style = list->interpolation ();
+	if (style == Evoral::ControlList::Curved) { unsupported (project, object, "Spline mixer automation needs explicit conversion"); return curve; }
+	bool transformed = false;
+	for (auto const& event : *list) {
+		double at = curve.unit == TimeUnit::Beats ? beat_value (event->when.beats ()) : double (event->when.samples ()) / rate;
+		if (!curve.points.empty () && (style == Evoral::ControlList::Exponential || style == Evoral::ControlList::Logarithmic)) {
+			auto before = curve.points.back ();
+			if (style == Evoral::ControlList::Logarithmic && (before.value <= 0 || event->value <= 0)) { throw ExchangeError ("Logarithmic automation requires positive values"); }
+			append_automation_segment (curve, at, event->value, [&] (double t) {
+				double fraction = (t - before.time) / (at - before.time);
+				return style == Evoral::ControlList::Exponential ? interpolate_gain (before.value, event->value, fraction, control->upper ())
+				       : interpolate_logarithmic (before.value, event->value, fraction, control->lower (), control->upper ());
+			});
+			transformed = true;
+		} else { curve.points.push_back ({at, event->value, style != Evoral::ControlList::Discrete}); }
+	}
+	if (transformed) { project.report.push_back ({Disposition::Transformed, object, "Native curved automation sampled to linear segments within 0.000101 amplitude before destination rounding"}); }
+	if (control->automation_state () != Play) { project.report.push_back ({Disposition::Transformed, object, "Recorded envelope exported as playback automation; write/touch/latch mode is not transferred"}); }
+	return curve;
 }
 
 /* Only direct, one-to-one stereo connections can be represented by the
@@ -588,8 +657,8 @@ Project collect (Session& session, AudioAssets& assets, const CancelCheck& cance
 		}
 		track.destination = destination_for (project, route, routes);
 		if (!route->active ()) { unsupported (project, track.name, "Inactive tracks cannot yet be exchanged"); }
-		check_control (project, track.name + " gain", route->gain_control ());
-		check_control (project, track.name + " pan", route->pan_azimuth_control ());
+		track.volume_automation = collect_automation (project, track.name + " gain", route->gain_control (), session.sample_rate ());
+		track.pan_automation = collect_automation (project, track.name + " pan", route->pan_azimuth_control (), session.sample_rate ());
 		check_control (project, track.name + " width", route->pan_width_control ());
 		check_control (project, track.name + " mute", route->mute_control ());
 		check_control (project, track.name + " trim", route->trim_control ());
@@ -599,7 +668,7 @@ Project collect (Session& session, AudioAssets& assets, const CancelCheck& cance
 		std::string panner = route->panner_shell ()->current_panner_uri ();
 		if (route->panner_shell ()->bypassed ()) { unsupported (project, track.name, "Bypassed panning cannot yet be exchanged"); }
 		if (panner == "http://ardour.org/plugin/panner_2in2out") {
-			if (std::fabs (route->pan_width_control ()->get_value () - 1) > 1e-6 || std::fabs (track.pan - 0.5) > 1e-6) {
+			if (std::fabs (route->pan_width_control ()->get_value () - 1) > 1e-6 || std::fabs (track.pan - 0.5) > 1e-6 || !track.pan_automation.points.empty ()) {
 				unsupported (project, track.name, "Stereo position and width panning cannot yet be exchanged; use a balance panner");
 			}
 		} else if (!panner.empty () && panner != "http://ardour.org/plugin/panner_balance" && panner != "http://ardour.org/plugin/panner_1in2out") {
@@ -977,7 +1046,7 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 	for (auto const& track : project.tracks) { if (track.master) { master = track.id; } }
 	for (auto const& track : project.tracks) {
 		if (track.master) {
-			if (track.volume != 1 || track.mute || track.solo || track.pan != .5) {
+			if (track.volume != 1 || track.mute || track.solo || track.pan != .5 || !track.volume_automation.points.empty () || !track.pan_automation.points.empty ()) {
 				unsupported (project, track.name, "Master mixing cannot yet be represented in AAF/MIDI");
 			}
 			continue;
@@ -986,12 +1055,13 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 			unsupported (project, track.name, "AAF/MIDI export currently requires tracks connected directly to the master, without folders or buses");
 		}
 		if (track.solo) { unsupported (project, track.name, "Clear solo before AAF/MIDI export"); }
-		if (track.kind == TrackKind::Audio && track.channels == 2 && track.pan != .5) {
+		if (track.kind == TrackKind::Audio && track.channels == 2 && (track.pan != .5 || !track.pan_automation.points.empty ())) {
 			unsupported (project, track.name, "Stereo balance cannot yet be represented in AAF export");
 		}
-		if (track.kind == TrackKind::MIDI && (track.volume != 1 || track.pan != .5 || track.mute)) {
+		if (track.kind == TrackKind::MIDI && (track.volume != 1 || track.pan != .5 || track.mute || !track.volume_automation.points.empty () || !track.pan_automation.points.empty ())) {
 			unsupported (project, track.name, "MIDI track mixer settings cannot yet be represented in Standard MIDI Files");
 		}
+		if (track.mute && !track.volume_automation.points.empty ()) { unsupported (project, track.name, "Unmute an automated track before AAF export to retain its editable gain envelope"); }
 		for (auto const& clip : track.clips) {
 			if (clip.kind == ClipKind::MIDI && !clip.enabled) { unsupported (project, clip.name, "Muted MIDI clips cannot yet be represented in Standard MIDI Files"); }
 		}
@@ -1046,6 +1116,19 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 		lane.set_property ("channels", track.channels);
 		lane.set_property ("gain", track.mute ? 0.0 : track.volume);
 		lane.set_property ("pan", track.pan);
+		for (bool pan : {false, true}) {
+			auto const& original = pan ? track.pan_automation : track.volume_automation;
+			if (original.points.empty ()) { continue; }
+			auto curve = convert_automation (original, timing, TimeUnit::Seconds);
+			XMLNode& envelope = *lane.add_child (pan ? "PanAutomation" : "GainAutomation");
+			for (auto const& p : curve.points) {
+				XMLNode& point = *envelope.add_child ("Point");
+				point.set_property ("time", p.time); point.set_property ("value", p.value);
+				point.set_property ("linear", p.linear ? "true" : "false");
+			}
+			duration = std::max (duration, curve.points.back ().time);
+			report.push_back ({Disposition::Transformed, track.name, "AAF automation uses seconds, rational values and sample-rounded positions; mixed hold/linear steps use a one-sample transition"});
+		}
 		if (track.mute) { report.push_back ({Disposition::Transformed, track.name, "Muted audio track exported with zero track gain"}); }
 		for (auto const& clip : track.clips) {
 			XMLNode& item = *lane.add_child ("Clip");
