@@ -20,9 +20,16 @@ public:
 	static std::unique_ptr<Session> import_dawproject (AudioEngine&, const std::string& archive,
 	                                                const std::string& destination, const std::string& snapshot,
 	                                                std::vector<Diagnostic>&, CancelCheck = CancelCheck ());
+	static std::unique_ptr<Session> import_studio_one (AudioEngine&, const std::string& song,
+	                                                const std::string& destination, const std::string& snapshot,
+	                                                std::vector<Diagnostic>&, CancelCheck = CancelCheck ());
 	/* Run on the session's owning control thread with editing suspended.
 	 * Transport must be stopped. An existing destination is never replaced. */
 	static std::vector<Diagnostic> export_dawproject (Session&, const std::string& destination, CancelCheck = CancelCheck ());
+	/* Also return all collected diagnostics when unsupported content prevents
+	 * export, so the caller can present every required conversion together. */
+	static void export_dawproject (Session&, const std::string& destination,
+	                               std::vector<Diagnostic>& report, CancelCheck = CancelCheck ());
 };
 
 } }

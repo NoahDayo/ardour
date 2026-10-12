@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "ardour/project_session.h"
+#include "ardour/studio_one_song.h"
 
 #include <algorithm>
 #include <array>
@@ -598,11 +599,11 @@ void write_audio (const SourceList& sources, const std::string& path, const Canc
 	if (sf_close (output.release ())) { throw ExchangeError ("Cannot finish export audio file"); }
 }
 
-} // namespace
-
 std::unique_ptr<Session>
-SessionExchange::import_dawproject (AudioEngine& engine, const std::string& archive_path, const std::string& destination,
-                                   const std::string& snapshot, std::vector<Diagnostic>& report, CancelCheck cancel)
+import_session (AudioEngine& engine, const Project& project, const std::string& destination,
+                const std::string& snapshot, std::vector<Diagnostic>& report, const CancelCheck& cancel,
+                const std::function<void (const Media&, const std::string&)>& copy_media,
+                const std::function<void (Session&)>& finish = std::function<void (Session&)> ())
 {
 	if (!engine.running () || engine.session ()) { throw ExchangeError ("Import requires a running engine with no session attached"); }
 	if (!Glib::path_is_absolute (destination) || snapshot.empty () || snapshot == "." || snapshot == ".." ||
@@ -611,17 +612,15 @@ SessionExchange::import_dawproject (AudioEngine& engine, const std::string& arch
 	}
 	FileObject final = file_object (destination);
 	if (g_file_query_exists (final.get (), NULL)) { throw ExchangeError ("Import destination already exists"); }
-	Project project = DawProject::read (archive_path, cancel);
 	report = project.report;
 	for (auto const& item : report) {
 		if (item.disposition == Disposition::Unsupported) { throw ExchangeError (item.object + ": " + item.detail); }
 	}
 	OwnedDirectory stage (Glib::path_get_dirname (destination));
-	ProjectArchive archive (archive_path, ArchiveLimits (), cancel);
 	std::map<std::string, std::string> assets;
 	for (size_t i = 0; i < project.media.size (); ++i) {
 		std::string path = Glib::build_filename (stage.path, "input-" + std::to_string (i) + ".media");
-		archive.copy_file (project.media[i].path, path);
+		copy_media (project.media[i], path);
 		assets[project.media[i].id] = path;
 	}
 	std::unique_ptr<Session> session;
@@ -632,6 +631,11 @@ SessionExchange::import_dawproject (AudioEngine& engine, const std::string& arch
 		session.reset (new Session (engine, Glib::build_filename (stage.path, "session"), snapshot, &profile, "", true));
 		engine.set_session (session.get ());
 		populate (*session, project, assets, report, cancel);
+		if (finish) { finish (*session); }
+		/* Suppress recent-session registration while staging, but publish a
+		 * named session so saving or closing it does not prompt for a rename. */
+		session->end_unnamed_status ();
+		if (session->unnamed ()) { throw ExchangeError ("Cannot finalize imported session name"); }
 		if (session->save_state (snapshot)) { throw ExchangeError ("Cannot save imported session"); }
 		engine.remove_session ();
 		session.reset ();
@@ -653,9 +657,75 @@ SessionExchange::import_dawproject (AudioEngine& engine, const std::string& arch
 	}
 }
 
+void copy_native_audio (const std::string& source, const std::string& destination, const CancelCheck& cancel)
+{
+	int binary = 0;
+#ifdef O_BINARY
+	binary = O_BINARY;
+#endif
+	PBD::ScopedFileDescriptor input (g_open (source.c_str (), O_RDONLY | binary, 0));
+	PBD::ScopedFileDescriptor output (g_open (destination.c_str (), O_WRONLY | O_CREAT | O_EXCL | binary, 0600));
+	if (input < 0 || output < 0) { throw ExchangeError ("Cannot copy native song audio"); }
+	std::vector<char> buffer (1024 * 1024);
+	uint64_t total = 0;
+	for (;;) {
+		cancelled (cancel);
+		ssize_t count = ::read (input, buffer.data (), buffer.size ());
+		if (count < 0 && errno == EINTR) { continue; }
+		if (count < 0) { throw ExchangeError ("Cannot read native song audio"); }
+		if (!count) { break; }
+		total += count;
+		if (total > ArchiveLimits ().entry_bytes) { throw ExchangeError ("Native audio exceeds import size limit"); }
+		for (ssize_t offset = 0; offset < count;) {
+			ssize_t written = ::write (output, buffer.data () + offset, count - offset);
+			if (written < 0 && errno == EINTR) { continue; }
+			if (written <= 0) { throw ExchangeError ("Cannot write native song audio"); }
+			offset += written;
+		}
+	}
+}
+
+} // namespace
+
+std::unique_ptr<Session>
+SessionExchange::import_dawproject (AudioEngine& engine, const std::string& archive_path, const std::string& destination,
+                                   const std::string& snapshot, std::vector<Diagnostic>& report, CancelCheck cancel)
+{
+	Project project = DawProject::read (archive_path, cancel);
+	ProjectArchive archive (archive_path, ArchiveLimits (), cancel);
+	return import_session (engine, project, destination, snapshot, report, cancel,
+	                       [&] (const Media& media, const std::string& path) { archive.copy_file (media.path, path); });
+}
+
+std::unique_ptr<Session>
+SessionExchange::import_studio_one (AudioEngine& engine, const std::string& filename, const std::string& destination,
+                                   const std::string& snapshot, std::vector<Diagnostic>& report, CancelCheck cancel)
+{
+	auto song = StudioOneSong::read (filename, cancel);
+	return import_session (engine, song.project, destination, snapshot, report, cancel,
+	                       [&] (const Media& media, const std::string& path) { copy_native_audio (song.audio_files.at (media.id), path, cancel); },
+	                       [&] (Session& session) {
+		                       auto position = [&] (Time t) { return Temporal::timepos_t (samples (convert_time (t, TimeUnit::Seconds, song.project.tempo), session.sample_rate ())); };
+		                       if (song.has_range) { session.set_session_extents (position (song.start), position (song.end)); }
+		                       for (auto const& marker : song.markers) {
+			                       auto pos = position (marker.position);
+			                       session.locations ()->add (new Location (session, pos, pos, marker.name, Location::IsMark));
+		                       }
+	                       });
+}
+
 std::vector<Diagnostic>
 SessionExchange::export_dawproject (Session& session, const std::string& destination, CancelCheck cancel)
 {
+	std::vector<Diagnostic> report;
+	export_dawproject (session, destination, report, cancel);
+	return report;
+}
+
+void
+SessionExchange::export_dawproject (Session& session, const std::string& destination, std::vector<Diagnostic>& report, CancelCheck cancel)
+{
+	report.clear ();
 	if (session.transport_rolling () || session.actively_recording ()) { throw ExchangeError ("Stop playback and recording before exporting a project"); }
 	if (!Glib::path_is_absolute (destination)) { throw ExchangeError ("Export destination must be absolute"); }
 	FileObject target = file_object (destination);
@@ -663,6 +733,7 @@ SessionExchange::export_dawproject (Session& session, const std::string& destina
 	cancelled (cancel);
 	AudioAssets assets;
 	Project project = collect (session, assets, cancel);
+	report = project.report;
 	for (auto const& item : project.report) {
 		if (item.disposition == Disposition::Unsupported) { throw ExchangeError (item.object + ": " + item.detail); }
 	}
@@ -674,7 +745,6 @@ SessionExchange::export_dawproject (Session& session, const std::string& destina
 		files[media.id] = path;
 	}
 	DawProject::write (project, destination, files, cancel);
-	return project.report;
 }
 
 } }

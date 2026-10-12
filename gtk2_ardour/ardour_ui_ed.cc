@@ -57,6 +57,7 @@
 #include "application_bar.h"
 #include "ardour_ui.h"
 #include "public_editor.h"
+#include "project_exchange_ui.h"
 #include "audio_clock.h"
 #include "keyboard.h"
 #include "monitor_section.h"
@@ -198,6 +199,10 @@ ARDOUR_UI::install_actions ()
 
 	ActionManager::register_action (main_actions, X_("Open"), _("Open..."),  sigc::mem_fun(*this, &ARDOUR_UI::open_session));
 	ActionManager::register_action (main_actions, X_("Recent"), _("Recent..."),  sigc::mem_fun(*this, &ARDOUR_UI::open_recent_session));
+	act = ActionManager::register_action (main_actions, X_("ImportDAWproject"), _("Import Project..."),
+	                                      sigc::bind (sigc::ptr_fun (&ProjectExchangeUI::import_dawproject), (Gtk::Window*) &_main_window));
+	ActionManager::engine_sensitive_actions.push_back (act);
+	ActionManager::rec_sensitive_actions.push_back (act);
 	act = ActionManager::register_action (main_actions, X_("Close"), _("Close"),  sigc::mem_fun(*this, &ARDOUR_UI::close_session));
 	ActionManager::session_sensitive_actions.push_back (act);
 
@@ -281,6 +286,10 @@ ARDOUR_UI::install_actions ()
 
 	act = ActionManager::register_action (main_actions, X_("Export"), _("Export"));
 	ActionManager::session_sensitive_actions.push_back (act);
+	act = ActionManager::register_action (main_actions, X_("ExportDAWproject"), _("Export DAWproject..."),
+	                                      sigc::bind (sigc::ptr_fun (&ProjectExchangeUI::export_dawproject), (Gtk::Window*) &_main_window));
+	ActionManager::session_sensitive_actions.push_back (act);
+	ActionManager::rec_sensitive_actions.push_back (act);
 
 	act = ActionManager::register_action (main_actions, X_("FlushWastebasket"), _("Flush Wastebasket"),  sigc::mem_fun (*(ARDOUR_UI::instance()), &ARDOUR_UI::flush_trash));
 

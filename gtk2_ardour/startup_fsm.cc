@@ -50,6 +50,7 @@
 #include "new_user_wizard.h"
 #include "opts.h"
 #include "plugin_scan_dialog.h"
+#include "project_exchange_ui.h"
 #include "session_dialog.h"
 #include "splash.h"
 #include "startup_fsm.h"
@@ -173,6 +174,7 @@ StartupFSM::start ()
 void
 StartupFSM::reset()
 {
+	session_dawproject.clear ();
 	show_session_dialog (new_session_required);
 }
 
@@ -577,6 +579,7 @@ StartupFSM::get_session_parameters_from_command_line (bool new_session_required)
 bool
 StartupFSM::get_session_parameters_from_path (string const & path_, string const & template_name, bool new_session_required)
 {
+	session_dawproject.clear ();
 	if (path_.empty()) {
 		/* use GUI to ask the user */
 		return false;
@@ -731,6 +734,7 @@ StartupFSM::check_session_parameters (bool must_be_new)
 {
 	bool requested_new = false;
 	session_loaded     = false;
+	session_dawproject.clear ();
 
 	session_name        = session_dialog->session_name (requested_new);
 	session_path        = session_dialog->session_folder ();
@@ -739,6 +743,19 @@ StartupFSM::check_session_parameters (bool must_be_new)
 
 	if (must_be_new) {
 		assert (requested_new);
+	}
+
+	if (!must_be_new && ProjectExchangeUI::is_importable_project (session_name)) {
+		ProjectExchangeUI::ImportRequest request;
+		if (!ProjectExchangeUI::prepare_import (session_dialog, session_name, request)) { return 1; }
+		session_dawproject = request.archive;
+		session_path = request.destination;
+		session_name = request.snapshot;
+		session_existing_sample_rate = request.sample_rate;
+		session_is_new = false;
+		session_name_edited = true;
+		session_template.clear ();
+		return 0;
 	}
 
 	if (!must_be_new) {

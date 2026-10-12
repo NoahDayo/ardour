@@ -72,6 +72,7 @@
 #include "opts.h"
 #include "pingback.h"
 #include "plugin_scan_dialog.h"
+#include "project_exchange_ui.h"
 #include "public_editor.h"
 #include "splash.h"
 #include "ui_config.h"
@@ -646,6 +647,13 @@ ARDOUR_UI::starting ()
 int
 ARDOUR_UI::load_session_from_startup_fsm ()
 {
+	if (!startup_fsm->session_dawproject.empty ()) {
+		ProjectExchangeUI::ImportRequest request;
+		request.archive = startup_fsm->session_dawproject;
+		request.destination = startup_fsm->session_path;
+		request.snapshot = startup_fsm->session_name;
+		return ProjectExchangeUI::import_prepared (&_main_window, request, false) ? 0 : -1;
+	}
 	const string     session_path          = startup_fsm->session_path;
 	const string     session_name          = startup_fsm->session_name;
 	const string     session_template      = startup_fsm->session_template;

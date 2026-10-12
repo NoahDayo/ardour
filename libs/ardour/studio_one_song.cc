@@ -1,0 +1,475 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+#include "ardour/studio_one_song.h"
+
+#include <algorithm>
+#include <cerrno>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <set>
+#include <gio/gio.h>
+#include <libxml/parser.h>
+#include <libxml/tree.h>
+
+namespace ARDOUR { namespace ProjectExchange {
+namespace {
+
+void require (bool ok, const std::string& message) { if (!ok) { throw ExchangeError (message); } }
+typedef xmlNode* Node;
+typedef std::unique_ptr<xmlDoc, void (*) (xmlDoc*)> Document;
+
+std::string value (Node node, const char* key, const std::string& fallback = "")
+{
+	if (!node) { return fallback; }
+	xmlChar* raw = xmlGetProp (node, BAD_CAST key);
+	if (!raw) { return fallback; }
+	std::string result (reinterpret_cast<const char*> (raw));
+	xmlFree (raw);
+	return result;
+}
+
+std::string id (Node node)
+{
+	std::string result = value (node, "x:id");
+	return result.empty () ? value (node, "id") : result;
+}
+
+bool is (Node node, const char* name) { return node && xmlStrEqual (node->name, BAD_CAST name); }
+std::vector<Node> children (Node node)
+{
+	std::vector<Node> result;
+	if (node) { for (Node n = node->children; n; n = n->next) { if (n->type == XML_ELEMENT_NODE) { result.push_back (n); } } }
+	return result;
+}
+Node child (Node node, const char* name, const char* identifier = nullptr)
+{
+	Node found = nullptr;
+	for (Node n : children (node)) {
+		if (is (n, name) && (!identifier || id (n) == identifier)) {
+			require (!found, "Duplicate native song element: " + std::string (name));
+			found = n;
+		}
+	}
+	return found;
+}
+double number (Node node, const char* key, double fallback = 0)
+{
+	std::string text = value (node, key);
+	if (text.empty ()) { return fallback; }
+	char* end = nullptr;
+	errno = 0;
+	double n = g_ascii_strtod (text.c_str (), &end);
+	require (!errno && end != text.c_str () && !*end && std::isfinite (n), "Invalid native song number: " + std::string (key));
+	return n;
+}
+unsigned integer (Node node, const char* key, unsigned fallback = 0)
+{
+	double n = number (node, key, fallback);
+	require (n >= 0 && n <= std::numeric_limits<unsigned>::max () && std::floor (n) == n, "Invalid native song integer: " + std::string (key));
+	return static_cast<unsigned> (n);
+}
+bool boolean (Node node, const char* key, bool fallback = false)
+{
+	double n = number (node, key, fallback ? 1 : 0);
+	require (n == 0 || n == 1, "Invalid native song boolean: " + std::string (key));
+	return n != 0;
+}
+TimeUnit unit (unsigned format)
+{
+	require (format == 0 || format == 2, "Unsupported Studio One time format");
+	return format == 0 ? TimeUnit::Seconds : TimeUnit::Beats;
+}
+void reject_dtd (void* context, const xmlChar*, const xmlChar*, const xmlChar*) { xmlStopParser (static_cast<xmlParserCtxt*> (context)); }
+void check_tree (Node n, size_t& count, unsigned depth)
+{
+	require (++count <= 1000000 && depth <= 64, "Native song XML exceeds structural limits");
+	for (Node c : children (n)) { check_tree (c, count, depth + 1); }
+}
+Document xml (const std::string& text)
+{
+	require (!text.empty () && text.size () <= 16 * 1024 * 1024, "Invalid native song XML size");
+	std::unique_ptr<xmlParserCtxt, void (*) (xmlParserCtxt*)> context (xmlNewParserCtxt (), xmlFreeParserCtxt);
+	require (context.get (), "Cannot allocate native song XML parser");
+	context->sax->internalSubset = reject_dtd;
+	context->sax->externalSubset = reject_dtd;
+	/* Studio One uses unbound x:id attributes in its native documents.
+	 * libxml retains these literal names; namespace errors are not recovered
+	 * into fabricated document structure. DTDs and malformed XML are refused. */
+	Document doc (xmlCtxtReadMemory (context.get (), text.data (), text.size (), nullptr, nullptr,
+	                               XML_PARSE_NONET | XML_PARSE_NOERROR | XML_PARSE_NOWARNING), xmlFreeDoc);
+	require (doc && context->wellFormed && !doc->intSubset && !doc->extSubset, "Malformed or unsafe native song XML");
+	size_t count = 0;
+	check_tree (xmlDocGetRootElement (doc.get ()), count, 0);
+	return doc;
+}
+
+/* Bounded UBJSON reader for native musicx/envelopex. Numeric payloads are
+ * big-endian. Duplicate keys, non-finite values and unsupported types fail. */
+struct Value {
+	enum Type { Null, Number, String, Array, Object, Boolean } type = Null;
+	double number = 0;
+	std::string string;
+	std::vector<Value> array;
+	std::map<std::string, Value> object;
+	const Value* find (const std::string& name) const {
+		require (type == Object, "Expected native MIDI object");
+		auto i = object.find (name); return i == object.end () ? nullptr : &i->second;
+	}
+	double get (const char* name, double fallback) const {
+		auto v = find (name); if (!v) { return fallback; }
+		require (v->type == Number, "Expected native MIDI number: " + std::string (name)); return v->number;
+	}
+};
+class BinaryJSON {
+public:
+	explicit BinaryJSON (const std::string& bytes) : data (bytes) {}
+	Value parse () { Value result = read (0); skip (); require (pos == data.size (), "Trailing native MIDI data"); return result; }
+private:
+	const std::string& data;
+	size_t pos = 0, nodes = 0;
+	unsigned char byte () { require (pos < data.size (), "Truncated native MIDI data"); return static_cast<unsigned char> (data[pos++]); }
+	void skip () { while (pos < data.size () && data[pos] == 'N') { ++pos; } }
+	uint64_t bits (unsigned n) { uint64_t v = 0; while (n--) { v = (v << 8) | byte (); } return v; }
+	int64_t signed_integer (char marker) {
+		switch (marker) {
+		case 'i': return static_cast<int8_t> (byte ());
+		case 'U': return byte ();
+		case 'I': return static_cast<int16_t> (bits (2));
+		case 'l': return static_cast<int32_t> (bits (4));
+		case 'L': { uint64_t b = bits (8); int64_t v; std::memcpy (&v, &b, 8); return v; }
+		default: throw ExchangeError ("Invalid native MIDI integer type");
+		}
+	}
+	size_t length () { int64_t n = signed_integer (byte ()); require (n >= 0 && uint64_t (n) <= data.size (), "Invalid native MIDI length"); return n; }
+	std::string string () {
+		size_t n = length (); require (n <= data.size () - pos, "Truncated native MIDI string");
+		std::string s = data.substr (pos, n); pos += n;
+		require (g_utf8_validate (s.data (), s.size (), nullptr) && s.find ('\0') == std::string::npos, "Invalid native MIDI text"); return s;
+	}
+	Value read (unsigned depth, char forced = 0) {
+		require (++nodes <= 1000000 && depth <= 64, "Native MIDI exceeds structural limits");
+		if (!forced) { skip (); }
+		char marker = forced ? forced : byte (); Value v;
+		switch (marker) {
+		case 'Z': return v;
+		case 'T': case 'F': v.type = Value::Boolean; v.number = marker == 'T'; return v;
+		case 'i': case 'U': case 'I': case 'l': case 'L': v.type = Value::Number; v.number = signed_integer (marker); return v;
+		case 'd': { uint32_t b = bits (4); float f; std::memcpy (&f, &b, 4); v.type = Value::Number; v.number = f; break; }
+		case 'D': { uint64_t b = bits (8); double f; std::memcpy (&f, &b, 8); v.type = Value::Number; v.number = f; break; }
+		case 'S': v.type = Value::String; v.string = string (); return v;
+		case 'C': v.type = Value::String; v.string += byte (); require (static_cast<unsigned char> (v.string[0]) < 128, "Invalid native MIDI character"); return v;
+		case '[': case '{': {
+			v.type = marker == '[' ? Value::Array : Value::Object;
+			char close = marker == '[' ? ']' : '}'; char typed = 0; bool counted = false; size_t count = 0;
+			if (pos < data.size () && data[pos] == '$') { ++pos; typed = byte (); }
+			if (pos < data.size () && data[pos] == '#') { ++pos; counted = true; count = length (); }
+			require (!typed || counted, "Typed native MIDI container has no length");
+			require (count <= 1000000, "Native MIDI container is too large");
+			for (size_t i = 0;; ++i) {
+				if (counted && i == count) { break; }
+				if (!typed || v.type == Value::Object) { skip (); }
+				if (!counted && pos < data.size () && data[pos] == close) { ++pos; break; }
+				if (v.type == Value::Object) {
+					std::string key = string ();
+					require (!v.object.count (key), "Duplicate native MIDI key");
+					v.object.emplace (key, read (depth + 1, typed));
+				} else { v.array.push_back (read (depth + 1, typed)); }
+			}
+			return v;
+		}
+		default: throw ExchangeError ("Unsupported native MIDI encoding");
+		}
+		require (std::isfinite (v.number), "Non-finite native MIDI number"); return v;
+	}
+};
+
+std::string color (const std::string& native)
+{
+	if (native.empty ()) { return ""; }
+	require (native.size () == 8 && native.find_first_not_of ("0123456789abcdefABCDEF") == std::string::npos, "Unsupported Studio One color");
+	/* Native colors are AABBGGRR. */
+	return "#" + native.substr (6, 2) + native.substr (4, 2) + native.substr (2, 2);
+}
+
+typedef std::unique_ptr<GFile, void (*) (gpointer)> File;
+File file (const std::string& path) { return File (g_file_new_for_path (path.c_str ()), g_object_unref); }
+std::string path (GFile* f) { char* p = g_file_get_path (f); require (p, "Native song requires local media"); std::string s (p); g_free (p); return s; }
+std::string url_path (const std::string& uri)
+{
+	require (uri.compare (0, 8, "file:///") == 0, "Native song media must be copied into its local song folder");
+	File f (g_file_new_for_uri (uri.c_str ()), g_object_unref); return path (f.get ());
+}
+std::string member_url (const std::string& uri)
+{
+	require (uri.compare (0, 9, "media:///") == 0, "Native MIDI must be embedded in the song");
+	char* unescaped = g_uri_unescape_string (uri.c_str () + 9, nullptr);
+	require (unescaped, "Invalid native media URL"); std::string result (unescaped); g_free (unescaped);
+	return result;
+}
+
+class Reader {
+public:
+	Reader (const std::string& filename, CancelCheck check) : archive (filename, ArchiveLimits (), check), cancel (check) {
+		File song = file (filename); File parent (g_file_get_parent (song.get ()), g_object_unref);
+		require (parent.get (), "Native song has no parent folder"); root = path (parent.get ());
+		for (auto const& m : archive.members ()) { members.insert (m.name); }
+	}
+	StudioOneSongData read ();
+private:
+	ProjectArchive archive;
+	CancelCheck cancel;
+	StudioOneSongData result;
+	std::string root, original_root;
+	std::set<std::string> members;
+	std::map<std::string, Node> pool, channels;
+	std::map<std::string, size_t> media_indices;
+	std::vector<Document> documents;
+	Node document (const std::string& name, const char* expected) {
+		check (); documents.push_back (xml (archive.read_text (name)));
+		Node n = xmlDocGetRootElement (documents.back ().get ()); require (is (n, expected), "Unexpected native song document: " + name); return n;
+	}
+	void check () { if (cancel && cancel ()) { throw ArchiveCancelled (); } }
+	void unsupported (const std::string& object, const std::string& detail) { result.project.report.push_back ({Disposition::Unsupported, object, detail}); }
+	void attributes (Node node, const std::set<std::string>& known, const std::string& object) {
+		for (xmlAttr* a = node->properties; a; a = a->next) {
+			std::string name (reinterpret_cast<const char*> (a->name));
+			if (!known.count (name)) { unsupported (object, "Native property is not yet supported: " + name); }
+		}
+	}
+	void index_pool (Node n) {
+		if (is (n, "AudioClip") || is (n, "MusicClip")) { std::string key = value (n, "mediaID"); require (!key.empty () && pool.emplace (key, n).second, "Duplicate or empty native media ID"); }
+		for (Node c : children (n)) { index_pool (c); }
+	}
+	void index_channels (Node n) {
+		if (Node uid = child (n, "UID", "uniqueID")) {
+			if (is (n, "AudioTrackChannel") || is (n, "MusicTrackChannel") || is (n, "AudioOutputChannel")) {
+				std::string key = value (uid, "uid"); require (!key.empty () && channels.emplace (key, n).second, "Duplicate native channel ID");
+			}
+		}
+		for (Node c : children (n)) { index_channels (c); }
+	}
+	std::string media_path (const std::string& uri);
+	std::string audio (const std::string& key);
+	void notes (Clip& clip, Node entry);
+	void channel (Track& track, Node n);
+	void track (Node n);
+	void automation (Node n, const std::string& name);
+};
+
+std::string Reader::media_path (const std::string& uri)
+{
+	File original = file (url_path (uri)); File base = file (original_root);
+	char* raw = g_file_get_relative_path (base.get (), original.get ());
+	require (raw, "Media is outside the song folder. In Studio One use Save to New Folder to collect the media.");
+	std::string relative (raw); g_free (raw);
+	require (!relative.empty (), "Invalid native audio path");
+	File folder = file (root); File local (g_file_resolve_relative_path (folder.get (), relative.c_str ()), g_object_unref);
+	require (g_file_has_prefix (local.get (), folder.get ()), "Native media path escapes the song folder");
+	/* Refuse links in every component; never follow a song-supplied path to
+	 * other local files or to a network share. */
+	File current (G_FILE (g_object_ref (local.get ())), g_object_unref);
+	while (!g_file_equal (current.get (), folder.get ())) {
+		GFileInfo* info = g_file_query_info (current.get (), G_FILE_ATTRIBUTE_STANDARD_TYPE "," G_FILE_ATTRIBUTE_STANDARD_IS_SYMLINK,
+		                                   G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, nullptr, nullptr);
+		require (info, "Missing native song media: " + relative);
+		bool link = g_file_info_get_is_symlink (info); g_object_unref (info);
+		require (!link, "Native song media links are not supported");
+		current.reset (g_file_get_parent (current.get ())); require (current.get (), "Invalid native song media path");
+	}
+	require (g_file_query_file_type (local.get (), G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, nullptr) == G_FILE_TYPE_REGULAR, "Native audio is not a regular file");
+	return path (local.get ());
+}
+
+std::string Reader::audio (const std::string& key)
+{
+	if (media_indices.count (key)) { return key; }
+	auto entry = pool.find (key); require (entry != pool.end () && is (entry->second, "AudioClip"), "Native audio clip references missing media");
+	Node n = entry->second; Node format = child (n, "Attributes", "format"); require (format, "Missing native audio format");
+	Media m; m.id = key; m.path = "audio/source-" + std::to_string (result.project.media.size ()) + ".wav";
+	m.sample_rate = integer (format, "sampleRate"); m.channels = integer (format, "numChannels");
+	require (m.sample_rate, "Invalid native audio sample rate"); m.duration = number (format, "frameCount", -1) / m.sample_rate;
+	result.audio_files[key] = media_path (value (child (n, "Url", "path"), "url"));
+	media_indices[key] = result.project.media.size (); result.project.media.push_back (m); return key;
+}
+
+void Reader::notes (Clip& clip, Node entry)
+{
+	std::string name = member_url (value (child (entry, "Url", "dataPath"), "url"));
+	std::string data = archive.read_text (name); Value content = BinaryJSON (data).parse ();
+	double format = content.get ("timeFormat", 2); require (format == 0 || format == 2, "Invalid native MIDI time format");
+	clip.offset.unit = unit (static_cast<unsigned> (format));
+	auto events = content.find ("events"); require (events && events->type == Value::Array, "Native MIDI has no event array");
+	for (auto const& e : events->array) {
+		check (); Note n;
+		double pitch = e.get ("pitch", -1), ch = e.get ("channel", 0);
+		require (pitch >= 0 && pitch <= 127 && std::floor (pitch) == pitch && ch >= 0 && ch <= 15 && std::floor (ch) == ch, "Unsupported native MIDI event or channel");
+		n.key = pitch; n.channel = ch; n.time = e.get ("start", 0); n.duration = e.get ("length", 0); n.velocity = e.get ("velocity", 1);
+		n.release_velocity = e.get ("releaseVelocity", 0.5);
+		for (auto const& a : e.object) {
+			if (!std::set<std::string> {"start", "length", "pitch", "channel", "velocity", "releaseVelocity", "noteId"}.count (a.first)) { unsupported (clip.name, "Native MIDI event property: " + a.first); }
+		}
+		clip.notes.push_back (n);
+	}
+	for (auto const& a : content.object) {
+		if (a.first == "envelopes") {
+			require (a.second.type == Value::Array, "Invalid native MIDI envelopes");
+			if (!a.second.array.empty ()) { unsupported (clip.name, "MIDI controllers and note expressions are not yet supported"); }
+		} else if (a.first != "events" && a.first != "timeFormat") { unsupported (clip.name, "Native MIDI property: " + a.first); }
+	}
+}
+
+void Reader::automation (Node n, const std::string& name)
+{
+	for (Node c : children (n)) {
+		if (!is (c, "AutomationRegion")) { unsupported (name, "Unknown native automation region"); continue; }
+		std::string member = member_url (value (child (c, "Url", "points"), "url"));
+		std::string data = archive.read_text (member); Value envelope = BinaryJSON (data).parse ();
+		auto events = envelope.find ("events");
+		require (events && events->type == Value::Array, "Malformed native automation envelope");
+		bool unknown = false;
+		for (auto const& item : envelope.object) { unknown = unknown || (item.first != "events" && item.first != "bipolar"); }
+		if (!events->array.empty () || unknown) { unsupported (name, "Automation is not yet supported: " + value (c, "title")); }
+	}
+}
+
+void Reader::channel (Track& track, Node n)
+{
+	attributes (n, {"gain", "pan", "iconid", "name", "label", "mute", "solo", "soloSafe", "color", "transpose", "velocity", "meteringPosition"}, track.name);
+	track.mute = boolean (n, "mute"); track.solo = boolean (n, "solo");
+	track.volume = number (n, "gain", 1); track.pan = number (n, "pan", 0.5);
+	if (number (n, "transpose") || number (n, "velocity")) { unsupported (track.name, "MIDI channel transpose or velocity adjustment"); }
+	for (Node c : children (n)) {
+		std::string identifier = id (c);
+		if (identifier == "Inserts" || identifier == "PostFaderInserts" || identifier == "Sends") {
+			for (Node item : children (c)) {
+				if (id (item) == "Presets" && children (item).empty ()) { continue; }
+				if (id (item) == "Combinator" && children (item).size () == 1 && is (children (item)[0], "UID")) { continue; }
+				unsupported (track.name, "Plug-ins or sends are not yet supported");
+			}
+		} else if (identifier == "Panner") {
+			track.pan = number (c, "panX1", track.pan);
+			if (number (c, "panX2") || number (c, "panWidth", 1) != 1 || number (c, "stereoMode") || number (c, "spatialObjectMode")) { unsupported (track.name, "Advanced panning is not yet supported"); }
+		} else if (identifier == "InputFX") {
+			if (number (c, "gain") || number (c, "invertPhaseL") || number (c, "invertPhaseR")) { unsupported (track.name, "Input gain or polarity adjustment"); }
+		} else if (identifier == "AudioBusMixFX" && !boolean (c, "passThrough", true)) { unsupported (track.name, "Mix engine effects are not yet supported"); }
+	}
+	if (Node connection = child (n, "Connection", "destination")) {
+		std::string target = value (connection, "objectID");
+		auto slash = target.find ('/');
+		require (slash != std::string::npos && target.substr (slash) == "/Input", "Unsupported native channel routing");
+		track.destination = target.substr (0, slash);
+	}
+}
+
+void Reader::track (Node n)
+{
+	check (); Track t; t.id = value (n, "trackID"); t.name = value (n, "name"); t.color = color (value (n, "color"));
+	attributes (n, {"mediaType", "tempoFollow", "materialMode", "trackNumber", "layersFollow", "followLayerName", "followGlobalTransposition", "version", "trackID", "timeFormat", "name", "color", "delay", "transpose"}, t.name);
+	std::string type = value (n, "mediaType");
+	require (type == "Audio" || type == "Music", "Unsupported native track media type"); t.kind = type == "Audio" ? TrackKind::Audio : TrackKind::MIDI;
+	unsigned format = integer (n, "timeFormat", 2); unit (format);
+	std::string channel_id = value (child (n, "UID", "channelID"), "uid");
+	auto ch = channels.find (channel_id); require (ch != channels.end (), "Missing native track channel");
+	channel (t, ch->second);
+	std::string speaker = value (child (n, "SpeakerSetup", "trackFormat"), "type", "Stereo");
+	require (speaker == "Stereo" || speaker == "Mono", "Unsupported native speaker arrangement"); t.channels = speaker == "Mono" ? 1 : 2;
+	if (number (n, "delay") || number (n, "transpose")) { unsupported (t.name, "Track delay or transposition is not yet supported"); }
+	automation (child (n, "Attributes", "AutomationRegionList"), t.name);
+	for (Node c : children (n)) {
+		if (is (c, "List") && id (c) != "Events" && !children (c).empty ()) { unsupported (t.name, "Track layers or additional event lists are not yet supported"); }
+	}
+	for (Node e : children (child (n, "List", "Events"))) {
+		bool midi = t.kind == TrackKind::MIDI;
+		if (!is (e, midi ? "MusicPart" : "AudioEvent")) { unsupported (t.name, "Unsupported native event type"); continue; }
+		Clip c; c.kind = midi ? ClipKind::MIDI : ClipKind::Audio; c.name = value (e, "name", t.name); c.color = color (value (e, "color"));
+		attributes (e, {"clipID", "timeFormat", "start", "length", "name", "color", "offset", "mute", "speed", "transpose", "tune", "normalize", "modification", "velocity", "fadeIn", "fadeOut", "loop", "gain"}, c.name);
+		c.position = Time (number (e, "start"), unit (integer (e, "timeFormat", format))); c.duration = number (e, "length");
+		c.offset = Time (number (e, "offset"), midi ? TimeUnit::Beats : TimeUnit::Seconds); c.enabled = !boolean (e, "mute");
+		std::string key = value (e, "clipID"); auto entry = pool.find (key); require (entry != pool.end (), "Native event references missing media");
+		if (midi) { require (is (entry->second, "MusicClip"), "Wrong native MIDI media type"); notes (c, entry->second); }
+		else { c.media = audio (key); }
+		for (const char* attr : {"transpose", "tune", "normalize", "modification", "velocity", "fadeIn", "fadeOut", "loop"}) {
+			if (number (e, attr)) { unsupported (c.name, "Native event processing is not yet supported: " + std::string (attr)); }
+		}
+		if (number (e, "speed", 1) != 1 || number (e, "gain", 1) != 1) { unsupported (c.name, "Event speed or gain adjustment is not yet supported"); }
+		if (!children (e).empty ()) { unsupported (c.name, "Event envelopes, fades or other nested processing are not yet supported"); }
+		t.clips.push_back (c);
+	}
+	result.project.tracks.push_back (t);
+}
+
+StudioOneSongData Reader::read ()
+{
+	Node meta = document ("metainfo.xml", "MetaInformation"); std::map<std::string, std::string> metadata;
+	for (Node n : children (meta)) { if (is (n, "Attribute")) { require (metadata.emplace (value (n, "id"), value (n, "value")).second, "Duplicate native song metadata"); } }
+	require (metadata["Document:MimeType"] == "application/x.presonus-song", "This file is not a Studio One song");
+	require (metadata["Document:FormatVersion"] == "9", "This Studio One native format version has not yet been validated (supported: 9)");
+	result.project.application = "Studio One / Studio Pro"; result.project.application_version = metadata["Document:Generator"];
+	Node song = document ("Song/song.xml", "Song"); Node root_node = child (song, "Attributes", "Root"); require (root_node, "Native song has no arrangement");
+	Node context = child (root_node, "Attributes", "timeContext"); require (context, "Native song has no time context");
+	Node tempos = child (context, "TempoMap", "tempoMap");
+	unsigned tempo_count = 0;
+	for (Node n : children (tempos)) { if (is (n, "TempoMapSegment")) {
+		++tempo_count; double seconds_per_beat = number (n, "tempo"); require (seconds_per_beat > 0, "Invalid native song tempo");
+		if (tempo_count == 1) { result.project.tempo = 60 / seconds_per_beat; }
+		if (number (n, "start") != 0 || number (n, "curveType")) { unsupported ("Tempo map", "Variable tempo is not yet supported"); }
+	} }
+	require (tempo_count, "Native song has no tempo"); if (tempo_count > 1) { unsupported ("Tempo map", "Variable tempo is not yet supported"); }
+	Node meters = child (context, "TimeSignatureMap", "timeSignatureMap"); unsigned meter_count = 0;
+	for (Node n : children (meters)) { if (is (n, "TimeSignatureMapSegment")) {
+		++meter_count; if (meter_count == 1) { result.project.numerator = integer (n, "numerator"); result.project.denominator = integer (n, "denominator"); }
+		if (number (n, "start")) { unsupported ("Meter map", "Variable meter is not yet supported"); }
+	} }
+	require (meter_count, "Native song has no meter"); if (meter_count > 1) { unsupported ("Meter map", "Variable meter is not yet supported"); }
+	Node media = document ("Song/mediapool.xml", "MediaPool");
+	std::string original = url_path (value (child (media, "Attributes", "documentPath"), "url"));
+	File original_file = file (original); File parent (g_file_get_parent (original_file.get ()), g_object_unref);
+	require (parent.get (), "Native song original folder is missing"); original_root = path (parent.get ()); index_pool (media);
+	index_channels (document ("Devices/audiomixer.xml", "AudioMixer"));
+	if (members.count ("Devices/musictrackdevice.xml")) { index_channels (document ("Devices/musictrackdevice.xml", "MusicTrackDevice")); }
+	if (members.count ("Devices/audiosynthfolder.xml")) {
+		for (Node n : children (document ("Devices/audiosynthfolder.xml", "AudioSynthFolder"))) {
+			if (id (n) != "Presets") { unsupported ("Instruments", "Native instrument plug-ins are not yet supported"); }
+		}
+	}
+	for (Node n : children (child (root_node, "List", "Tracks"))) {
+		if (is (n, "MediaTrack")) { track (n); }
+		else if (is (n, "MarkerTrack")) {
+			unsigned format = integer (n, "timeFormat", 2); bool start = false, end = false;
+			for (Node m : children (n)) { if (is (m, "MarkerEvent")) {
+				Time time (number (m, "start"), unit (integer (m, "timeFormat", format)));
+				require (time.value >= 0, "Invalid native marker time");
+				unsigned type = integer (m, "markerType");
+				if (type == 2) { require (!start, "Duplicate song start marker"); result.start = time; start = true; }
+				else if (type == 3) { require (!end, "Duplicate song end marker"); result.end = time; end = true; }
+				else { result.markers.push_back ({value (m, "name"), time}); }
+				if (boolean (m, "markerStop")) { unsupported (value (m, "name"), "Stop-at-marker behavior is not yet supported"); }
+			} }
+			result.has_range = start && end;
+		} else if (is (n, "ChordTrack") || is (n, "ArrangerTrack") || is (n, "LyricsTrack") || is (n, "VideoTrack")) {
+			for (Node c : children (n)) {
+				if (is (c, "UID") || (is (c, "Attributes") && (id (c) == "attributes" || (id (c) == "lyrics" && children (c).empty ())))) { continue; }
+				unsupported (reinterpret_cast<const char*> (n->name), "This native track contains unsupported content");
+			}
+		} else { unsupported (value (n, "name"), "Native track type is not yet supported: " + std::string (reinterpret_cast<const char*> (n->name))); }
+	}
+	for (auto const& pair : channels) { if (is (pair.second, "AudioOutputChannel")) {
+		Track master; master.id = pair.first; master.kind = TrackKind::Bus; master.master = true; master.name = value (pair.second, "label", "Master"); channel (master, pair.second);
+		result.project.tracks.push_back (master);
+	} }
+	/* Native channel routing references channel IDs, while tracks use trackID. */
+	std::map<std::string, std::string> destinations;
+	for (Node n : children (child (root_node, "List", "Tracks"))) { if (is (n, "MediaTrack")) { destinations[value (child (n, "UID", "channelID"), "uid")] = value (n, "trackID"); } }
+	for (auto& t : result.project.tracks) { auto i = destinations.find (t.destination); if (i != destinations.end ()) { t.destination = i->second; } }
+	if (result.has_range) { require (convert_time (result.end, TimeUnit::Seconds, result.project.tempo) > convert_time (result.start, TimeUnit::Seconds, result.project.tempo), "Invalid native song boundaries"); }
+	validate_project (result.project);
+	result.project.report.push_back ({Disposition::Preserved, "Native Studio One song", "Audio, MIDI notes, clip positions, track names, colors, static mixer controls and constant tempo/meter read directly from the .song file"});
+	return result;
+}
+
+} // namespace
+
+StudioOneSongData StudioOneSong::read (const std::string& filename, CancelCheck cancel) { return Reader (filename, cancel).read (); }
+
+} }

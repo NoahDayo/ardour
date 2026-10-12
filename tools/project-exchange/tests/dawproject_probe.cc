@@ -8,6 +8,7 @@
 #include <libxml/parser.h>
 #include <libxml/xmlschemas.h>
 #include "ardour/dawproject.h"
+#include "ardour/studio_one_song.h"
 
 using namespace ARDOUR::ProjectExchange;
 
@@ -96,6 +97,16 @@ static int run (const std::vector<std::string>& args)
 		if (args.size () < 3) { return 2; }
 		if (args[1] == "parse") { dump (DawProject::parse_xml (read_text (args[2]))); }
 		else if (args[1] == "read") { dump (DawProject::read (args[2])); }
+		else if (args[1] == "read-song") {
+			auto song = StudioOneSong::read (args[2]);
+			std::cout << "{\"project\":"; dump (song.project);
+			std::cout << ",\"start\":"; time_json (song.start);
+			std::cout << ",\"end\":"; time_json (song.end);
+			std::cout << ",\"has_range\":" << (song.has_range ? "true" : "false") << ",\"markers\":[";
+			bool first = true;
+			for (auto const& marker : song.markers) { if (!first) { std::cout << ','; } first = false; std::cout << "["; quoted (marker.name); std::cout << ','; time_json (marker.position); std::cout << ']'; }
+			std::cout << "]}\n";
+		}
 		else if (args[1] == "rewrite" && args.size () == 4) {
 			std::string xml = DawProject::write_xml (DawProject::parse_xml (read_text (args[2])));
 			if (!g_file_set_contents (args[3].c_str (), xml.c_str (), xml.size (), NULL)) { throw ExchangeError ("Cannot write test file"); }

@@ -66,6 +66,7 @@
 #include "ardour_ui.h"
 #include "context_menu_helper.h"
 #include "session_dialog.h"
+#include "project_exchange_ui.h"
 #include "opts.h"
 #include "engine_dialog.h"
 #include "pbd/i18n.h"
@@ -593,14 +594,30 @@ SessionDialog::setup_existing_box ()
 	aaf_filter.set_name (_("Advanced Authoring Format (AAF)"));
 	existing_session_chooser.add_filter (aaf_filter);
 
+	FileFilter dawproject_filter;
+	dawproject_filter.add_pattern ("*.dawproject");
+	dawproject_filter.add_pattern ("*.DAWPROJECT");
+	dawproject_filter.set_name (_("DAWproject files"));
+	existing_session_chooser.add_filter (dawproject_filter);
+
+	FileFilter song_filter;
+	song_filter.add_pattern ("*.song");
+	song_filter.add_pattern ("*.SONG");
+	song_filter.set_name (_("Studio One / Studio Pro songs"));
+	existing_session_chooser.add_filter (song_filter);
+
 	FileFilter all_filter;
 	all_filter.add_pattern (string_compose(X_("*%1"), ARDOUR::statefile_suffix));
 	all_filter.add_pattern (string_compose(X_("*%1"), ARDOUR::session_archive_suffix));
 	all_filter.add_pattern (string_compose(X_("*%1"), ARDOUR::advanced_authoring_format_suffix));
+	all_filter.add_pattern ("*.dawproject");
+	all_filter.add_pattern ("*.DAWPROJECT");
+	all_filter.add_pattern ("*.song");
+	all_filter.add_pattern ("*.SONG");
 	all_filter.set_name (_("All supported files"));
 	existing_session_chooser.add_filter (all_filter);
 
-	existing_session_chooser.set_filter (session_filter);
+	existing_session_chooser.set_filter (all_filter);
 
 	Gtkmm2ext::add_volume_shortcuts (existing_session_chooser);
 
@@ -623,9 +640,12 @@ SessionDialog::existing_file_selected ()
 		return;
 	}
 
-	std::string suffix = s.substr (s.find_last_of ('.'));
+	const std::string::size_type dot = s.find_last_of ('.');
+	std::string suffix = dot == std::string::npos ? std::string () : s.substr (dot);
 
-	if (PBD::downcase (suffix).find (advanced_authoring_format_suffix) == 0) {
+	if (ProjectExchangeUI::is_importable_project (s)) {
+		// Validated by the importer after choosing a destination.
+	} else if (PBD::downcase (suffix).find (advanced_authoring_format_suffix) == 0) {
 		// OK
 	}  else if (suffix.find (session_archive_suffix) == 0) {
 		// OK

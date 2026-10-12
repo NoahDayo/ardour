@@ -68,6 +68,7 @@
 #include "missing_plugin_dialog.h"
 #include "opts.h"
 #include "plugin_scan_dialog.h"
+#include "project_exchange_ui.h"
 #include "public_editor.h"
 #include "save_as_dialog.h"
 #include "session_dialog.h"
@@ -183,6 +184,21 @@ ARDOUR_UI::session_dialog_response_handler (int response, SessionDialog* session
 
 	if (nsm) {
 		likely_new = true;
+	}
+
+	if (!likely_new && ProjectExchangeUI::is_importable_project (session_name)) {
+		ProjectExchangeUI::ImportRequest request;
+		if (!ProjectExchangeUI::prepare_import (session_dialog, session_name, request)) {
+			session_dialog->present ();
+			return;
+		}
+		session_dialog->hide ();
+		if (ProjectExchangeUI::import_prepared (&_main_window, request, false)) {
+			delete_when_idle (session_dialog);
+		} else {
+			session_dialog->present ();
+		}
+		return;
 	}
 
 	/* could be an archived session, so test for that and use the

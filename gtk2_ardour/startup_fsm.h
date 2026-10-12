@@ -73,6 +73,7 @@ class StartupFSM : public sigc::trackable
 	std::string          session_path;
 	std::string          session_name;
 	std::string          session_template;
+	std::string          session_dawproject;
 	Temporal::TimeDomain session_domain;
 	int                  session_existing_sample_rate;
 	XMLNode              session_engine_hints;

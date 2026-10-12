@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <set>
 #include <glib/gstdio.h>
 #include <glibmm/fileutils.h>
 #include <glibmm/miscutils.h>
@@ -12,6 +13,7 @@
 #include "ardour/audioregion.h"
 #include "ardour/midi_model.h"
 #include "ardour/midi_region.h"
+#include "ardour/location.h"
 #include "ardour/playlist.h"
 #include "ardour/project_session.h"
 #include "ardour/recent_sessions.h"
@@ -126,6 +128,27 @@ void package (Fixture& fixture, const PX::Project& project, const std::string& n
 	PX::DawProject::write (project, fixture.path (name), {{"source", fixture.path ("source.wav")}});
 }
 
+void native_package (Fixture& fixture, bool processing = false)
+{
+	auto project = example (fixture);
+	auto uri = [] (const std::string& path) {
+		gchar* raw = g_filename_to_uri (path.c_str (), NULL, NULL);
+		CPPUNIT_ASSERT (raw);
+		std::string result (raw); g_free (raw); return result;
+	};
+	PX::ProjectArchiveWriter song (fixture.path ("input.song"));
+	song.add_text ("metainfo.xml", "<MetaInformation><Attribute id=\"Document:MimeType\" value=\"application/x.presonus-song\"/><Attribute id=\"Document:FormatVersion\" value=\"9\"/></MetaInformation>");
+	song.add_text ("Song/song.xml", std::string (R"(<Song><Attributes x:id="Root"><Attributes x:id="timeContext">
+<TempoMap x:id="tempoMap"><TempoMapSegment start="0" tempo="0.6"/></TempoMap>
+<TimeSignatureMap x:id="timeSignatureMap"><TimeSignatureMapSegment start="0" numerator="3" denominator="4"/></TimeSignatureMap>
+</Attributes><List x:id="Tracks"><MarkerTrack timeFormat="2"><MarkerEvent markerType="2"/><MarkerEvent markerType="3" start="12"/></MarkerTrack>
+<MediaTrack trackID="audio" mediaType="Audio" name="Native audio" timeFormat="0" color="FF34AB12"><UID x:id="channelID" uid="channel"/>
+<List x:id="Events"><AudioEvent clipID="media" start="1.25" length="0.5" offset="0.375" name="Native clip" gain=")") + (processing ? "0.5" : "1") + R"("/></List></MediaTrack></List></Attributes></Song>)");
+	song.add_text ("Song/mediapool.xml", "<MediaPool><Attributes x:id=\"documentPath\" url=\"" + uri (fixture.path ("input.song")) + "\"/><AudioClip mediaID=\"media\"><Url x:id=\"path\" url=\"" + uri (fixture.path ("source.wav")) + "\"/><Attributes x:id=\"format\" sampleRate=\"" + std::to_string (project.media[0].sample_rate) + "\" numChannels=\"2\" frameCount=\"" + std::to_string (project.media[0].sample_rate * 2) + "\"/></AudioClip></MediaPool>");
+	song.add_text ("Devices/audiomixer.xml", R"(<AudioMixer><AudioTrackChannel gain="0.75" pan="0.3"><UID x:id="uniqueID" uid="channel"/><Connection x:id="destination" objectID="master/Input"/></AudioTrackChannel><AudioOutputChannel label="Main"><UID x:id="uniqueID" uid="master"/></AudioOutputChannel></AudioMixer>)");
+	song.finish ();
+}
+
 const PX::Track& track_named (const PX::Project& project, const std::string& name)
 {
 	for (auto const& track : project.tracks) { if (track.name == name) { return track; } }
@@ -155,6 +178,9 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (cancel_export);
 	CPPUNIT_TEST (existing_export);
 	CPPUNIT_TEST (reject_unmapped_processing);
+	CPPUNIT_TEST (native_song_import);
+	CPPUNIT_TEST (native_song_cancel);
+	CPPUNIT_TEST (native_song_unsupported);
 	CPPUNIT_TEST_SUITE_END ();
 public:
 	void roundtrip ();
@@ -168,9 +194,71 @@ public:
 	void cancel_export ();
 	void existing_export ();
 	void reject_unmapped_processing ();
+	void native_song_import ();
+	void native_song_cancel ();
+	void native_song_unsupported ();
 };
 
 CPPUNIT_TEST_SUITE_REGISTRATION (ProjectSessionTest);
+
+void ProjectSessionTest::native_song_import ()
+{
+	Fixture fixture;
+	native_package (fixture);
+	fixture.session = PX::SessionExchange::import_studio_one (*AudioEngine::instance (), fixture.path ("input.song"), fixture.path ("Native"), "Native", fixture.report);
+	CPPUNIT_ASSERT (!fixture.session->unnamed ());
+	CPPUNIT_ASSERT (fixture.session);
+	CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
+	CPPUNIT_ASSERT_EQUAL (0, g_unlink (fixture.path ("input.song").c_str ()));
+	CPPUNIT_ASSERT_EQUAL (0, g_unlink (fixture.path ("source.wav").c_str ()));
+	auto range = fixture.session->locations ()->session_range_location ();
+	CPPUNIT_ASSERT (range);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (7.2, double (range->end ().samples ()) / fixture.session->sample_rate (), 1.0 / fixture.session->sample_rate ());
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("native-output.dawproject"));
+	auto output = PX::DawProject::read (fixture.path ("native-output.dawproject"));
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (100, output.tempo, 1e-6);
+	CPPUNIT_ASSERT_EQUAL (3U, output.numerator);
+	auto const& audio = track_named (output, "Native audio");
+	CPPUNIT_ASSERT_EQUAL (std::string ("#12ab34"), audio.color);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (0.75, audio.volume, 1e-6);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (0.3, audio.pan, 1e-6);
+	CPPUNIT_ASSERT_EQUAL (size_t (1), audio.clips.size ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (1.25, audio.clips[0].position.value, 1e-6);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (0.375, audio.clips[0].offset.value, 1e-6);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (0.5, audio.clips[0].duration, 1e-6);
+	PX::ProjectArchive (fixture.path ("native-output.dawproject")).copy_file (output.media[0].path, fixture.path ("native-verify.wav"));
+	SndFileImportableSource source (fixture.path ("native-verify.wav"));
+	std::vector<Sample> pcm (source.length () * source.channels ());
+	CPPUNIT_ASSERT_EQUAL (samplecnt_t (pcm.size ()), source.read (pcm.data (), pcm.size ()));
+	for (size_t i = 0; i < pcm.size () / 2; ++i) {
+		CPPUNIT_ASSERT_EQUAL (float (int (i % 37) - 18) / 32, pcm[2 * i]);
+		CPPUNIT_ASSERT_EQUAL (float (int (i % 61) - 30) / 64, pcm[2 * i + 1]);
+	}
+}
+
+void ProjectSessionTest::native_song_cancel ()
+{
+	Fixture fixture;
+	native_package (fixture);
+	bool reached_session = false;
+	auto cancel = [&] { return reached_session = AudioEngine::instance ()->session () != nullptr; };
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::import_studio_one (*AudioEngine::instance (), fixture.path ("input.song"), fixture.path ("Native"), "Native", fixture.report, cancel), PX::ArchiveCancelled);
+	CPPUNIT_ASSERT (reached_session);
+	CPPUNIT_ASSERT (!AudioEngine::instance ()->session ());
+	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("Native"), Glib::FILE_TEST_EXISTS));
+	CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
+}
+
+void ProjectSessionTest::native_song_unsupported ()
+{
+	Fixture fixture;
+	native_package (fixture, true);
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::import_studio_one (*AudioEngine::instance (), fixture.path ("input.song"), fixture.path ("Native"), "Native", fixture.report), PX::ExchangeError);
+	CPPUNIT_ASSERT (!AudioEngine::instance ()->session ());
+	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("Native"), Glib::FILE_TEST_EXISTS));
+	CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
+	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& d) { return d.disposition == PX::Disposition::Unsupported; }));
+}
 
 void ProjectSessionTest::roundtrip ()
 {
@@ -180,6 +268,7 @@ void ProjectSessionTest::roundtrip ()
 	const std::string session_name = u8"音楽 Session";
 	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"), fixture.path (session_name), "Exchange", fixture.report);
 	CPPUNIT_ASSERT (fixture.session);
+	CPPUNIT_ASSERT (!fixture.session->unnamed ());
 	CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
 	CPPUNIT_ASSERT (Glib::file_test (Glib::build_filename (fixture.path (session_name), "Exchange.ardour"), Glib::FILE_TEST_IS_REGULAR));
 	// Remove both external inputs. Export must read the saved session's copies.
@@ -370,7 +459,12 @@ void ProjectSessionTest::reject_unmapped_processing ()
 		}
 	}
 	CPPUNIT_ASSERT (changed);
-	CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("lossy.dawproject")), PX::ExchangeError);
+	std::vector<PX::Diagnostic> report;
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("lossy.dawproject"), report), PX::ExchangeError);
+	std::set<std::string> unsupported;
+	for (auto const& item : report) { if (item.disposition == PX::Disposition::Unsupported) { unsupported.insert (item.object); } }
+	CPPUNIT_ASSERT (unsupported.count ("Offset audio"));
+	CPPUNIT_ASSERT (unsupported.count ("Muted audio"));
 	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("lossy.dawproject"), Glib::FILE_TEST_EXISTS));
 }
 
