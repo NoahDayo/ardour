@@ -48,14 +48,26 @@ main (int argc, char** argv)
 		if (count++) { putchar (','); }
 		printf ("{\"name\":");
 		json_string (track->name);
+		if (track->gain && track->gain->pts_cnt == 1) { printf (",\"gain\":%.12g", aafRationalToDouble (track->gain->value[0])); }
+		if (track->gain && track->gain->pts_cnt > 1) {
+			printf (",\"gain_curve\":[");
+			for (unsigned int point = 0; point < track->gain->pts_cnt; ++point) {
+				if (point) { putchar (','); }
+				printf ("[%.12g,%.12g]", aafRationalToDouble (track->gain->time[point]), aafRationalToDouble (track->gain->value[point]));
+			}
+			putchar (']');
+		}
+		if (track->pan && track->pan->pts_cnt == 1) { printf (",\"pan\":%.12g", aafRationalToDouble (track->pan->value[0])); }
 		printf (",\"channels\":%u,\"rate\":[%d,%d],\"clips\":[",
 		        track->format, track->edit_rate->numerator, track->edit_rate->denominator);
 		AAFI_foreachTrackItem (track, item) {
 			aafiAudioClip* clip = aafi_timelineItemToAudioClip (item);
 			if (!clip) { continue; }
 			if (clips++) { putchar (','); }
-			printf ("{\"position\":%" PRId64 ",\"length\":%" PRId64 ",\"offset\":%" PRId64 ",\"channels\":%d}",
+			printf ("{\"position\":%" PRId64 ",\"length\":%" PRId64 ",\"offset\":%" PRId64 ",\"channels\":%d",
 			        clip->pos, clip->len, clip->essence_offset, clip->channels);
+			if (clip->gain && clip->gain->pts_cnt == 1) { printf (",\"gain\":%.12g", aafRationalToDouble (clip->gain->value[0])); }
+			putchar ('}');
 		}
 		printf ("]}");
 	}

@@ -16,4 +16,5 @@ bool prepare_import (Gtk::Window*, std::string const& archive, ImportRequest&);
 bool import_prepared (Gtk::Window*, ImportRequest const&, bool offer_session_dialog);
 void import_dawproject (Gtk::Window* parent);
 void export_dawproject (Gtk::Window* parent);
+void export_logic (Gtk::Window* parent);
 }

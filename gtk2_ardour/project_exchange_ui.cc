@@ -287,41 +287,44 @@ bool ProjectExchangeUI::import_prepared (Gtk::Window* parent, ImportRequest cons
 	return false;
 }
 
-void ProjectExchangeUI::export_dawproject (Gtk::Window* parent)
+static void export_project (Gtk::Window* parent, bool logic)
 {
 	ARDOUR_UI& ui = *ARDOUR_UI::instance ();
 	ARDOUR::Session* session = ui.the_session ();
 	if (!parent || !session || exchange_active || ui.session_load_in_progress) { return; }
 	PBD::Unwinder<bool> active (exchange_active, true);
+	std::string title = logic ? _("Export AAF + MIDI to a new folder") : _("Export DAWproject");
 	if (session->transport_rolling () || session->actively_recording ()) {
-		show_report (*parent, _("Export DAWproject"), _("Stop playback and recording before exporting a project."));
+		show_report (*parent, title, _("Stop playback and recording before exporting a project."));
 		return;
 	}
-	Gtk::FileChooserDialog dialog (*parent, _("Export DAWproject"), Gtk::FILE_CHOOSER_ACTION_SAVE);
+	Gtk::FileChooserDialog dialog (*parent, title, Gtk::FILE_CHOOSER_ACTION_SAVE);
 	Gtkmm2ext::add_volume_shortcuts (dialog);
 	dialog.add_button (Gtk::Stock::CANCEL, Gtk::RESPONSE_CANCEL);
 	dialog.add_button (_("Export"), Gtk::RESPONSE_ACCEPT);
-	dialog.set_current_name (session->name () + ".dawproject");
+	dialog.set_current_name (session->name () + (logic ? " AAF-MIDI" : ".dawproject"));
 	dialog.set_current_folder (Glib::path_get_dirname (session->path ()));
 	Gtk::FileFilter filter;
-	filter.set_name (_("DAWproject files"));
-	filter.add_pattern ("*.dawproject");
+	filter.set_name (logic ? _("All files and folders") : _("DAWproject files"));
+	filter.add_pattern (logic ? "*" : "*.dawproject");
 	dialog.add_filter (filter);
 	if (dialog.run () != Gtk::RESPONSE_ACCEPT) { return; }
 	std::string destination = dialog.get_filename ();
 	dialog.hide ();
-	if (destination.size () < 11 || g_ascii_strcasecmp (destination.c_str () + destination.size () - 11, ".dawproject")) { destination += ".dawproject"; }
+	if (!logic && (destination.size () < 11 || g_ascii_strcasecmp (destination.c_str () + destination.size () - 11, ".dawproject"))) { destination += ".dawproject"; }
 	std::vector<PX::Diagnostic> report;
 	try {
-		ExchangeProgress progress (*parent, _("Exporting DAWproject"));
+		ExchangeProgress progress (*parent, logic ? _("Exporting AAF + MIDI") : _("Exporting DAWproject"));
 		if (ui.the_session () != session) { throw PX::ExchangeError (_("The session changed. Choose the project to export again.")); }
-		PX::SessionExchange::export_dawproject (*session, destination, report, [&] {
+		auto check = [&] {
 			bool cancelled = progress.check ();
 			if (ui.the_session () != session || session->transport_rolling ()) { throw PX::ExchangeError (_("The session changed during export. Stop playback and try again.")); }
 			return cancelled;
-		});
+		};
+		if (logic) { PX::SessionExchange::export_logic (*session, destination, report, check); }
+		else { PX::SessionExchange::export_dawproject (*session, destination, report, check); }
 	} catch (PX::ArchiveCancelled const&) {
-		show_report (*parent, _("Export cancelled"), _("No project file was created."));
+		show_report (*parent, _("Export cancelled"), _("No project was created."));
 		return;
 	} catch (Glib::Exception const& error) {
 		show_report (*parent, _("Project not exported"), error.what ().raw (), report);
@@ -333,5 +336,8 @@ void ProjectExchangeUI::export_dawproject (Gtk::Window* parent)
 		show_report (*parent, _("Project not exported"), _("An unexpected error occurred while exporting the project."));
 		return;
 	}
-	show_report (*parent, _("DAWproject exported"), _("Project saved to:") + std::string ("\n") + destination, report);
+	show_report (*parent, logic ? _("AAF + MIDI exported") : _("DAWproject exported"), _("Project saved to:") + std::string ("\n") + destination, report);
 }
+
+void ProjectExchangeUI::export_dawproject (Gtk::Window* parent) { export_project (parent, false); }
+void ProjectExchangeUI::export_logic (Gtk::Window* parent) { export_project (parent, true); }

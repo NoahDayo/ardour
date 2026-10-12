@@ -655,6 +655,9 @@ def build(bld):
             create_ardour_test_program(bld, obj.includes, 'unit-test-sha1', 'test_sha1', ['test/sha1_test.cc'])
             create_ardour_test_program(bld, obj.includes, 'unit-test-session', 'test_session', ['test/session_test.cc'])
             create_ardour_test_program(bld, obj.includes, 'unit-test-project-session', 'test_project_session', ['test/project_session_test.cc'])
+            logic_tests = create_ardour_test_program(bld, obj.includes, 'unit-test-logic-session', 'test_logic_session', ['test/logic_session_test.cc'])
+            logic_tests.use += ['libaaf']
+            logic_tests.includes += ['../aaf']
             create_ardour_test_program(bld, obj.includes, 'unit-test-dsp_load_calculator', 'test_dsp_load_calculator', ['test/dsp_load_calculator_test.cc'])
 
         test_sources  = [
@@ -754,6 +757,8 @@ def create_ardour_test_program(bld, includes, name, target, sources):
         'CONFIG_DIR="' + autowaf.normpath(bld.env['SYSCONFDIR']) + '"',
         'LOCALEDIR="' + autowaf.normpath(bld.env['LOCALEDIR']) + '"',
         ]
+
+    return testobj
 
 def i18n_func(bld):
     autowaf.build_i18n(bld, '.', 'libs/ardour', I18N_PACKAGE + bld.env['MAJOR'], libardour_sources,

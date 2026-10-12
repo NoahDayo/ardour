@@ -8,3 +8,5 @@ mkdir -p build-evidence
     -lm -o build-evidence/aaf-probe.exe
 "${AAF_TEST_PYTHON:-python}" tools/project-exchange/tests/test_aaf_writer.py \
     --probe build-evidence/aaf-probe.exe 2>&1 | tee build-evidence/aaf-writer-tests.log
+"${AAF_TEST_PYTHON:-python}" tools/project-exchange/tests/test_logic_writer.py \
+    --probe build-evidence/aaf-probe.exe 2>&1 | tee build-evidence/logic-writer-tests.log

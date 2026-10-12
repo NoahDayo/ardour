@@ -36,6 +36,7 @@
         <menuitem action='StemExport'/>
         <menuitem action='ExportVideo'/>
         <menuitem action='ExportDAWproject'/>
+        <menuitem action='ExportLogicProject'/>
       </menu>
 
       <separator/>

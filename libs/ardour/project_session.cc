@@ -4,17 +4,21 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <set>
 #include <iomanip>
 #include <sstream>
+#include <thread>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sndfile.h>
 #include <gio/gio.h>
 #include <glib/gstdio.h>
+#include <glibmm/fileutils.h>
 #include <glibmm/miscutils.h>
 
 #include "pbd/controllable.h"
@@ -28,6 +32,7 @@
 #include "ardour/audio_port.h"
 #include "ardour/audiofilesource.h"
 #include "ardour/automation_list.h"
+#include "ardour/filesystem_paths.h"
 #include "ardour/import_status.h"
 #include "ardour/io.h"
 #include "ardour/lua_api.h"
@@ -100,7 +105,7 @@ struct OwnedDirectory {
 		if (!g_file_move (from.get (), to.get (), G_FILE_COPY_NO_FALLBACK_FOR_MOVE, NULL, NULL, NULL, &error)) {
 			std::string message = error ? error->message : "unknown error";
 			g_clear_error (&error);
-			throw ExchangeError ("Cannot publish imported session: " + message);
+			throw ExchangeError ("Cannot publish project: " + message);
 		}
 		published = destination;
 	}
@@ -597,13 +602,15 @@ Project collect (Session& session, AudioAssets& assets, const CancelCheck& cance
 	return project;
 }
 
-void write_audio (const SourceList& sources, const std::string& path, const CancelCheck& cancel)
+void write_audio (const SourceList& sources, const std::string& path, const CancelCheck& cancel, bool pcm24 = false)
 {
 	SF_INFO info = {};
 	info.channels = sources.size ();
 	info.samplerate = std::dynamic_pointer_cast<AudioSource> (sources.front ())->sample_rate ();
 	samplecnt_t frames = sources.front ()->length ().samples ();
-	info.format = (static_cast<uint64_t> (frames) * info.channels * sizeof (float) > 0xffff0000ULL ? SF_FORMAT_RF64 : SF_FORMAT_WAV) | SF_FORMAT_FLOAT;
+	uint64_t bytes = static_cast<uint64_t> (frames) * info.channels * (pcm24 ? 3 : sizeof (float));
+	if (pcm24 && bytes > 0xffff0000ULL) { throw ExchangeError ("AAF source exceeds the prepared WAV size limit"); }
+	info.format = (bytes > 0xffff0000ULL ? SF_FORMAT_RF64 : SF_FORMAT_WAV) | (pcm24 ? SF_FORMAT_PCM_24 : SF_FORMAT_FLOAT);
 	int fd = g_open (path.c_str (), O_WRONLY | O_CREAT | O_EXCL
 #ifdef O_BINARY
 	                 | O_BINARY
@@ -620,12 +627,73 @@ void write_audio (const SourceList& sources, const std::string& path, const Canc
 		for (int channel = 0; channel < info.channels; ++channel) {
 			auto source = std::dynamic_pointer_cast<AudioSource> (sources[channel]);
 			if (source->read (channel_data.data (), position, count) != count) { throw ExchangeError ("Cannot read complete audio source"); }
+			if (pcm24 && std::any_of (channel_data.begin (), channel_data.begin () + count, [] (Sample sample) {
+				return !std::isfinite (sample) || sample < -1 || sample > 1;
+			})) { throw ExchangeError ("Audio exceeds 24-bit PCM range; render or reduce its source level before AAF export"); }
 			for (samplecnt_t i = 0; i < count; ++i) { interleaved[i * info.channels + channel] = channel_data[i]; }
 		}
 		if (sf_writef_float (output.get (), interleaved.data (), count) != count) { throw ExchangeError ("Cannot write complete export audio"); }
 		position += count;
 	}
 	if (sf_close (output.release ())) { throw ExchangeError ("Cannot finish export audio file"); }
+}
+
+void run_logic_writer (const std::string& manifest, const std::string& destination, const CancelCheck& cancel)
+{
+	std::string base = Glib::build_filename (ardour_dll_directory (), "project-exchange");
+	const char* python_override = g_getenv ("ARDOUR_LOGIC_PYTHON");
+	const char* helper_override = g_getenv ("ARDOUR_LOGIC_HELPER");
+	std::string helper = helper_override ? helper_override : Glib::build_filename (base, "aaf_writer.py");
+#ifdef PLATFORM_WINDOWS
+	std::string python = python_override ? python_override : Glib::build_filename (base, "python", "pythonw.exe");
+#else
+	std::string python = python_override ? python_override : Glib::build_filename (base, "python", "bin", "python3");
+#endif
+	if (!Glib::path_is_absolute (python) || !Glib::file_test (python, Glib::FILE_TEST_IS_REGULAR) ||
+	    !Glib::path_is_absolute (helper) || !Glib::file_test (helper, Glib::FILE_TEST_IS_REGULAR)) {
+		throw ExchangeError ("The Logic exchange writer is missing from this installation");
+	}
+	const char* arguments[] = {python.c_str (), "-I", "-B", "-X", "utf8", helper.c_str (), manifest.c_str (), destination.c_str (), nullptr};
+	GError* error = nullptr;
+	GSubprocess* child = g_subprocess_newv (arguments, GSubprocessFlags (G_SUBPROCESS_FLAGS_STDOUT_SILENCE | G_SUBPROCESS_FLAGS_STDERR_PIPE), &error);
+	if (!child) {
+		std::string message = error ? error->message : "unknown error"; g_clear_error (&error);
+		throw ExchangeError ("Cannot start Logic exchange writer: " + message);
+	}
+	std::unique_ptr<GSubprocess, void (*) (gpointer)> process (child, g_object_unref);
+	std::atomic<bool> done (false);
+	bool success = false;
+	std::string detail;
+	std::thread waiter;
+	try {
+		waiter = std::thread ([&] {
+			gchar* errors = nullptr;
+			GError* failure = nullptr;
+			bool communicated = g_subprocess_communicate_utf8 (child, nullptr, nullptr, nullptr, &errors, &failure);
+			success = communicated && g_subprocess_get_successful (child);
+			if (failure) { detail = failure->message; }
+			else if (errors) { detail.assign (errors, std::min (size_t (16384), strlen (errors))); }
+			g_free (errors); g_clear_error (&failure);
+			done.store (true);
+		});
+		while (!done.load ()) { cancelled (cancel); g_usleep (10000); }
+		waiter.join ();
+		cancelled (cancel);
+	} catch (...) {
+		if (!done.load ()) { g_subprocess_force_exit (child); }
+		if (waiter.joinable ()) { waiter.join (); }
+		else { g_subprocess_wait (child, nullptr, nullptr); }
+		throw;
+	}
+	if (!success) { throw ExchangeError ("Logic exchange writer failed: " + detail); }
+	for (const char* name : {"Project.aaf", "Project.mid", "Metadata.xml"}) {
+		FileObject file = file_object (Glib::build_filename (destination, name));
+		GFileInfo* info = g_file_query_info (file.get (), G_FILE_ATTRIBUTE_STANDARD_TYPE "," G_FILE_ATTRIBUTE_STANDARD_SIZE,
+		                                  G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, nullptr, nullptr);
+		bool valid = info && g_file_info_get_file_type (info) == G_FILE_TYPE_REGULAR && g_file_info_get_size (info) > 0;
+		if (info) { g_object_unref (info); }
+		if (!valid) { throw ExchangeError (std::string ("Logic exchange writer did not produce ") + name); }
+	}
 }
 
 std::unique_ptr<Session>
@@ -770,6 +838,128 @@ SessionExchange::export_dawproject (Session& session, const std::string& destina
 		files[media.id] = path;
 	}
 	DawProject::write (project, destination, files, cancel);
+}
+
+void
+SessionExchange::export_logic (Session& session, const std::string& destination, std::vector<Diagnostic>& report, CancelCheck cancel)
+{
+	report.clear ();
+	if (session.transport_rolling () || session.actively_recording ()) { throw ExchangeError ("Stop playback and recording before exporting a project"); }
+	if (!Glib::path_is_absolute (destination)) { throw ExchangeError ("Export destination must be absolute"); }
+	FileObject target = file_object (destination);
+	if (g_file_query_exists (target.get (), NULL)) { throw ExchangeError ("Export destination already exists"); }
+	cancelled (cancel);
+	AudioAssets assets;
+	Project project = collect (session, assets, cancel);
+	std::string master;
+	for (auto const& track : project.tracks) { if (track.master) { master = track.id; } }
+	for (auto const& track : project.tracks) {
+		if (track.master) {
+			if (track.volume != 1 || track.mute || track.solo || track.pan != .5) {
+				unsupported (project, track.name, "Master mixing cannot yet be represented in AAF/MIDI");
+			}
+			continue;
+		}
+		if (track.kind == TrackKind::Bus || track.kind == TrackKind::Folder || !track.parent.empty () || track.destination != master) {
+			unsupported (project, track.name, "AAF/MIDI export currently requires tracks connected directly to the master, without folders or buses");
+		}
+		if (track.solo) { unsupported (project, track.name, "Clear solo before AAF/MIDI export"); }
+		if (track.kind == TrackKind::Audio && track.channels == 2 && track.pan != .5) {
+			unsupported (project, track.name, "Stereo balance cannot yet be represented in AAF export");
+		}
+		if (track.kind == TrackKind::MIDI && (track.volume != 1 || track.pan != .5 || track.mute)) {
+			unsupported (project, track.name, "MIDI track mixer settings cannot yet be represented in Standard MIDI Files");
+		}
+		for (auto const& clip : track.clips) {
+			if (clip.kind == ClipKind::MIDI && !clip.enabled) { unsupported (project, clip.name, "Muted MIDI clips cannot yet be represented in Standard MIDI Files"); }
+		}
+	}
+	report = project.report;
+	for (auto const& item : report) { if (item.disposition == Disposition::Unsupported) { throw ExchangeError (item.object + ": " + item.detail); } }
+	validate_project (project);
+	OwnedDirectory stage (Glib::path_get_dirname (destination));
+	std::string output = Glib::build_filename (stage.path, "session");
+	if (g_mkdir (output.c_str (), 0700)) { throw ExchangeError ("Cannot create AAF/MIDI export staging directory"); }
+	XMLTree manifest;
+	XMLNode& root = *manifest.set_root (new XMLNode ("LogicExchange"));
+	root.set_property ("version", 1);
+	root.set_property ("name", session.name ());
+	root.set_property ("rate", session.sample_rate ());
+	root.set_property ("tempo", project.tempo);
+	root.set_property ("numerator", project.numerator);
+	root.set_property ("denominator", project.denominator);
+	double duration = 0;
+	for (auto const& media : project.media) {
+		cancelled (cancel);
+		std::string path = Glib::build_filename (stage.path, media.id + ".wav");
+		write_audio (assets.at (media.id), path, cancel, true);
+		XMLNode& source = *root.add_child ("Media");
+		source.set_property ("id", media.id);
+		source.set_property ("path", path);
+		source.set_property ("channels", media.channels);
+		source.set_property ("frames", assets.at (media.id).front ()->length ().samples ());
+	}
+	for (auto const& track : project.tracks) {
+		if (track.master) { continue; }
+		cancelled (cancel);
+		bool audio = track.kind == TrackKind::Audio;
+		XMLNode& lane = *root.add_child (audio ? "AudioTrack" : "MidiTrack");
+		lane.set_property ("name", track.name);
+		lane.set_property ("color", track.color);
+		lane.set_property ("channels", track.channels);
+		lane.set_property ("gain", track.mute ? 0.0 : track.volume);
+		lane.set_property ("pan", track.pan);
+		if (track.mute) { report.push_back ({Disposition::Transformed, track.name, "Muted audio track exported with zero track gain"}); }
+		for (auto const& clip : track.clips) {
+			XMLNode& item = *lane.add_child ("Clip");
+			item.set_property ("name", clip.name);
+			item.set_property ("color", clip.color);
+			item.set_property ("enabled", clip.enabled ? "true" : "false");
+			TimeUnit unit = audio ? TimeUnit::Seconds : TimeUnit::Beats;
+			double position = convert_time (clip.position, unit, project.tempo);
+			double length = convert_time (Time (clip.duration, clip.position.unit), unit, project.tempo);
+			double offset = convert_time (clip.offset, unit, project.tempo);
+			duration = std::max (duration, convert_time (Time (position + length, unit), TimeUnit::Seconds, project.tempo));
+			if (audio) {
+				item.set_property ("time", samples (position, session.sample_rate ()));
+				item.set_property ("length", samples (length, session.sample_rate ()));
+				item.set_property ("offset", samples (offset, session.sample_rate ()));
+				item.set_property ("media", clip.media);
+				if (!clip.enabled) { report.push_back ({Disposition::Transformed, clip.name, "Muted audio clip exported with zero clip gain"}); }
+			} else {
+				item.set_property ("time", position);
+				item.set_property ("length", length);
+				item.set_property ("offset", offset);
+				for (auto const& note : clip.notes) {
+					XMLNode& event = *item.add_child ("Note");
+					event.set_property ("time", convert_time (Time (note.time, clip.offset.unit), TimeUnit::Beats, project.tempo));
+					event.set_property ("length", convert_time (Time (note.duration, clip.offset.unit), TimeUnit::Beats, project.tempo));
+					event.set_property ("key", note.key);
+					event.set_property ("channel", note.channel);
+					event.set_property ("velocity", int (std::max (1.0, std::round (note.velocity * 127))));
+					event.set_property ("release", int (std::round (note.release_velocity * 127)));
+				}
+			}
+		}
+	}
+	for (auto const& marker : project.markers) {
+		XMLNode& item = *root.add_child ("Marker");
+		item.set_property ("name", marker.name);
+		item.set_property ("time", convert_time (marker.position, TimeUnit::Beats, project.tempo));
+		duration = std::max (duration, convert_time (marker.position, TimeUnit::Seconds, project.tempo));
+	}
+	root.set_property ("duration", duration);
+	std::string path = Glib::build_filename (stage.path, "manifest.xml");
+	if (!manifest.write (path)) { throw ExchangeError ("Cannot write AAF/MIDI export manifest"); }
+	run_logic_writer (path, output, cancel);
+	report.push_back ({Disposition::Transformed, "Audio", "Embedded 24-bit PCM; floating-point sources are quantized to 24 bits"});
+	report.push_back ({Disposition::Transformed, "MIDI", "Clips merged per track; notes trimmed to clip boundaries and rounded to 1/19200 beat; notes crossing the left edge are retriggered"});
+	report.push_back ({Disposition::Transformed, "Metadata", "Original clip structure and colors retained in Metadata.xml; target applications may not display this metadata"});
+	report.push_back ({Disposition::Transformed, "Timeline", "AAF and MIDI start at zero, with 25 fps zero timecode; load both files at that origin"});
+	report.push_back ({Disposition::Transformed, "Mixing", "Gain and pan use AAF rational values; target panning laws can differ"});
+	cancelled (cancel);
+	stage.publish (destination);
+	stage.published.clear ();
 }
 
 } }

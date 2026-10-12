@@ -13,8 +13,9 @@ for argument in "$@"; do
         --build) build=true ;;
         --debug) mode=debug ;;
         --exchange-only) mode=exchange ;;
+        --logic) mode=logic ;;
         --all) mode=all ;;
-        *) echo "Usage: $0 [--build] [--exchange-only|--all|--debug]" >&2; exit 2 ;;
+        *) echo "Usage: $0 [--build] [--exchange-only|--logic|--all|--debug]" >&2; exit 2 ;;
     esac
 done
 # Read only the configured output path; never execute the lock file, which
@@ -50,6 +51,9 @@ if $build; then
         exit 1
     fi
     targets=unit-test-project-session,unit-test-session
+    if [[ $mode == logic ]]; then
+        targets=unit-test-logic-session
+    fi
     if [[ $mode == all ]]; then
         targets=libardour-tests,libpbd-tests,libtemporal-tests
     fi
@@ -117,6 +121,10 @@ if [[ $mode == all ]]; then
     exit "$result"
 fi
 
+if [[ $mode == logic ]]; then
+    "$libs/ardour/test_logic_session" 2>&1 | tee build-evidence/logic-session-tests.log
+    exit 0
+fi
 if [[ $mode == session ]]; then
     "$libs/ardour/test_session" 2>&1 | tee build-evidence/baseline-session-tests.log
 fi

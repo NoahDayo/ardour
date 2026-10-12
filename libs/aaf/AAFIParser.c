@@ -1825,7 +1825,8 @@ parse_OperationGroup (AAF_Iface* aafi, aafObject* OpGroup, td* __ptd)
 
 		current_track->format = track_format;
 		RESET_CTX__AudioChannelCombiner (aafi->ctx);
-	} else if (aafUIDCmp (OperationIdentification, &AAFOperationDef_MonoAudioGain)) {
+	} else if (aafUIDCmp (OperationIdentification, &AAFOperationDef_MonoAudioGain) ||
+	           aafUIDCmp (OperationIdentification, &AAFOperationDef_StereoAudioGain)) {
 		aafObject* Param      = NULL;
 		aafObject* Parameters = aaf_get_propertyValue (OpGroup, PID_OperationGroup_Parameters, &AAFTypeID_ParameterStrongReferenceVector);
 
@@ -1883,7 +1884,6 @@ parse_OperationGroup (AAF_Iface* aafi, aafObject* OpGroup, td* __ptd)
 		 * Unknown usage and implementation, not encountered yet:
 		 *
 		 * 	AAFOperationDef_MonoAudioMixdown
-		 * 	AAFOperationDef_StereoAudioGain
 		 * 	AAFOperationDef_TwoParameterMonoAudioDissolve
 		 * 	AAFOperationDef_StereoAudioDissolve
 		 */
@@ -1933,7 +1933,8 @@ end:
 		if (!aafUIDCmp (Obj->Class->ID, &AAFClassID_OperationGroup))
 			break;
 
-	if (aafUIDCmp (OperationIdentification, &AAFOperationDef_MonoAudioGain)) {
+	if (aafUIDCmp (OperationIdentification, &AAFOperationDef_MonoAudioGain) ||
+	    aafUIDCmp (OperationIdentification, &AAFOperationDef_StereoAudioGain)) {
 		if (!aafUIDCmp (Obj->Class->ID, &AAFClassID_TimelineMobSlot)) {
 			if (aafi->ctx.current_clip_gain_is_used == 0) {
 				aafi_freeAudioGain (aafi->ctx.current_clip_gain);
@@ -2021,7 +2022,8 @@ parse_ConstantValue (AAF_Iface* aafi, aafObject* ConstantValue, td* __ptd)
 
 	aafUID_t* mobUsageCode = aaf_get_propertyValue (ParentMob, PID_Mob_UsageCode, &AAFTypeID_UsageType);
 
-	if (aafUIDCmp (OperationIdentification, &AAFOperationDef_MonoAudioGain) &&
+	if ((aafUIDCmp (OperationIdentification, &AAFOperationDef_MonoAudioGain) ||
+	     aafUIDCmp (OperationIdentification, &AAFOperationDef_StereoAudioGain)) &&
 	    aafUIDCmp (ParamDef, &AAFParameterDef_Amplitude)) {
 		aafRational_t* value = aaf_get_indirectValue (aafi->aafd, Indirect, &AAFTypeID_Rational);
 
@@ -2220,7 +2222,8 @@ parse_VaryingValue (AAF_Iface* aafi, aafObject* VaryingValue, td* __ptd)
 		 */
 
 		TRACE_OBJ (aafi, VaryingValue, &__td);
-	} else if (aafUIDCmp (OperationIdentification, &AAFOperationDef_MonoAudioGain) &&
+	} else if ((aafUIDCmp (OperationIdentification, &AAFOperationDef_MonoAudioGain) ||
+	            aafUIDCmp (OperationIdentification, &AAFOperationDef_StereoAudioGain)) &&
 	           (aafUIDCmp (ParamDef, &AAFParameterDef_Amplitude) || aafUIDCmp (ParamDef, aaf_get_ParamDefIDByName (aafi->aafd, "AvidControlClipRatio")))) {
 		aafiAudioGain* Gain = aafi_newAudioGain (aafi, 0, interpolation, NULL);
 

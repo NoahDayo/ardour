@@ -30,6 +30,10 @@ public:
 	 * export, so the caller can present every required conversion together. */
 	static void export_dawproject (Session&, const std::string& destination,
 	                               std::vector<Diagnostic>& report, CancelCheck = CancelCheck ());
+	/* Publish an AAF with embedded audio and a coordinated type-1 MIDI file
+	 * in a new directory. Both use timeline/timecode origin zero. */
+	static void export_logic (Session&, const std::string& destination,
+	                          std::vector<Diagnostic>& report, CancelCheck = CancelCheck ());
 };
 
 } }
