@@ -1,5 +1,8 @@
-#include <glib.h>
-#include <sched.h>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <vector>
+
 #include "rwlock_test.h"
 
 using namespace PBD;
@@ -13,178 +16,126 @@ RWLockTest::RWLockTest ()
 void
 RWLockTest::single_thread_test ()
 {
-	RWLock::ReaderLock rl (_rwlock);
+	/* std::shared_mutex is not recursive, even for shared ownership. */
+	RWLock::ReaderLock reader (_rwlock, RWLock::NotLock);
+	CPPUNIT_ASSERT (!reader.locked ());
+	reader.acquire ();
+	CPPUNIT_ASSERT (reader.locked ());
+	reader.release ();
+	CPPUNIT_ASSERT (!reader.locked ());
 
-	CPPUNIT_ASSERT (rl.locked());
-
-	/* trying to get another read-lock should be OK */
-	CPPUNIT_ASSERT (_rwlock.reader_trylock());
-	_rwlock.reader_unlock ();
-
-	rl.release ();
-
-	RWLock::WriterLock rw (_rwlock);
-
-	CPPUNIT_ASSERT (!_rwlock.reader_trylock());
-
-	/* leaving the scope releases ReaderLock */
-}
-
-/* ****************************************************************************/
-
-#define N_WORKERS 3
-
-void*
-RWLockTest::launch_worker (void* d)
-{
-	RWLockTest* self = static_cast<RWLockTest*> (d);
-	self->worker_thread ();
-	return NULL;
-}
-
-void
-RWLockTest::worker_thread ()
-{
-	RWLock::ReaderLock rl (_rwlock);
-	g_usleep (1000000); // 1 sec
+	{
+		RWLock::WriterLock writer (_rwlock);
+		CPPUNIT_ASSERT (writer.locked ());
+	}
+	/* The writer's destructor releases exclusive ownership. */
+	reader.acquire ();
+	CPPUNIT_ASSERT (reader.locked ());
 }
 
 void
 RWLockTest::run_thread_test ()
 {
-	pthread_t workers[N_WORKERS];
-	for (int i = 0; i < N_WORKERS; ++i) {
-		CPPUNIT_ASSERT (0 == pthread_create (&workers[i], NULL, &RWLockTest::launch_worker, this));
+	std::mutex mutex;
+	std::condition_variable changed;
+	unsigned int ready = 0;
+	bool release = false;
+	std::vector<std::thread> workers;
+	for (int i = 0; i < 3; ++i) {
+		workers.emplace_back ([&] {
+			RWLock::ReaderLock reader (_rwlock);
+			std::unique_lock<std::mutex> guard (mutex);
+			++ready;
+			changed.notify_all ();
+			changed.wait (guard, [&] { return release; });
+		});
+	}
+	{
+		std::unique_lock<std::mutex> guard (mutex);
+		changed.wait (guard, [&] { return ready == workers.size (); });
 	}
 
-	sched_yield ();
-	g_usleep (100);
-
-	/* worker thread(s) should hold read-lock by now */
-	RWLock::WriterLock wl (_rwlock, RWLock::NotLock);
-	CPPUNIT_ASSERT (!wl.try_acquire());
-
-	RWLock::ReaderLock trl (_rwlock, RWLock::TryLock);
-	RWLock::WriterLock twl (_rwlock, RWLock::TryLock);
-
-	CPPUNIT_ASSERT (trl.locked ());
-	CPPUNIT_ASSERT (!twl.locked ());
-	trl.release ();
-
-	for (int i = 0; i < N_WORKERS; ++i) {
-		CPPUNIT_ASSERT (0 == pthread_join (workers[i], NULL));
+	bool writer_blocked;
+	{
+		RWLock::WriterLock writer (_rwlock, RWLock::TryLock);
+		writer_blocked = !writer.locked ();
 	}
+	/* Multiple threads may read simultaneously. Do not depend on a
+	 * non-blocking attempt succeeding: try_lock_shared may fail spuriously. */
+	{
+		RWLock::ReaderLock reader (_rwlock);
+	}
+	{
+		std::lock_guard<std::mutex> guard (mutex);
+		release = true;
+	}
+	changed.notify_all ();
+	for (auto& worker : workers) { worker.join (); }
 
-	CPPUNIT_ASSERT (wl.try_acquire());
-
-	CPPUNIT_ASSERT (!trl.try_acquire());
+	CPPUNIT_ASSERT (writer_blocked);
+	RWLock::WriterLock writer (_rwlock);
+	CPPUNIT_ASSERT (writer.locked ());
 }
-
-/* ****************************************************************************/
-
-void*
-RWLockTest::launch_reader_a (void* d)
-{
-	RWLockTest* self = static_cast<RWLockTest*> (d);
-	self->reader_thread_a ();
-	return NULL;
-}
-
-void*
-RWLockTest::launch_reader_b (void* d)
-{
-	RWLockTest* self = static_cast<RWLockTest*> (d);
-	self->reader_thread_b ();
-	return NULL;
-}
-
-void
-RWLockTest::reader_thread_a ()
-{
-	RWLock::ReaderLock rl1 (_rwlock);
-	/* release main thread */
-	_sequence++; // = 1
-
-	/* wait for main thread to ack .. */
-	int want = 2;
-	while (!_sequence.compare_exchange_strong (want, 3)) {
-		want = 2;
-		sched_yield ();
-		g_usleep (1000);
-	}
-
-	/* wait for main thread to ask for the writer-lock */
-	sched_yield ();
-	g_usleep (1000000); // 1 sec
-
-	/* Now test if 2nd read-lock can be taken while writer-lock waits on rl1 */
-
-	RWLock::ReaderLock rl2 (_rwlock, RWLock::TryLock);
-	CPPUNIT_ASSERT (rl2.locked());
-
-	_sequence++; // = 4
-
-	want = 6;
-	while (!_sequence.compare_exchange_strong (want, 7)) {
-		want = 6;
-		sched_yield ();
-		g_usleep (1000);
-	}
-}
-
-void
-RWLockTest::reader_thread_b ()
-{
-	int want = 4;
-	while (!_sequence.compare_exchange_strong (want, 5)) {
-		want = 4;
-		sched_yield ();
-		g_usleep (1000);
-	}
-
-	RWLock::ReaderLock rl (_rwlock, RWLock::TryLock);
-	CPPUNIT_ASSERT (rl.locked());
-	_sequence++; // = 6
-
-	want = 7;
-	while (!_sequence.compare_exchange_strong (want, 8)) {
-		want = 7;
-		sched_yield ();
-		g_usleep (1000);
-	}
-}
-
 
 void
 RWLockTest::run_thread_sequence_test ()
 {
-	/* 1. Thread A takes read-lock
-	 * 2. Thread M asks for write-lock (blocks)
-	 * 3. Thread A takes another read-lock
-	 * 4. Thread B takes another read-lock
-	 *
-	 * Test that additional reader-lock can still be
-	 * taken while writer-lock waits.
-	 */
+	std::mutex mutex;
+	std::condition_variable changed;
+	bool writer_started = false;
+	bool writer_acquired = false;
+	bool release_writer = false;
+	RWLock::ReaderLock reader (_rwlock);
+	std::thread worker ([&] {
+		{
+			std::lock_guard<std::mutex> guard (mutex);
+			writer_started = true;
+		}
+		changed.notify_all ();
+		RWLock::WriterLock writer (_rwlock);
+		std::unique_lock<std::mutex> guard (mutex);
+		writer_acquired = true;
+		changed.notify_all ();
+		changed.wait (guard, [&] { return release_writer; });
+	});
 
-	_sequence = 0;
-
-	pthread_t r[2];
-	CPPUNIT_ASSERT (0 == pthread_create (&r[0], NULL, &RWLockTest::launch_reader_a, this));
-	CPPUNIT_ASSERT (0 == pthread_create (&r[1], NULL, &RWLockTest::launch_reader_b, this));
-
-	int want = 1;
-	while (!_sequence.compare_exchange_strong (want, 2)) {
-		want = 1;
-		sched_yield ();
-		g_usleep (1000);
+	bool writer_entered_early;
+	{
+		std::unique_lock<std::mutex> guard (mutex);
+		changed.wait (guard, [&] { return writer_started; });
+		writer_entered_early = writer_acquired;
 	}
+	/* Neither reader preference nor recursive ownership is guaranteed by
+	 * std::shared_mutex. Another thread may succeed or fail to try-read while
+	 * a writer is queued, but the writer must wait for existing readers. */
+	std::thread extra_reader ([&] { RWLock::ReaderLock probe (_rwlock, RWLock::TryLock); });
+	extra_reader.join ();
+	reader.release ();
+	{
+		std::unique_lock<std::mutex> guard (mutex);
+		changed.wait (guard, [&] { return writer_acquired; });
+	}
+	bool reader_blocked, writer_blocked;
+	{
+		RWLock::ReaderLock read_probe (_rwlock, RWLock::TryLock);
+		reader_blocked = !read_probe.locked ();
+	}
+	{
+		RWLock::WriterLock write_probe (_rwlock, RWLock::TryLock);
+		writer_blocked = !write_probe.locked ();
+	}
+	{
+		std::lock_guard<std::mutex> guard (mutex);
+		release_writer = true;
+	}
+	changed.notify_all ();
+	worker.join ();
 
-	/* worker thread(s) should hold read-lock by now */
-	RWLock::WriterLock wl (_rwlock);
-	CPPUNIT_ASSERT (wl.locked());
-	CPPUNIT_ASSERT (_sequence == 8);
-
-	CPPUNIT_ASSERT (0 == pthread_join (r[0], NULL));
-	CPPUNIT_ASSERT (0 == pthread_join (r[1], NULL));
+	/* Assert on the test thread after joining, so failed assertions do not
+	 * escape worker threads or leave another thread waiting indefinitely. */
+	CPPUNIT_ASSERT (!writer_entered_early);
+	CPPUNIT_ASSERT (reader_blocked);
+	CPPUNIT_ASSERT (writer_blocked);
+	reader.acquire ();
+	CPPUNIT_ASSERT (reader.locked ());
 }
