@@ -81,16 +81,52 @@ struct Marker {
 	Time position;
 };
 
+struct TempoChange {
+	Time position;
+	double bpm = 120;
+	bool linear = false; // Interpolate to the following point in position.unit.
+};
+
+struct MeterChange {
+	Time position;
+	unsigned int numerator = 4;
+	unsigned int denominator = 4;
+};
+
 struct Project {
 	std::string application;
 	std::string application_version;
-	double tempo = 120; // Quarter notes per minute; this initial model is constant.
+	double tempo = 120; // Transport defaults, before any timeline changes.
 	unsigned int numerator = 4;
 	unsigned int denominator = 4;
+	std::vector<TempoChange> tempos;
+	std::vector<MeterChange> meters;
 	std::vector<Media> media;
 	std::vector<Track> tracks;
 	std::vector<Marker> markers;
 	std::vector<Diagnostic> report;
+};
+
+/* Converts absolute positions and anchored durations separately. In particular,
+ * a four-beat duration at bar ten need not last as long as the first four beats.
+ * A map is immutable after construction; reuse it across clips and notes. */
+class LIBARDOUR_API TimeMap {
+public:
+	explicit TimeMap (const Project&);
+	double convert (Time, TimeUnit) const;
+	double duration (Time length, Time origin, TimeUnit) const;
+	double content (Time value, Time position, Time offset, TimeUnit) const;
+	double tempo_at (Time) const;
+	// Equivalent step changes, with bounded error in the beat-to-second mapping.
+	std::vector<TempoChange> stepped (double max_error_seconds) const;
+private:
+	struct Segment {
+		double beat, second, bpm, slope;
+		TimeUnit axis;
+	};
+	std::vector<Segment> _segments;
+	double _initial;
+	size_t segment (Time) const;
 };
 
 LIBARDOUR_API double convert_time (Time, TimeUnit, double tempo);

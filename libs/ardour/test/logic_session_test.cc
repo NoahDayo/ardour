@@ -374,5 +374,10 @@ void LogicSessionTest::midi_validation ()
 	broken = valid; broken.insert (broken.end () - 4, {0, 0xb2, 64, 127}); write (broken);
 	CPPUNIT_ASSERT_THROW (PX::read_project_midi (path, project, 0), PX::ExchangeError);
 	broken = valid; broken.insert (broken.end () - 4, {0, 0xff, 0x51, 3, 7, 0xa1, 0x20}); write (broken);
+	PX::read_project_midi (path, project, 0);
+	CPPUNIT_ASSERT_EQUAL (size_t (2), project.tempos.size ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.5, project.tempos[1].position.value, 1e-9);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (120, project.tempos[1].bpm, 1e-9);
+	broken = valid; broken.insert (broken.begin () + 7, {0, 0xff, 0x51, 3, 7, 0xa1, 0x20}); write (broken);
 	CPPUNIT_ASSERT_THROW (PX::read_project_midi (path, project, 0), PX::ExchangeError);
 }

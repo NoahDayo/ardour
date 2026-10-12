@@ -32,6 +32,8 @@ struct Transport {
 	unsigned tempo = 500000, numerator = 4, denominator = 4;
 	bool tempo_set = false, meter_set = false, offset_set = false;
 	double offset = 0;
+	std::map<uint64_t, unsigned> tempos;
+	std::map<uint64_t, std::pair<unsigned, unsigned>> meters;
 };
 }
 
@@ -79,17 +81,19 @@ void read_project_midi (const std::string& path, Project& project, double origin
 				if (type == 0x51) {
 					require (length == 3, "Invalid MIDI tempo event"); unsigned value = payload.word (3);
 					require (value > 0, "Invalid MIDI tempo");
-					require ((tick == 0 && (!transport.tempo_set || value == transport.tempo)) || value == transport.tempo,
-					         "Variable or conflicting MIDI tempo is not yet supported by project import");
-					transport.tempo = value; transport.tempo_set = true;
+					auto inserted = transport.tempos.emplace (tick, value);
+					require (inserted.second || inserted.first->second == value, "Conflicting MIDI tempo events at the same position");
+					if (!tick) { transport.tempo = value; }
+					transport.tempo_set = true;
 				} else if (type == 0x58) {
 					require (length == 4, "Invalid MIDI time signature");
 					unsigned n = payload.byte (), power = payload.byte (); payload.byte (); unsigned notes = payload.byte ();
 					require (n > 0 && power <= 6 && notes == 8, "Unsupported MIDI time signature units");
 					unsigned d = 1u << power;
-					require ((tick == 0 && (!transport.meter_set || (n == transport.numerator && d == transport.denominator))) ||
-					         (n == transport.numerator && d == transport.denominator), "Variable or conflicting MIDI meter is not yet supported by project import");
-					transport.numerator = n; transport.denominator = d; transport.meter_set = true;
+					auto inserted = transport.meters.emplace (tick, std::make_pair (n, d));
+					require (inserted.second || inserted.first->second == std::make_pair (n, d), "Conflicting MIDI meter events at the same position");
+					if (!tick) { transport.numerator = n; transport.denominator = d; }
+					transport.meter_set = true;
 				} else if (type == 0x54) {
 					require (tick == 0 && length == 5, "Invalid MIDI SMPTE offset");
 					unsigned hour = payload.byte (), minute = payload.byte (), second = payload.byte (), frame = payload.byte (), fraction = payload.byte ();
@@ -146,6 +150,13 @@ void read_project_midi (const std::string& path, Project& project, double origin
 	else { project.report.push_back ({Disposition::Transformed, "Timeline", "MIDI has no SMPTE offset; beat zero is aligned with the AAF composition start"}); }
 	project.tempo = 60000000.0 / transport.tempo;
 	project.numerator = transport.numerator; project.denominator = transport.denominator;
+	project.tempos.clear (); project.meters.clear ();
+	if (transport.tempos.size () > 1 || (!transport.tempos.empty () && transport.tempos.begin ()->first != 0)) {
+		for (auto const& point : transport.tempos) { project.tempos.push_back ({Time (double (point.first) / ppqn), 60000000.0 / point.second, false}); }
+	}
+	if (transport.meters.size () > 1 || (!transport.meters.empty () && transport.meters.begin ()->first != 0)) {
+		for (auto const& point : transport.meters) { project.meters.push_back ({Time (double (point.first) / ppqn), point.second.first, point.second.second}); }
+	}
 	if (!transport.tempo_set || !transport.meter_set) { project.report.push_back ({Disposition::Transformed, "MIDI transport", "Absent tempo or meter uses the MIDI defaults (120 BPM, 4/4)"}); }
 	project.tracks.insert (project.tracks.end (), tracks.begin (), tracks.end ());
 	project.markers.insert (project.markers.end (), markers.begin (), markers.end ());

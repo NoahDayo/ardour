@@ -124,6 +124,7 @@ Document parse_document (const std::string& text)
 
 struct Parser {
 	Project project;
+	std::unique_ptr<TimeMap> timing;
 	std::map<std::string, Node> ids;
 	std::map<std::string, size_t> track_indices;
 	std::map<std::string, std::string> channel_tracks;
@@ -325,13 +326,13 @@ struct Parser {
 		return media.id;
 	}
 
-	std::vector<Clip> clip (Node, TimeUnit, std::set<Node>&);
+	std::vector<Clip> clip (Node, TimeUnit, std::set<Node>&, Time origin = Time ());
 	void timeline (Node, TimeUnit, const std::string&);
 	Project parse (Node);
 };
 
 std::vector<Clip>
-Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active)
+Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active, Time origin)
 {
 	expansion ();
 	if (active.size () >= 128 || !active.insert (node).second) { throw ExchangeError ("Cyclic or excessively deep clip reference"); }
@@ -342,22 +343,23 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active)
 	Clip outer;
 	outer.name = attr (node, "name");
 	outer.color = color (node);
-	outer.position = Time (number (node, "time", 0, true), parent_unit);
+	double local_position = number (node, "time", 0, true);
+	outer.position = Time (timing->convert (origin, parent_unit) + local_position, parent_unit);
 	outer.enabled = boolean (node, "enable", true);
 	TimeUnit content_unit = time_unit (node, "contentTimeUnit", parent_unit);
 	outer.offset = Time (number (node, "playStart"), content_unit);
-	if (outer.offset.value < 0 || outer.position.value < 0) { throw ExchangeError ("Negative clip time is not supported"); }
+	if (outer.offset.value < 0 || local_position < 0) { throw ExchangeError ("Negative clip time is not supported"); }
 	if (has (node, "duration")) {
 		outer.duration = number (node, "duration");
 	} else {
 		double stop = number (node, "playStop", 0, true);
-		outer.duration = convert_time (Time (stop - outer.offset.value, content_unit), parent_unit, project.tempo);
+		outer.duration = timing->duration (Time (stop - outer.offset.value, content_unit), outer.position, parent_unit);
 	}
 	if (outer.duration <= 0) { throw ExchangeError ("Clip duration must be positive"); }
 	if (has (node, "playStop")) {
 		double span = number (node, "playStop") - outer.offset.value;
 		if (span <= 0) { throw ExchangeError ("Clip playStop must follow playStart"); }
-		double maximum = convert_time (Time (span, content_unit), parent_unit, project.tempo);
+		double maximum = timing->duration (Time (span, content_unit), outer.position, parent_unit);
 		if (maximum < outer.duration) {
 			outer.duration = maximum;
 			diagnostic (node, "Clipped the region to its content playback stop", Disposition::Transformed);
@@ -392,13 +394,13 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active)
 	if (is (content, "Audio")) {
 		outer.kind = ClipKind::Audio;
 		outer.media = audio (content);
-		outer.offset = Time (convert_time (outer.offset, TimeUnit::Seconds, project.tempo), TimeUnit::Seconds);
+		outer.offset = Time (timing->content (outer.offset, outer.position, outer.offset, TimeUnit::Seconds), TimeUnit::Seconds);
 		result.push_back (std::move (outer));
 	} else if (is (content, "Notes")) {
 		attributes (content, {"id", "timeUnit"});
 		outer.kind = ClipKind::MIDI;
 		TimeUnit unit = time_unit (content, "timeUnit", content_unit);
-		outer.offset = Time (convert_time (outer.offset, unit, project.tempo), unit);
+		outer.offset = Time (timing->content (outer.offset, outer.position, outer.offset, unit), unit);
 		for (Node item : children (content)) {
 			if (!is (item, "Note")) { diagnostic (item, "Unknown notes element"); continue; }
 			expansion ();
@@ -420,19 +422,20 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active)
 	} else if (is (content, "Clips")) {
 		attributes (content, {"id", "timeUnit"});
 		TimeUnit unit = time_unit (content, "timeUnit", content_unit);
-		double start = convert_time (outer.offset, TimeUnit::Seconds, project.tempo);
-		double stop = start + convert_time (Time (outer.duration, parent_unit), TimeUnit::Seconds, project.tempo);
+		double start = timing->convert (outer.position, TimeUnit::Seconds);
+		double stop = start + timing->duration (Time (outer.duration, parent_unit), outer.position, TimeUnit::Seconds);
+		Time child_origin (timing->convert (outer.position, outer.offset.unit) - outer.offset.value, outer.offset.unit);
 		for (Node item : children (content)) {
 			if (!is (item, "Clip")) { diagnostic (item, "Unknown nested clips element"); continue; }
-			for (Clip& inner : clip (item, unit, active)) {
-				double inner_start = convert_time (inner.position, TimeUnit::Seconds, project.tempo);
-				double inner_stop = inner_start + convert_time (Time (inner.duration, inner.position.unit), TimeUnit::Seconds, project.tempo);
+			for (Clip& inner : clip (item, unit, active, child_origin)) {
+				double inner_start = timing->convert (inner.position, TimeUnit::Seconds);
+				double inner_stop = inner_start + timing->duration (Time (inner.duration, inner.position.unit), inner.position, TimeUnit::Seconds);
 				double begin = std::max (start, inner_start);
 				double end = std::min (stop, inner_stop);
 				if (end <= begin) { continue; }
-				inner.offset.value += convert_time (Time (begin - inner_start, TimeUnit::Seconds), inner.offset.unit, project.tempo);
-				inner.position = Time (outer.position.value + convert_time (Time (begin - start, TimeUnit::Seconds), parent_unit, project.tempo), parent_unit);
-				inner.duration = convert_time (Time (end - begin, TimeUnit::Seconds), parent_unit, project.tempo);
+				inner.offset.value += timing->duration (Time (begin - inner_start, TimeUnit::Seconds), inner.position, inner.offset.unit);
+				inner.position = Time (timing->convert (Time (begin, TimeUnit::Seconds), parent_unit), parent_unit);
+				inner.duration = timing->duration (Time (end - begin, TimeUnit::Seconds), inner.position, parent_unit);
 				inner.enabled = inner.enabled && outer.enabled;
 				if (inner.name.empty ()) { inner.name = outer.name; }
 				if (inner.color.empty ()) { inner.color = outer.color; }
@@ -521,9 +524,36 @@ Parser::parse (Node root)
 	}
 	if (Node arrangement = child (root, "Arrangement")) {
 		attributes (arrangement, {"id"});
-		if (child (arrangement, "TempoAutomation") || child (arrangement, "TimeSignatureAutomation")) {
-			throw ExchangeError ("Tempo and meter automation are not yet supported by this converter");
+		for (bool tempo : {true, false}) {
+			Node automation = child (arrangement, tempo ? "TempoAutomation" : "TimeSignatureAutomation");
+			if (!automation) { continue; }
+			attributes (automation, {"id", "timeUnit", "unit"});
+			Node target = child (automation, "Target");
+			if (!target) { throw ExchangeError ("Tempo/meter automation is missing its target"); }
+			attributes (target, {"parameter"});
+			auto found = ids.find (required (target, "parameter"));
+			Node transport = child (root, "Transport");
+			if (found == ids.end () || !transport || found->second != child (transport, tempo ? "Tempo" : "TimeSignature") || !children (target).empty ()) {
+				throw ExchangeError ("Tempo/meter automation has an invalid target");
+			}
+			if (has (automation, "unit") && (!tempo || attr (automation, "unit") != "bpm")) { throw ExchangeError ("Invalid tempo/meter automation unit"); }
+			TimeUnit unit = time_unit (automation, "timeUnit", TimeUnit::Beats);
+			for (Node point : children (automation)) {
+				if (is (point, "Target")) { continue; }
+				expansion ();
+				if (!children (point).empty ()) { throw ExchangeError ("Invalid transport point content"); }
+				if (tempo && is (point, "RealPoint")) {
+					attributes (point, {"time", "value", "interpolation"});
+					std::string mode = attr (point, "interpolation", "hold");
+					if (mode != "hold" && mode != "linear") { throw ExchangeError ("Unsupported tempo interpolation"); }
+					project.tempos.push_back ({Time (number (point, "time", 0, true), unit), number (point, "value", 0, true), mode == "linear"});
+				} else if (!tempo && is (point, "TimeSignaturePoint")) {
+					attributes (point, {"time", "numerator", "denominator"});
+					project.meters.push_back ({Time (number (point, "time", 0, true), unit), integer (point, "numerator", 0, true), integer (point, "denominator", 0, true)});
+				} else { throw ExchangeError ("Unexpected tempo/meter point type"); }
+			}
 		}
+		timing.reset (new TimeMap (project));
 		if (Node lanes = child (arrangement, "Lanes")) { timeline (lanes, TimeUnit::Beats, ""); }
 		if (Node markers = child (arrangement, "Markers")) {
 			attributes (markers, {"id", "timeUnit"});
@@ -536,7 +566,7 @@ Parser::parse (Node root)
 			}
 		}
 		for (Node item : children (arrangement)) {
-			if (!is (item, "Lanes") && !is (item, "Markers")) { diagnostic (item, "Arrangement data is not yet converted"); }
+			if (!is (item, "Lanes") && !is (item, "Markers") && !is (item, "TempoAutomation") && !is (item, "TimeSignatureAutomation")) { diagnostic (item, "Arrangement data is not yet converted"); }
 		}
 	}
 	for (Node item : children (root)) {
@@ -572,8 +602,9 @@ void property (Node node, const char* name, const char* value) { property (node,
 const char* unit_name (TimeUnit unit) { return unit == TimeUnit::Beats ? "beats" : "seconds"; }
 
 struct Writer {
-	explicit Writer (const Project& p) : project (p) {}
+	explicit Writer (const Project& p) : project (p), timing (p) {}
 	const Project& project;
+	TimeMap timing;
 	std::map<std::string, std::string> track_ids;
 	std::map<std::string, std::string> channel_ids;
 	std::map<std::string, std::string> media_ids;
@@ -621,7 +652,7 @@ struct Writer {
 		property (output, "duration", clip.duration);
 		property (output, "contentTimeUnit", unit_name (clip.offset.unit));
 		property (output, "playStart", clip.offset.value);
-		property (output, "playStop", clip.offset.value + convert_time (Time (clip.duration, clip.position.unit), clip.offset.unit, project.tempo));
+		property (output, "playStop", clip.offset.value + timing.duration (Time (clip.duration, clip.position.unit), clip.position, clip.offset.unit));
 		property (output, "enable", clip.enabled ? "true" : "false");
 		if (!clip.name.empty ()) { property (output, "name", clip.name); }
 		if (!clip.color.empty ()) { property (output, "color", clip.color); }
@@ -674,9 +705,11 @@ struct Writer {
 		property (application, "version", project.application_version);
 		Node transport = element (root, "Transport");
 		Node tempo = element (transport, "Tempo");
+		property (tempo, "id", "transport-tempo");
 		property (tempo, "unit", "bpm");
 		property (tempo, "value", project.tempo);
 		Node meter = element (transport, "TimeSignature");
+		property (meter, "id", "transport-meter");
 		property (meter, "numerator", project.numerator);
 		property (meter, "denominator", project.denominator);
 		tracks (element (root, "Structure"), "");
@@ -703,7 +736,30 @@ struct Writer {
 			for (auto const& marker : project.markers) {
 				Node item = element (markers, "Marker");
 				property (item, "name", marker.name);
-				property (item, "time", convert_time (marker.position, unit, project.tempo));
+				property (item, "time", timing.convert (marker.position, unit));
+			}
+		}
+		if (!project.tempos.empty ()) {
+			Node points = element (arrangement, "TempoAutomation");
+			property (points, "timeUnit", unit_name (project.tempos.front ().position.unit));
+			property (points, "unit", "bpm");
+			property (element (points, "Target"), "parameter", "transport-tempo");
+			for (auto const& change : project.tempos) {
+				Node point = element (points, "RealPoint");
+				property (point, "time", change.position.value); property (point, "value", change.bpm);
+				property (point, "interpolation", change.linear ? "linear" : "hold");
+			}
+		}
+		if (!project.meters.empty ()) {
+			Node points = element (arrangement, "TimeSignatureAutomation");
+			TimeUnit unit = project.meters.front ().position.unit;
+			for (auto const& change : project.meters) { if (change.position.unit != unit) { unit = TimeUnit::Beats; break; } }
+			property (points, "timeUnit", unit_name (unit));
+			property (element (points, "Target"), "parameter", "transport-meter");
+			for (auto const& change : project.meters) {
+				Node point = element (points, "TimeSignaturePoint");
+				property (point, "time", timing.convert (change.position, unit));
+				property (point, "numerator", change.numerator); property (point, "denominator", change.denominator);
 			}
 		}
 		xmlChar* buffer = NULL;

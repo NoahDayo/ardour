@@ -157,6 +157,29 @@ class LogicWriterTest(unittest.TestCase):
         for output in metadata.findall("OutputFile"):
             self.assertEqual(hashlib.sha256((self.output / output.attrib["name"]).read_bytes()).hexdigest(), output.attrib["sha256"])
 
+    def test_variable_transport_and_duration(self):
+        self.root.set("durationBeats", "24")
+        for at, bpm in ((0, 60), (4.25, 120), (8.25, 90)):
+            ET.SubElement(self.root, "Tempo", time=str(at), bpm=str(bpm))
+        for at, n, d in ((0, 4, 4), (4.25, 3, 4), (8.25, 7, 8)):
+            ET.SubElement(self.root, "TimeSignature", time=str(at), numerator=str(n), denominator=str(d))
+        result = self.run_writer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tracks = read_midi(self.output / "Project.mid")
+        tempos = [(tick / PPQN, int.from_bytes(payload, "big"))
+                  for tick, status, kind, payload in tracks[0] if kind == 81]
+        self.assertEqual(tempos, [(0, 1000000), (4.25, 500000), (8.25, 666667)])
+        meters = [(tick / PPQN, payload[:2]) for tick, status, kind, payload in tracks[0] if kind == 88]
+        self.assertEqual(meters, [(0, bytes([4, 2])), (4.25, bytes([3, 2])), (8.25, bytes([7, 3]))])
+        self.assertTrue(all(track[-1][0] == 24 * PPQN for track in tracks))
+
+    def test_rejects_transport_tick_collision(self):
+        ET.SubElement(self.root, "Tempo", time="1", bpm="100")
+        ET.SubElement(self.root, "Tempo", time="1.00000001", bpm="120")
+        result = self.run_writer()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("collide", result.stderr)
+
     def test_refuses_existing_output(self):
         sentinel = self.output / "Project.aaf"
         sentinel.write_bytes(b"existing project")

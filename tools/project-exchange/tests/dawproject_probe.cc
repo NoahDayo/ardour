@@ -33,8 +33,18 @@ static void time_json (Time time)
 
 static void dump (const Project& p)
 {
-	std::cout << "{\"tempo\":" << p.tempo << ",\"meter\":[" << p.numerator << ',' << p.denominator << "],\"media\":[";
+	std::cout << "{\"tempo\":" << p.tempo << ",\"meter\":[" << p.numerator << ',' << p.denominator << "],\"tempos\":[";
 	bool first = true;
+	for (auto const& point : p.tempos) {
+		if (!first) { std::cout << ','; } first = false;
+		std::cout << '['; time_json (point.position); std::cout << ',' << point.bpm << ',' << (point.linear ? "true" : "false") << ']';
+	}
+	std::cout << "],\"meters\":["; first = true;
+	for (auto const& point : p.meters) {
+		if (!first) { std::cout << ','; } first = false;
+		std::cout << '['; time_json (point.position); std::cout << ',' << point.numerator << ',' << point.denominator << ']';
+	}
+	std::cout << "],\"media\":["; first = true;
 	for (auto const& m : p.media) {
 		if (!first) { std::cout << ','; } first = false;
 		std::cout << "{\"id\":"; quoted (m.id);
@@ -105,6 +115,18 @@ static int run (const std::vector<std::string>& args)
 	try {
 		if (args.size () < 3) { return 2; }
 		if (args[1] == "parse") { dump (DawProject::parse_xml (read_text (args[2]))); }
+		else if (args[1] == "timing") {
+			Project p = DawProject::parse_xml (read_text (args[2])); TimeMap map (p);
+			Project approximation = p; approximation.tempos = map.stepped (0.00001); TimeMap steps (approximation);
+			std::cout << '[';
+			for (unsigned i = 0; i <= 400; ++i) {
+				double beat = i / 10.0, second = map.convert (Time (beat), TimeUnit::Seconds);
+				if (i) { std::cout << ','; }
+				std::cout << '[' << beat << ',' << second << ',' << map.convert (Time (second, TimeUnit::Seconds), TimeUnit::Beats)
+				          << ',' << steps.convert (Time (beat), TimeUnit::Seconds) << ']';
+			}
+			std::cout << ']';
+		}
 		else if (args[1] == "read") { dump (DawProject::read (args[2])); }
 		else if (args[1] == "read-song") {
 			auto song = StudioOneSong::read (args[2]);

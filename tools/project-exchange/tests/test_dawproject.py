@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -313,10 +314,75 @@ class DawProjectTest(unittest.TestCase):
             with self.subTest(change=new):
                 self.parse(PROJECT.replace(old, new, 1), status=1)
 
-    def test_reject_tempo_changes_until_mapped(self):
+    def test_reject_tempo_changes_without_target(self):
         xml = PROJECT.replace('</Arrangement>', '<TempoAutomation><RealPoint time="4" value="80"/></TempoAutomation></Arrangement>')
         result = self.parse(xml, status=1)
         self.assertIn("Tempo", result.stderr)
+
+    def timed_project(self, points, unit="beats", meters=""):
+        xml = PROJECT.replace('<Tempo ', '<Tempo id="tempo-map" ', 1)
+        xml = xml.replace('<TimeSignature ', '<TimeSignature id="meter-map" ', 1)
+        tempo = '<TempoAutomation timeUnit="%s" unit="bpm"><Target parameter="tempo-map"/>%s</TempoAutomation>' % (unit, points)
+        meter = '<TimeSignatureAutomation timeUnit="beats"><Target parameter="meter-map"/>%s</TimeSignatureAutomation>' % meters
+        return xml.replace('</Arrangement>', tempo + meter + '</Arrangement>')
+
+    def test_variable_tempo_and_meter_roundtrip(self):
+        xml = self.timed_project('<RealPoint time="9" value="60"/><RealPoint time="20" value="140"/>',
+                                 meters='<TimeSignaturePoint time="10" numerator="7" denominator="8"/>')
+        parsed = self.parse(xml)
+        self.assertAlmostEqual(parsed["tracks"][1]["clips"][0]["duration"], 1.9)
+        self.assertEqual(parsed["tempos"], [[[9, "beats"], 60, False], [[20, "beats"], 140, False]])
+        self.assertEqual(parsed["meters"], [[[10, "beats"], 7, 8]])
+        output = self.root / "rewritten.xml"
+        self.command("rewrite", self.input, output)
+        self.assert_schema(output)
+        self.assertEqual(self.semantic(parsed), self.semantic(json.loads(self.command("parse", output).stdout)))
+
+    def test_tempo_ramps_and_step_conversion(self):
+        cases = [
+            ("beats", '<RealPoint time="0" value="60" interpolation="linear"/><RealPoint time="8" value="180"/>',
+             lambda q: 4 * math.log1p(q / 4) if q < 8 else 4 * math.log(3) + (q - 8) / 3),
+            ("seconds", '<RealPoint time="0" value="60" interpolation="linear"/><RealPoint time="4" value="180"/>',
+             lambda q: 2 * (math.sqrt(1 + q) - 1) if q < 8 else 4 + (q - 8) / 3),
+            ("seconds", '<RealPoint time="0" value="180" interpolation="linear"/><RealPoint time="4" value="60"/>',
+             lambda q: 2 * (3 - math.sqrt(9 - q)) if q < 8 else 4 + (q - 8)),
+            ("beats", '<RealPoint time="0" value="60" interpolation="linear"/><RealPoint time="8" value="180"/><RealPoint time="8" value="90"/>',
+             lambda q: 4 * math.log1p(q / 4) if q < 8 else 4 * math.log(3) + (q - 8) / 1.5),
+        ]
+        for unit, points, expected in cases:
+            with self.subTest(unit=unit, points=points):
+                self.parse(self.timed_project(points, unit))
+                data = json.loads(self.command("timing", self.input).stdout)
+                for beat, second, back, approximate in data:
+                    self.assertAlmostEqual(second, expected(beat), places=11)
+                    self.assertAlmostEqual(back, beat, places=10)
+                    self.assertLessEqual(abs(approximate - second), .000010001)
+                output = self.root / "ramp.xml"
+                self.command("rewrite", self.input, output)
+                self.assert_schema(output)
+
+    def test_variable_tempo_nested_clip_ranges(self):
+        xml = self.timed_project('<RealPoint time="0" value="60"/><RealPoint time="4" value="120"/>')
+        # Use one explicit nested viewport; its content starts before the outer
+        # audible range and must be trimmed at the root tempo-map position.
+        root = ET.fromstring(xml)
+        arrangement = root.find('Arrangement')
+        arrangement.remove(arrangement.find('Lanes'))
+        arrangement.insert(0, ET.fromstring('''<Lanes><Clips track="audio" timeUnit="beats"><Clip time="8" duration="4" playStart="2">
+          <Clips timeUnit="seconds"><Clip time="0.25" duration="3" playStart="0.5" contentTimeUnit="seconds">
+          <Audio duration="4" channels="2" sampleRate="48000"><File path="audio/nested.wav"/></Audio>
+          </Clip></Clips></Clip></Clips></Lanes>'''))
+        clip = self.parse(ET.tostring(root, encoding='unicode'))['tracks'][1]['clips'][0]
+        self.assertAlmostEqual(clip['position'][0], 8)
+        self.assertAlmostEqual(clip['offset'][0], 1.25)
+        self.assertAlmostEqual(clip['duration'], 4)
+
+    def test_invalid_transport_automation(self):
+        for points in ('<RealPoint time="0" value="0"/>', '<RealPoint time="4" value="120"/><RealPoint time="3" value="90"/>',
+                       '<RealPoint time="0" value="120" interpolation="curve"/>'):
+            self.parse(self.timed_project(points), status=1)
+        self.parse(self.timed_project('<RealPoint time="4" value="100"/>').replace('parameter="tempo-map"', 'parameter="meter-map"'), status=1)
+        self.parse(self.timed_project('', meters='<TimeSignaturePoint time="2" numerator="3" denominator="3"/>'), status=1)
 
     def test_reject_dtd_entities_and_reference_cycles(self):
         secret = self.root / "private.txt"

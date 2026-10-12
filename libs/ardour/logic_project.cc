@@ -157,13 +157,14 @@ LogicProject::LogicProject (const std::string& path, const std::string& midi, Ca
 	double origin = self.aaf->Timecode ? seconds (self.aaf->Timecode->start, self.aaf->Timecode->edit_rate) : 0;
 	if (!midi.empty ()) { read_project_midi (midi, project, origin, cancel); }
 	else { project.report.push_back ({Disposition::Transformed, "Transport", "AAF carries no musical tempo map; imported audio uses 120 BPM and 4/4 until a companion MIDI file is supplied"}); }
+	TimeMap timing (project);
 	aafiMarker* marker;
 	AAFI_foreachMarker (self.aaf.get (), marker) {
 		if (marker->length) { project.report.push_back ({Disposition::Unsupported, "AAF markers", "Range markers are not yet supported by project import"}); continue; }
 		Marker value {name (marker->name, name (marker->comment, "Marker")), Time (seconds (marker->start, marker->edit_rate), TimeUnit::Seconds)};
 		bool duplicate = false;
 		for (auto const& existing : project.markers) {
-			if (existing.name == value.name && std::fabs (convert_time (existing.position, TimeUnit::Seconds, project.tempo) - value.position.value) < 1e-6) { duplicate = true; break; }
+			if (existing.name == value.name && std::fabs (timing.convert (existing.position, TimeUnit::Seconds) - value.position.value) < 1e-6) { duplicate = true; break; }
 		}
 		if (!duplicate) { project.markers.push_back (value); }
 	}

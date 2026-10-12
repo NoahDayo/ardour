@@ -81,22 +81,38 @@ def track_chunk(events, end):
 def write_midi(root, destination):
     tempo = number(root, "tempo")
     require(tempo > 0, "Invalid tempo")
-    micros = math.floor(60000000 / tempo + 0.5)
-    numerator = integer(root, "numerator")
-    denominator = integer(root, "denominator")
-    require(1 <= micros <= 0xFFFFFF, "Tempo cannot be represented in MIDI")
-    require(1 <= numerator <= 255 and denominator > 0 and denominator & (denominator - 1) == 0,
-            "Meter cannot be represented in MIDI")
-    exponent = denominator.bit_length() - 1
-    require(exponent <= 255, "Meter denominator too large")
+    def tempo_payload(bpm):
+        require(bpm > 0, "Invalid tempo")
+        micros = math.floor(60000000 / bpm + 0.5)
+        require(1 <= micros <= 0xFFFFFF, "Tempo cannot be represented in MIDI")
+        return meta(81, micros.to_bytes(3, "big"))
+
+    def meter_payload(node):
+        numerator, denominator = integer(node, "numerator"), integer(node, "denominator")
+        require(1 <= numerator <= 255 and denominator > 0 and denominator & (denominator - 1) == 0,
+                "Meter cannot be represented in MIDI")
+        exponent = denominator.bit_length() - 1
+        require(exponent <= 255, "Meter denominator too large")
+        return meta(88, bytes([numerator, exponent, 24, 8]))
+
     events = [
         (0, -4, meta(3, root.attrib["name"].encode("utf-8"))),
-        (0, -3, meta(81, micros.to_bytes(3, "big"))),
-        (0, -2, meta(88, bytes([numerator, exponent, 24, 8]))),
         # 25 fps, 00:00:00:00. Matches the AAF timecode origin.
         (0, -1, meta(84, bytes([0x20, 0, 0, 0, 0]))),
     ]
-    end = ticks(number(root, "duration") * tempo / 60)
+    for tag, order, initial, encode in (
+            ("Tempo", -3, tempo_payload(tempo), lambda n: tempo_payload(number(n, "bpm"))),
+            ("TimeSignature", -2, meter_payload(root), meter_payload)):
+        transport = {0: initial}
+        previous = -1
+        for point in root.findall(tag):
+            at = ticks(number(point, "time"))
+            require(at > previous, "Transport changes collide at MIDI tick resolution")
+            transport[at] = encode(point)
+            previous = at
+        events.extend((at, order, payload) for at, payload in transport.items())
+    end = ticks(number(root, "durationBeats") if "durationBeats" in root.attrib
+                else number(root, "duration") * tempo / 60)
     for marker in root.findall("Marker"):
         at = ticks(number(marker, "time"))
         events.append((at, 0, meta(6, marker.attrib["name"].encode("utf-8"))))

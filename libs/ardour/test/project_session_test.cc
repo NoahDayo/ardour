@@ -14,6 +14,8 @@
 #include "ardour/midi_model.h"
 #include "ardour/midi_region.h"
 #include "ardour/location.h"
+#include "ardour/logic_project.h"
+#include "temporal/tempo.h"
 #include "ardour/playlist.h"
 #include "ardour/project_session.h"
 #include "ardour/recent_sessions.h"
@@ -183,6 +185,9 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (native_song_unsupported);
 	CPPUNIT_TEST (marker_roundtrip);
 	CPPUNIT_TEST (studio_pro_export);
+	CPPUNIT_TEST (variable_timing);
+	CPPUNIT_TEST (second_based_ramp);
+	CPPUNIT_TEST (transport_collision);
 	CPPUNIT_TEST_SUITE_END ();
 public:
 	void roundtrip ();
@@ -201,9 +206,120 @@ public:
 	void native_song_unsupported ();
 	void marker_roundtrip ();
 	void studio_pro_export ();
+	void variable_timing ();
+	void second_based_ramp ();
+	void transport_collision ();
 };
 
 CPPUNIT_TEST_SUITE_REGISTRATION (ProjectSessionTest);
+
+void ProjectSessionTest::variable_timing ()
+{
+	Fixture fixture;
+	auto input = example (fixture);
+	input.tempo = 60; input.numerator = 4;
+	input.tempos = {{PX::Time (0), 60, false}, {PX::Time (4.25), 120, true},
+	                {PX::Time (8.25), 180, false}, {PX::Time (8.25), 90, false}};
+	input.meters = {{PX::Time (0), 4, 4}, {PX::Time (4.25), 3, 4}, {PX::Time (8.25), 7, 8}};
+	input.markers = {{"Ramp", PX::Time (4.25)}, {"Seconds", PX::Time (6, PX::TimeUnit::Seconds)}};
+	input.tracks.erase (input.tracks.begin () + 1); // Direct routing is supported by both formats.
+	for (auto& track : input.tracks) { track.parent.clear (); track.pan = .5; if (!track.master) { track.destination = "master"; } }
+	auto& audio = input.tracks[1].clips;
+	audio.resize (1); audio[0].position = PX::Time (3.5); audio[0].duration = 2;
+	auto& midi = input.tracks[2].clips[0];
+	midi.position = PX::Time (3.5); midi.duration = 5; midi.offset = PX::Time (1, PX::TimeUnit::Seconds);
+	midi.notes.resize (1); midi.notes[0].time = 1.2; midi.notes[0].duration = 1.3;
+	PX::TimeMap expected (input);
+	package (fixture, input);
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"), fixture.path ("Timing"), "Timing", fixture.report);
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("Timing"), "Timing", nullptr, "", true));
+	AudioEngine::instance ()->set_session (fixture.session.get ());
+	auto native = Temporal::TempoMap::use ();
+	CPPUNIT_ASSERT_EQUAL (size_t (3), size_t (native->n_tempos ()));
+	CPPUNIT_ASSERT_EQUAL (size_t (3), size_t (native->n_meters ()));
+	CPPUNIT_ASSERT_EQUAL (7, int (native->meter_at (Temporal::Beats::from_double (9)).divisions_per_bar ()));
+	CPPUNIT_ASSERT_EQUAL (8, int (native->meter_at (Temporal::Beats::from_double (9)).note_value ()));
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("timing.dawproject"));
+	auto output = PX::DawProject::read (fixture.path ("timing.dawproject"));
+	PX::TimeMap exported (output);
+	for (unsigned i = 0; i <= 128; ++i) {
+		double beat = i / 8.0;
+		double seconds = double (native->superclock_at (Temporal::Beats::from_double (beat))) / Temporal::superclock_ticks_per_second ();
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (expected.convert (PX::Time (beat), PX::TimeUnit::Seconds), seconds, 1e-6);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (seconds, exported.convert (PX::Time (beat), PX::TimeUnit::Seconds), 1e-6);
+	}
+	auto const& out_audio = track_named (output, "Stereo").clips[0];
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (3.5, out_audio.position.value, 1.0 / fixture.session->sample_rate ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (expected.duration (PX::Time (2), PX::Time (3.5), PX::TimeUnit::Seconds), out_audio.duration, 1.0 / fixture.session->sample_rate ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.375, out_audio.offset.value, 1e-8);
+	auto const& out_midi = track_named (output, "Notes").clips[0];
+	double start = expected.content (PX::Time (1.2, PX::TimeUnit::Seconds), midi.position, midi.offset, PX::TimeUnit::Beats);
+	double stop = expected.content (PX::Time (2.5, PX::TimeUnit::Seconds), midi.position, midi.offset, PX::TimeUnit::Beats);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (start, out_midi.notes[0].time, 1.0 / Temporal::Beats::PPQN);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (stop - start, out_midi.notes[0].duration, 2.0 / Temporal::Beats::PPQN);
+	CPPUNIT_ASSERT_EQUAL (size_t (3), output.meters.size ());
+	for (size_t i = 0; i < input.meters.size (); ++i) { CPPUNIT_ASSERT_DOUBLES_EQUAL (input.meters[i].position.value, output.meters[i].position.value, 1e-9); }
+	CPPUNIT_ASSERT_EQUAL (input.markers.size (), output.markers.size ());
+	for (size_t i = 0; i < input.markers.size (); ++i) {
+		CPPUNIT_ASSERT_EQUAL (input.markers[i].name, output.markers[i].name);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (expected.convert (input.markers[i].position, PX::TimeUnit::Beats), exported.convert (output.markers[i].position, PX::TimeUnit::Beats), 1.0 / Temporal::Beats::PPQN);
+	}
+	PX::SessionExchange::export_logic (*fixture.session, fixture.path ("Logic"), fixture.report);
+	PX::Project smf;
+	PX::read_project_midi (fixture.path ("Logic/Project.mid"), smf, 0);
+	PX::TimeMap midi_timing (smf);
+	CPPUNIT_ASSERT (smf.tempos.size () > 3);
+	CPPUNIT_ASSERT_EQUAL (size_t (3), smf.meters.size ());
+	for (unsigned i = 0; i <= 128; ++i) {
+		double beat = i / 8.0;
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (expected.convert (PX::Time (beat), PX::TimeUnit::Seconds), midi_timing.convert (PX::Time (beat), PX::TimeUnit::Seconds), .0001);
+	}
+	// AAF/MIDI import must retain the same tempo map after save and reopen.
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("Logic/Project.aaf"), fixture.path ("Logic/Project.mid"), fixture.path ("Return"), "Return", fixture.report);
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("Return"), "Return", nullptr, "", true));
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("return.dawproject"));
+	auto returned = PX::DawProject::read (fixture.path ("return.dawproject"));
+	PX::TimeMap returned_timing (returned);
+	for (unsigned i = 0; i <= 128; ++i) {
+		double beat = i / 8.0;
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (expected.convert (PX::Time (beat), PX::TimeUnit::Seconds), returned_timing.convert (PX::Time (beat), PX::TimeUnit::Seconds), .001);
+	}
+}
+
+void ProjectSessionTest::second_based_ramp ()
+{
+	Fixture fixture;
+	auto input = example (fixture);
+	input.tempos = {{PX::Time (0, PX::TimeUnit::Seconds), 60, true}, {PX::Time (4, PX::TimeUnit::Seconds), 180, false}};
+	package (fixture, input);
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"), fixture.path ("Ramp"), "Ramp", fixture.report);
+	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& item) { return item.object == "Tempo" && item.disposition == PX::Disposition::Transformed; }));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("Ramp"), "Ramp", nullptr, "", true));
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("ramp.dawproject"));
+	auto output = PX::DawProject::read (fixture.path ("ramp.dawproject"));
+	PX::TimeMap timing (output);
+	for (unsigned i = 0; i <= 64; ++i) {
+		double beat = i / 8.0;
+		// q = s + s*s/4 for a 60 -> 180 BPM ramp over four seconds.
+		double seconds = 2 * (std::sqrt (1 + beat) - 1);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (seconds, timing.convert (PX::Time (beat), PX::TimeUnit::Seconds), .001);
+	}
+}
+
+void ProjectSessionTest::transport_collision ()
+{
+	Fixture fixture;
+	auto input = example (fixture);
+	input.tempos = {{PX::Time (0), 100, false}, {PX::Time (1), 120, false}, {PX::Time (1.00000001), 140, false}};
+	package (fixture, input);
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"), fixture.path ("Collision"), "Collision", fixture.report), PX::ExchangeError);
+	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("Collision"), Glib::FILE_TEST_EXISTS));
+	CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
+}
 
 void ProjectSessionTest::marker_roundtrip ()
 {

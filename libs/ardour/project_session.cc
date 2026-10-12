@@ -149,7 +149,97 @@ std::string color_text (uint32_t color)
 	return text.str ();
 }
 
-SourceList midi_source (Session& session, const Clip& clip, double tempo, const CancelCheck& cancel)
+void populate_tempo (const Project& project, std::vector<Diagnostic>& report)
+{
+	TimeMap timing (project);
+	std::vector<TempoChange> changes = project.tempos;
+	bool sampled = false, rounded = false, partial_bar = false;
+	for (auto const& change : changes) { if (change.linear && change.position.unit == TimeUnit::Seconds) { sampled = true; } }
+	if (sampled) { changes = timing.stepped (0.00001); }
+	for (auto& change : changes) { change.position = Time (timing.convert (change.position, TimeUnit::Beats)); }
+	if (changes.empty () || changes.front ().position.value > 0) { changes.insert (changes.begin (), {Time (), project.tempo, false}); }
+	struct TempoEntry { Temporal::Beats beat; double bpm, end; };
+	std::vector<TempoEntry> tempos;
+	for (size_t i = 0; i < changes.size ();) {
+		size_t last = i;
+		while (last + 1 < changes.size () && changes[last + 1].position.value == changes[i].position.value) { ++last; }
+		auto const& change = changes[last];
+		Temporal::Beats beat = beats (change.position.value);
+		rounded |= std::fabs (beat_value (beat) - change.position.value) > 1e-9;
+		if (!tempos.empty () && beat <= tempos.back ().beat) { throw ExchangeError ("Tempo changes collide at Ardour's tick resolution"); }
+		double end = change.linear && last + 1 < changes.size () ? changes[last + 1].bpm : change.bpm;
+		if (60.0 * Temporal::superclock_ticks_per_second () / std::min (change.bpm, end) > std::numeric_limits<int64_t>::max () / 4.0) {
+			throw ExchangeError ("Tempo exceeds Ardour's clock range");
+		}
+		samples (timing.convert (Time (beat_value (beat)), TimeUnit::Seconds), 1);
+		tempos.push_back ({beat, change.bpm, end}); i = last + 1;
+	}
+	struct MeterEntry { Temporal::Beats beat; Temporal::BBT_Time bbt; Temporal::Meter meter; };
+	auto meter = [] (unsigned n, unsigned d) {
+		if (n > 127 || d > 64) { throw ExchangeError ("Meter exceeds Ardour's supported range"); }
+		return Temporal::Meter (n, d);
+	};
+	std::vector<MeterEntry> meters {{Temporal::Beats (), Temporal::BBT_Time (1, 1, 0), meter (project.numerator, project.denominator)}};
+	auto bbt_after = [] (const MeterEntry& entry, Temporal::Beats beat) {
+		int64_t ticks = (beat - entry.beat).to_ticks (), grid = entry.meter.ticks_per_grid ();
+		int64_t bar = grid * entry.meter.divisions_per_bar ();
+		if (ticks < 0 || ticks / bar > INT32_MAX - entry.bbt.bars) { throw ExchangeError ("Meter map exceeds Ardour's bar range"); }
+		return entry.meter.bbt_add (entry.bbt, Temporal::BBT_Offset (ticks / bar, (ticks % bar) / grid, ticks % grid));
+	};
+	for (auto const& change : project.meters) {
+		double value = timing.convert (change.position, TimeUnit::Beats);
+		Temporal::Beats beat = beats (value);
+		samples (timing.convert (Time (beat_value (beat)), TimeUnit::Seconds), 1);
+		rounded |= std::fabs (beat_value (beat) - value) > 1e-9;
+		if (beat == Temporal::Beats () && value == 0) { meters.front ().meter = meter (change.numerator, change.denominator); continue; }
+		if (beat <= meters.back ().beat) { throw ExchangeError ("Meter changes collide at Ardour's tick resolution"); }
+		Temporal::BBT_Time bbt = bbt_after (meters.back (), beat);
+		if (bbt.beats != 1 || bbt.ticks != 0) { bbt = Temporal::BBT_Time (bbt.bars + 1, 1, 0); partial_bar = true; }
+		meters.push_back ({beat, bbt, meter (change.numerator, change.denominator)});
+	}
+	auto bbt_at = [&] (Temporal::Beats beat) {
+		auto end = std::upper_bound (meters.begin (), meters.end (), beat,
+		                            [] (Temporal::Beats b, const MeterEntry& m) { return b < m.beat; });
+		return bbt_after (*std::prev (end), beat);
+	};
+	/* Use Ardour's persistence representation: the editor-facing setters round
+	 * changes to whole beats/bars, while valid imported maps may use sub-beats
+	 * and truncated measures. Construct every timestamp from the same native
+	 * TempoPoint integration used for playback, including ramp coefficients. */
+	Temporal::TempoMap candidate (Temporal::Tempo (tempos.front ().bpm, 4), meters.front ().meter);
+	XMLNode state ("TempoMap");
+	state.set_property ("superclocks-per-second", Temporal::superclock_ticks_per_second ());
+	XMLNode& tempo_nodes = *state.add_child ("Tempos");
+	XMLNode& meter_nodes = *state.add_child ("Meters");
+	state.add_child ("MusicTimes");
+	std::vector<std::unique_ptr<Temporal::TempoPoint>> points;
+	for (size_t i = 0; i < tempos.size (); ++i) {
+		auto const& entry = tempos[i];
+		Temporal::superclock_t sc = i ? points.back ()->superclock_at (entry.beat) : 0;
+		if (sc < 0 || sc > std::numeric_limits<int64_t>::max () / 4) { throw ExchangeError ("Tempo map exceeds Ardour's time range"); }
+		std::unique_ptr<Temporal::TempoPoint> point (new Temporal::TempoPoint (candidate,
+		        Temporal::Tempo (entry.bpm, entry.end, 4), sc, entry.beat, bbt_at (entry.beat)));
+		if (i + 1 < tempos.size ()) { point->compute_omega_from_quarter_duration (tempos[i + 1].beat - entry.beat, point->end_superclocks_per_quarter_note ()); }
+		tempo_nodes.add_child_nocopy (point->get_state ()); points.push_back (std::move (point));
+	}
+	for (auto const& entry : meters) {
+		auto end = std::upper_bound (points.begin (), points.end (), entry.beat,
+		                            [] (Temporal::Beats beat, const std::unique_ptr<Temporal::TempoPoint>& p) { return beat < p->beats (); });
+		Temporal::superclock_t sc = (*std::prev (end))->superclock_at (entry.beat);
+		Temporal::MeterPoint point (candidate, entry.meter, sc, entry.beat, entry.bbt);
+		meter_nodes.add_child_nocopy (point.get_state ());
+	}
+	auto map = Temporal::TempoMap::write_copy ();
+	try {
+		if (map->set_state (state, PBD::Stateful::current_state_version)) { throw ExchangeError ("Cannot construct imported tempo map"); }
+	} catch (...) { Temporal::TempoMap::abort_update (); throw; }
+	if (Temporal::TempoMap::update (map)) { throw ExchangeError ("Cannot update session tempo map"); }
+	if (sampled) { report.push_back ({Disposition::Transformed, "Tempo", "Second-based linear ramps sampled into constant tempos with a 10-microsecond timing-error bound before native tick rounding"}); }
+	if (rounded) { report.push_back ({Disposition::Transformed, "Transport", "Tempo/meter positions rounded to Ardour's 1/" + std::to_string (Temporal::Beats::PPQN) + " quarter-note resolution"}); }
+	if (partial_bar) { report.push_back ({Disposition::Transformed, "Meter", "A meter change inside a measure starts a new bar at the original musical position"}); }
+}
+
+SourceList midi_source (Session& session, const Clip& clip, const TimeMap& timing, const CancelCheck& cancel)
 {
 	std::string path = session.new_midi_source_path (clip.name.empty () ? "MIDI" : clip.name);
 	std::shared_ptr<MidiSource> source = std::dynamic_pointer_cast<MidiSource> (
@@ -161,12 +251,12 @@ SourceList midi_source (Session& session, const Clip& clip, double tempo, const 
 		std::array<uint8_t, 3> data;
 	};
 	std::vector<Event> events;
-	double end = convert_time (clip.offset, TimeUnit::Beats, tempo) + convert_time (Time (clip.duration, clip.position.unit), TimeUnit::Beats, tempo);
+	double end = timing.content (clip.offset, clip.position, clip.offset, TimeUnit::Beats) + timing.duration (Time (clip.duration, clip.position.unit), clip.position, TimeUnit::Beats);
 	for (auto const& note : clip.notes) {
 		cancelled (cancel);
 		if (note.velocity == 0) { throw ExchangeError ("Zero-velocity notes cannot be preserved in an SMF source"); }
-		double start = convert_time (Time (note.time, clip.offset.unit), TimeUnit::Beats, tempo);
-		double stop = convert_time (Time (note.time + note.duration, clip.offset.unit), TimeUnit::Beats, tempo);
+		double start = timing.content (Time (note.time, clip.offset.unit), clip.position, clip.offset, TimeUnit::Beats);
+		double stop = timing.content (Time (note.time + note.duration, clip.offset.unit), clip.position, clip.offset, TimeUnit::Beats);
 		Temporal::Beats on = beats (start), off = beats (stop);
 		if (off <= on) { throw ExchangeError ("MIDI note is shorter than Ardour's timing resolution"); }
 		uint8_t velocity = std::max (1L, std::lround (note.velocity * 127));
@@ -200,12 +290,9 @@ SourceList midi_source (Session& session, const Clip& clip, double tempo, const 
 void populate (Session& session, const Project& project, const std::map<std::string, std::string>& assets,
                std::vector<Diagnostic>& report, const CancelCheck& cancel)
 {
-	if (project.numerator > 127 || project.denominator > 64) { throw ExchangeError ("Meter exceeds Ardour's supported range"); }
 	session.config.set_native_file_data_format (FormatFloat);
-	auto map = Temporal::TempoMap::write_copy ();
-	map->set_tempo (Temporal::Tempo (project.tempo, 4), Temporal::timepos_t (Temporal::Beats ()));
-	map->set_meter (Temporal::Meter (project.numerator, project.denominator), Temporal::timepos_t (Temporal::Beats ()));
-	if (Temporal::TempoMap::update (map)) { throw ExchangeError ("Cannot update session tempo"); }
+	TimeMap timing (project);
+	populate_tempo (project, report);
 
 	std::map<std::string, SourceList> sources;
 	for (auto const& media : project.media) {
@@ -326,9 +413,9 @@ void populate (Session& session, const Project& project, const std::map<std::str
 			cancelled (cancel);
 			bool midi = clip.kind == ClipKind::MIDI;
 			TimeUnit native_unit = midi ? TimeUnit::Beats : TimeUnit::Seconds;
-			double position = convert_time (clip.position, native_unit, project.tempo);
-			double duration = convert_time (Time (clip.duration, clip.position.unit), native_unit, project.tempo);
-			double offset = convert_time (clip.offset, native_unit, project.tempo);
+			double position = timing.convert (clip.position, native_unit);
+			double duration = timing.duration (Time (clip.duration, clip.position.unit), clip.position, native_unit);
+			double offset = timing.content (clip.offset, clip.position, clip.offset, native_unit);
 			if (midi) { beats (position + duration); beats (offset + duration); }
 			else { samples (position + duration, session.sample_rate ()); samples (offset + duration, session.sample_rate ()); }
 			Temporal::timepos_t pos = midi ? Temporal::timepos_t (beats (position)) : Temporal::timepos_t (samples (position, session.sample_rate ()));
@@ -340,7 +427,7 @@ void populate (Session& session, const Project& project, const std::map<std::str
 			properties.add (Properties::name, clip.name.empty () ? track.name : clip.name);
 			properties.add (Properties::whole_file, false);
 			properties.add (Properties::opaque, false);
-			SourceList source = midi ? midi_source (session, clip, project.tempo, cancel) : sources.at (clip.media);
+			SourceList source = midi ? midi_source (session, clip, timing, cancel) : sources.at (clip.media);
 			auto region = RegionFactory::create (source, properties);
 			if (!region) { throw ExchangeError ("Cannot create imported region"); }
 			region->set_muted (!clip.enabled);
@@ -374,7 +461,7 @@ void populate (Session& session, const Project& project, const std::map<std::str
 		session.locations ()->add (location);
 		if (location->name () != marker.name) { report.push_back ({Disposition::Transformed, "Unnamed marker", "Assigned marker name " + location->name ()}); }
 		if (location->start ().time_domain () != pos.time_domain ()) {
-			report.push_back ({Disposition::Transformed, marker.name, "Marker converted to the session time basis at the current constant tempo"});
+			report.push_back ({Disposition::Transformed, marker.name, "Marker converted to the session time basis using the tempo map"});
 		}
 		end = std::max (end, pos.samples ());
 	}
@@ -434,8 +521,24 @@ Project collect (Session& session, AudioAssets& assets, const CancelCheck& cance
 	project.tempo = initial_tempo.quarter_notes_per_minute ();
 	project.numerator = initial_meter.divisions_per_bar ();
 	project.denominator = initial_meter.note_value ();
-	if (tempo->n_tempos () != 1 || tempo->n_meters () != 1 || initial_tempo.ramped ()) {
-		unsupported (project, "Tempo map", "Variable tempo and meter cannot yet be exchanged");
+	if (!tempo->bartimes ().empty ()) { unsupported (project, "Tempo map", "Music-time anchors cannot yet be exchanged"); }
+	if (tempo->n_tempos () != 1 || initial_tempo.ramped ()) {
+		for (auto it = tempo->tempos ().begin (); it != tempo->tempos ().end (); ++it) {
+			auto next = std::next (it);
+			bool ramp = it->actually_ramped () && next != tempo->tempos ().end ();
+			project.tempos.push_back ({Time (beat_value (it->beats ())), it->quarter_notes_per_minute (), ramp});
+			if (ramp) {
+				double end = 60.0 * Temporal::superclock_ticks_per_second () / it->end_superclocks_per_quarter_note ();
+				if (std::fabs (end - next->quarter_notes_per_minute ()) > 1e-8) {
+					project.tempos.push_back ({Time (beat_value (next->beats ())), end, false});
+				}
+			}
+		}
+	}
+	if (tempo->n_meters () > 1) {
+		for (auto const& point : tempo->meters ()) {
+			project.meters.push_back ({Time (beat_value (point.beats ())), unsigned (point.divisions_per_bar ()), unsigned (point.note_value ())});
+		}
 	}
 	for (auto const& location : session.locations ()->list ()) {
 		if (!location->is_session_range () && !location->is_auto_loop () && !location->is_auto_punch ()) {
@@ -452,7 +555,7 @@ Project collect (Session& session, AudioAssets& assets, const CancelCheck& cance
 	if (!project.markers.empty () && std::any_of (project.markers.begin (), project.markers.end (), [&] (const Marker& marker) {
 		return marker.position.unit != project.markers.front ().position.unit;
 	})) {
-		project.report.push_back ({Disposition::Transformed, "Markers", "Mixed musical and sample-time markers exported in seconds at the current constant tempo"});
+		project.report.push_back ({Disposition::Transformed, "Markers", "Mixed musical and sample-time markers exported in seconds using the tempo map"});
 	}
 	RouteList routes (*session.get_routes ());
 	routes.remove_if ([] (const std::shared_ptr<Route>& route) { return route->is_auditioner () || route->is_monitor (); });
@@ -907,6 +1010,21 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 	root.set_property ("tempo", project.tempo);
 	root.set_property ("numerator", project.numerator);
 	root.set_property ("denominator", project.denominator);
+	TimeMap timing (project);
+	if (!project.tempos.empty ()) {
+		for (auto const& change : timing.stepped (0.00001)) {
+			XMLNode& item = *root.add_child ("Tempo");
+			item.set_property ("time", change.position.value);
+			item.set_property ("bpm", change.bpm);
+		}
+		report.push_back ({Disposition::Transformed, "Tempo", "MIDI tempos rounded to whole microseconds per quarter note; ramps sampled with a 10-microsecond timing-error bound before MIDI rounding"});
+	}
+	for (auto const& change : project.meters) {
+		XMLNode& item = *root.add_child ("TimeSignature");
+		item.set_property ("time", timing.convert (change.position, TimeUnit::Beats));
+		item.set_property ("numerator", change.numerator);
+		item.set_property ("denominator", change.denominator);
+	}
 	double duration = 0;
 	for (auto const& media : project.media) {
 		cancelled (cancel);
@@ -936,10 +1054,10 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 			item.set_property ("enabled", clip.enabled ? "true" : "false");
 			item.set_property ("gain", clip.gain);
 			TimeUnit unit = audio ? TimeUnit::Seconds : TimeUnit::Beats;
-			double position = convert_time (clip.position, unit, project.tempo);
-			double length = convert_time (Time (clip.duration, clip.position.unit), unit, project.tempo);
-			double offset = convert_time (clip.offset, unit, project.tempo);
-			duration = std::max (duration, convert_time (Time (position + length, unit), TimeUnit::Seconds, project.tempo));
+			double position = timing.convert (clip.position, unit);
+			double length = timing.duration (Time (clip.duration, clip.position.unit), clip.position, unit);
+			double offset = timing.content (clip.offset, clip.position, clip.offset, unit);
+			duration = std::max (duration, timing.convert (Time (position + length, unit), TimeUnit::Seconds));
 			if (audio) {
 				item.set_property ("time", samples (position, session.sample_rate ()));
 				item.set_property ("length", samples (length, session.sample_rate ()));
@@ -952,8 +1070,10 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 				item.set_property ("offset", offset);
 				for (auto const& note : clip.notes) {
 					XMLNode& event = *item.add_child ("Note");
-					event.set_property ("time", convert_time (Time (note.time, clip.offset.unit), TimeUnit::Beats, project.tempo));
-					event.set_property ("length", convert_time (Time (note.duration, clip.offset.unit), TimeUnit::Beats, project.tempo));
+					double start = timing.content (Time (note.time, clip.offset.unit), clip.position, clip.offset, TimeUnit::Beats);
+					double stop = timing.content (Time (note.time + note.duration, clip.offset.unit), clip.position, clip.offset, TimeUnit::Beats);
+					event.set_property ("time", start);
+					event.set_property ("length", stop - start);
 					event.set_property ("key", note.key);
 					event.set_property ("channel", note.channel);
 					event.set_property ("velocity", int (std::max (1.0, std::round (note.velocity * 127))));
@@ -965,10 +1085,11 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 	for (auto const& marker : project.markers) {
 		XMLNode& item = *root.add_child ("Marker");
 		item.set_property ("name", marker.name);
-		item.set_property ("time", convert_time (marker.position, TimeUnit::Beats, project.tempo));
-		duration = std::max (duration, convert_time (marker.position, TimeUnit::Seconds, project.tempo));
+		item.set_property ("time", timing.convert (marker.position, TimeUnit::Beats));
+		duration = std::max (duration, timing.convert (marker.position, TimeUnit::Seconds));
 	}
 	root.set_property ("duration", duration);
+	root.set_property ("durationBeats", timing.convert (Time (duration, TimeUnit::Seconds), TimeUnit::Beats));
 	std::string path = Glib::build_filename (stage.path, "manifest.xml");
 	if (!manifest.write (path)) { throw ExchangeError ("Cannot write AAF/MIDI export manifest"); }
 	run_logic_writer (path, output, cancel);
