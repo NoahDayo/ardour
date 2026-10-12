@@ -186,6 +186,19 @@ mkdir -p $DESTDIR/lib/gtk-2.0/engines
 cp build/libs/clearlooks-newer/clearlooks.dll $DESTDIR/lib/gtk-2.0/engines/libclearlooks.la
 
 cp $PREFIX/bin/*.dll $DESTDIR/bin/
+# GSubprocess launches these on Windows; DLL import scanning cannot discover them.
+# Use the helpers from the same dependency prefix as the bundled GLib libraries.
+spawn_helpers_found=false
+for spawn_helper in "$PREFIX"/bin/gspawn-*-helper*.exe; do
+	if test -f "$spawn_helper"; then
+		cp "$spawn_helper" "$DESTDIR/bin/"
+		spawn_helpers_found=true
+	fi
+done
+if ! $spawn_helpers_found; then
+	echo "Missing GLib process helpers in $PREFIX/bin" >&2
+	exit 1
+fi
 cp $PREFIX/bin/*.yes $DESTDIR/bin/ || true
 cp $PREFIX/lib/*.dll $DESTDIR/bin/
 # special case libportaudio (wasapi), old stack has no wasapi and hence no .xp

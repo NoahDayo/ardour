@@ -3,6 +3,8 @@
 
 Example: --destination PACKAGE/lib/ardour9/project-exchange --cache BUILD/downloads
 Dependencies are pinned, hash-checked, and isolated from the user's Python.
+The enclosing app also needs its matching GLib gspawn helper executables in
+the application bin directory, as bundled by tools/x-win/package.sh.
 """
 import argparse
 import hashlib
