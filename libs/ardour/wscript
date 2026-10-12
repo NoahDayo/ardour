@@ -187,6 +187,7 @@ libardour_sources = [
         'processor.cc',
         'project_archive.cc',
         'project_exchange.cc',
+        'project_session.cc',
         'quantize.cc',
         'rc_configuration.cc',
         'readable.cc',
@@ -652,6 +653,7 @@ def build(bld):
             create_ardour_test_program(bld, obj.includes, 'unit-test-mtdm', 'test_mtdm', ['test/mtdm_test.cc'])
             create_ardour_test_program(bld, obj.includes, 'unit-test-sha1', 'test_sha1', ['test/sha1_test.cc'])
             create_ardour_test_program(bld, obj.includes, 'unit-test-session', 'test_session', ['test/session_test.cc'])
+            create_ardour_test_program(bld, obj.includes, 'unit-test-project-session', 'test_project_session', ['test/project_session_test.cc'])
             create_ardour_test_program(bld, obj.includes, 'unit-test-dsp_load_calculator', 'test_dsp_load_calculator', ['test/dsp_load_calculator_test.cc'])
 
         test_sources  = [
@@ -674,6 +676,7 @@ def build(bld):
             'test/mtdm_test.cc',
             'test/sha1_test.cc',
             'test/session_test.cc',
+            'test/project_session_test.cc',
         ]
 
 # Tests that don't work
@@ -739,7 +742,7 @@ def create_ardour_test_program(bld, includes, name, target, sources):
     testobj.includes     = includes + ['test', '../pbd', '..']
     testobj.source       = sources
     testobj.uselib       = ['CPPUNIT','SIGCPP','GLIBMM','GTHREAD', 'FFTW3F', 'OSX', 'USB',
-                            'SAMPLERATE','XML','LRDF','COREAUDIO','TAGLIB','VAMPSDK','VAMPHOSTSDK','RUBBERBAND']
+                            'SAMPLERATE','SNDFILE','XML','LRDF','COREAUDIO','TAGLIB','VAMPSDK','VAMPHOSTSDK','RUBBERBAND']
     testobj.use          = [ 'testcommon' ]
     testobj.name         = name
     testobj.target       = target

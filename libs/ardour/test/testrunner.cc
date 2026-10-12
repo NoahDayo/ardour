@@ -1,4 +1,8 @@
 #include <getopt.h>
+#ifdef PLATFORM_WINDOWS
+#include <cstdlib>
+#include <windows.h>
+#endif
 
 #include <cppunit/CompilerOutputter.h>
 #include <cppunit/extensions/TestFactoryRegistry.h>
@@ -18,6 +22,13 @@ static const char* localedir = LOCALEDIR;
 int
 main(int argc, char* argv[])
 {
+#ifdef PLATFORM_WINDOWS
+	/* Unattended tests must exit on a native assertion, not hold DLLs open
+	 * while waiting for an invisible Windows crash dialog. */
+	SetErrorMode (SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+	_set_error_mode (_OUT_TO_STDERR);
+	_set_abort_behavior (0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
 	const struct option longopts[] = {
 		{ "debug", 1, 0, 'D' },
 		{ 0, 0, 0, 0 }
