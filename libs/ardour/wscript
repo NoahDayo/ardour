@@ -192,6 +192,7 @@ libardour_sources = [
         'project_midi.cc',
         'logic_project.cc',
         'studio_one_song.cc',
+        'studio_one_song_writer.cc',
         'quantize.cc',
         'rc_configuration.cc',
         'readable.cc',

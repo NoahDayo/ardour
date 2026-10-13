@@ -13,6 +13,7 @@ import tempfile
 import unittest
 import wave
 import zipfile
+import xml.etree.ElementTree as ET
 
 
 def ubj(value):
@@ -25,6 +26,40 @@ def ubj(value):
     if isinstance(value, str):
         return b"S" + ubj(len(value.encode())) + value.encode()
     return b"D" + struct.pack(">d", value)
+
+
+def unpack_music(data):
+    stream = io.BytesIO(data)
+
+    def value(marker=None):
+        marker = marker or stream.read(1)
+        if marker == b"i":
+            return struct.unpack("b", stream.read(1))[0]
+        if marker == b"D":
+            return struct.unpack(">d", stream.read(8))[0]
+        if marker == b"{":
+            result = {}
+            while True:
+                lead = stream.read(1)
+                if lead == b"}":
+                    return result
+                key = stream.read(value(lead)).decode("utf-8")
+                if key in result:
+                    raise ValueError("Duplicate UBJSON key")
+                result[key] = value()
+        if marker == b"[":
+            result = []
+            while True:
+                lead = stream.read(1)
+                if lead == b"]":
+                    return result
+                result.append(value(lead))
+        raise ValueError(f"Unexpected UBJSON marker {marker!r}")
+
+    result = value()
+    if stream.read():
+        raise ValueError("Trailing UBJSON data")
+    return result
 
 
 META = '''<MetaInformation>
@@ -288,6 +323,137 @@ class NativeSongTest(unittest.TestCase):
         self.assertFalse(any(d["disposition"] == 3 for d in self.read()["project"]["report"]))
         self.entries["pan.envelopex"] = ubj({"bipolar": 1, "events": [{"time": 0., "value": .5}]})
         self.assertTrue(any(d["disposition"] == 3 for d in self.read()["project"]["report"]))
+
+    def writable_fixture(self):
+        self.entries["Performances/notes.musicx"] = ubj({"timeFormat": 2, "events": [
+            {"start": 1.25, "length": .5, "pitch": 60, "velocity": .75},
+            {"start": 2., "length": 1., "pitch": 67, "velocity": .5}], "envelopes": []})
+
+    def export(self, status=0, cancel=False, published=None):
+        self.save()
+        output = self.root / "Export.song"
+        command = [self.probe, "cancel-song" if cancel else "repack-song", str(self.song), str(output)]
+        if published:
+            command.append(str(published))
+        result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=20)
+        self.assertEqual(result.returncode, status, result.stderr)
+        return output, result.stderr
+
+    def native_xml(self, archive, name):
+        # Studio Pro's on-disk schema uses literal, unbound x:id names.
+        return ET.fromstring(archive.read(name).decode("utf-8-sig").replace("x:id=", "id="))
+
+    def test_native_writer_archive_and_independent_midi(self):
+        self.writable_fixture()
+        self.entries["Song/song.xml"] = SONG.replace('name="Audio"', 'name="Audio &amp; \u03a9"')
+        output, _ = self.export()
+        with zipfile.ZipFile(output) as archive:
+            self.assertIsNone(archive.testzip())
+            metadata = {a.get("id"): a.get("value") for a in self.native_xml(archive, "metainfo.xml")}
+            self.assertEqual(metadata["Document:FormatVersion"], "9")
+            self.assertEqual(metadata["Media:TrackCount"], "2")
+            root = self.native_xml(archive, "Song/song.xml").find("Attributes[@id='Root']")
+            tracks = root.findall("List[@id='Tracks']/MediaTrack")
+            self.assertEqual([t.get("mediaType") for t in tracks], ["Audio", "Music"])
+            self.assertEqual(tracks[0].get("name"), "Audio & \u03a9")
+            self.assertEqual(tracks[0].get("tempoFollow"), "0")
+            mixer = self.native_xml(archive, "Devices/audiomixer.xml")
+            main = mixer.find(".//AudioOutputChannel/UID").get("uid")
+            audio = mixer.find(".//AudioTrackChannel")
+            self.assertEqual(audio.find("Connection").get("objectID"), main + "/Input")
+            self.assertEqual(tracks[0].find("UID").get("uid"), audio.find("UID").get("uid"))
+            self.assertRegex(main, r"^\{[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}\}$")
+            pool = self.native_xml(archive, "Song/mediapool.xml")
+            info = pool.find(".//AudioClip/Attributes[@id='format']")
+            self.assertEqual((info.get("bitDepth"), info.get("frameCount"), info.get("sampleRate")), ("16", "192000", "48000"))
+            clip_id = tracks[0].find("List/AudioEvent").get("clipID")
+            self.assertEqual(clip_id, pool.find(".//AudioClip").get("mediaID"))
+            music_name = pool.find(".//MusicClip/Url").get("url").removeprefix("media:///")
+            music = unpack_music(archive.read(music_name))
+            self.assertEqual(music, {"timeFormat": 2, "events": [
+                {"start": 1.25, "length": .5, "pitch": 60, "velocity": .75},
+                {"start": 2., "length": 1., "pitch": 67, "velocity": .5}], "envelopes": []})
+
+    def test_native_writer_roundtrip_timing_fades_and_mixer(self):
+        self.writable_fixture()
+        self.entries["Song/song.xml"] = (SONG.replace('</TempoMap>', '<TempoMapSegment start="8" tempo="0.75"/></TempoMap>')
+            .replace('</TimeSignatureMap>', '<TimeSignatureMapSegment start="8" numerator="7" denominator="8"/></TimeSignatureMap>')
+            .replace('offset="0.25" timeFormat="0"/>', 'offset="0.25" timeFormat="0" gain="0.5" mute="1"><Attributes x:id="volumeCurve" fadeIn.length="0.125" fadeOut.length="0.25"/></AudioEvent>'))
+        before = self.read()
+        output, _ = self.export()
+        after = self.read(path=output)
+        for key in ("tempos", "meters", "markers"):
+            self.assertEqual(before["project"][key], after["project"][key])
+        for a, b in zip(before["project"]["tracks"], after["project"]["tracks"]):
+            for key in ("name", "kind", "channels", "master", "mute", "solo", "volume", "pan"):
+                self.assertEqual(a[key], b[key], key)
+            for left, right in zip(a["clips"], b["clips"]):
+                for key in ("position", "offset", "duration", "enabled", "gain", "envelope", "notes"):
+                    self.assertEqual(left[key], right[key], key)
+        self.assertEqual(after["start"], [0, "seconds"])
+        self.assertEqual(after["end"], [22, "seconds"])
+
+    def test_native_writer_published_paths_and_relocation(self):
+        self.writable_fixture()
+        final = self.root / "Final with spaces" / "Published.song"
+        output, _ = self.export(published=final)
+        with zipfile.ZipFile(output) as archive:
+            pool = self.native_xml(archive, "Song/mediapool.xml")
+            self.assertEqual(pool.find("Attributes[@id='documentPath']").get("url"), final.as_uri())
+            self.assertEqual(pool.find(".//AudioClip/Url").get("url"), (final.parent / "Media/tone.wav").as_uri())
+        final.parent.mkdir()
+        shutil.move(output, final)
+        shutil.move(self.root / "Media", final.parent / "Media")
+        after = self.read(path=final)
+        self.assertEqual(len(after["project"]["tracks"]), 3)
+        self.assertFalse(any(d["disposition"] == 3 for d in after["project"]["report"]))
+
+    def test_native_writer_cancel_and_existing_destination(self):
+        self.writable_fixture()
+        output, error = self.export(status=1, cancel=True)
+        self.assertIn("cancelled", error)
+        self.assertFalse(output.exists())
+        self.assertFalse(list(self.root.glob("Export.song.part-*")))
+        output.write_bytes(b"keep this file")
+        self.export(status=1)
+        self.assertEqual(output.read_bytes(), b"keep this file")
+        self.assertFalse(list(self.root.glob("Export.song.part-*")))
+
+    def test_native_writer_unverified_note_semantics_refused(self):
+        for parameter, value in (("channel", 2), ("releaseVelocity", .25)):
+            self.entries["Performances/notes.musicx"] = ubj({"events": [{"pitch": 60, "length": 1, parameter: value}], "envelopes": []})
+            output, error = self.export(status=1)
+            self.assertIn("Per-note MIDI channels", error)
+            self.assertFalse(output.exists())
+
+    def test_native_writer_rejects_inconsistent_collected_audio(self):
+        self.writable_fixture()
+        self.entries["Song/mediapool.xml"] = self.entries["Song/mediapool.xml"].replace('frameCount="192000"', 'frameCount="192001"')
+        output, error = self.export(status=1)
+        self.assertIn("metadata", error)
+        self.assertFalse(output.exists())
+
+    def test_native_writer_real_application_source(self):
+        sample = os.environ.get("ARDOUR_STUDIO_ONE_EXPORT_TEST_SONG")
+        if not sample:
+            self.skipTest("Actual native application source is supplied privately")
+        source = Path(sample)
+        copied = self.root / "Application source"
+        copied.mkdir()
+        shutil.copy2(source, copied / source.name)
+        shutil.copytree(source.parent / "Media", copied / "Media")
+        before = self.read(path=copied / source.name)
+        output = copied / "Export.song"
+        result = subprocess.run([self.probe, "repack-song", str(copied / source.name), str(output)], capture_output=True, text=True, encoding="utf-8", timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        after = self.read(path=output)
+        self.assertEqual(len(before["project"]["tracks"]), len(after["project"]["tracks"]))
+        for a, b in zip(before["project"]["tracks"], after["project"]["tracks"]):
+            self.assertEqual(a["name"], b["name"])
+            self.assertEqual(len(a["clips"]), len(b["clips"]))
+            for left, right in zip(a["clips"], b["clips"]):
+                for key in ("position", "offset", "duration", "notes", "gain", "enabled"):
+                    self.assertEqual(left[key], right[key], key)
 
 
 if __name__ == "__main__":

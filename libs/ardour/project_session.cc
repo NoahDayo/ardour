@@ -1599,4 +1599,45 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 	stage.published.clear ();
 }
 
+void
+SessionExchange::export_studio_one (Session& session, const std::string& destination, std::vector<Diagnostic>& report, const ExportOptions& options, CancelCheck cancel)
+{
+	report.clear ();
+	if (session.transport_rolling () || session.actively_recording ()) { throw ExchangeError ("Stop playback and recording before exporting a project"); }
+	if (!Glib::path_is_absolute (destination)) { throw ExchangeError ("Export destination must be absolute"); }
+	FileObject target = file_object (destination);
+	if (g_file_query_exists (target.get (), NULL)) { throw ExchangeError ("Export destination already exists"); }
+	cancelled (cancel); AudioAssets assets; StudioOneSongData song;
+	song.project = options.render_mix ? collect_mix (session, options) : collect (session, assets, cancel);
+	song.title = session.name (); song.sample_rate = session.sample_rate ();
+	song.has_range = true;
+	song.start = Time (options.render_mix ? 0 : double (session.current_start_sample ()) / session.sample_rate (), TimeUnit::Seconds);
+	song.end = Time (options.render_mix ? song.project.media.front ().duration : double (session.current_end_sample ()) / session.sample_rate (), TimeUnit::Seconds);
+	report = StudioOneSong::export_report (song.project);
+	for (auto const& item : report) { if (item.disposition == Disposition::Unsupported) { throw ExchangeError (item.object + ": " + item.detail); } }
+	OwnedDirectory stage (Glib::path_get_dirname (destination));
+	std::string output = Glib::build_filename (stage.path, "session"), media_directory = Glib::build_filename (output, "Media");
+	if (g_mkdir (output.c_str (), 0700) || g_mkdir (media_directory.c_str (), 0700)) { throw ExchangeError ("Cannot create native song staging folder"); }
+	if (options.render_mix) {
+		try {
+			auto mix = render_session_mix (session, stage.path, samples (song.project.media.front ().duration, session.sample_rate ()), cancel);
+			std::string path = Glib::build_filename (media_directory, "mix.wav");
+			if (g_rename (mix.path.c_str (), path.c_str ())) { throw ExchangeError ("Cannot collect rendered native song audio"); }
+			song.audio_files[song.project.media.front ().id] = path;
+		} catch (RenderShutdownFailed const&) { stage.retained = true; throw; }
+	} else {
+		for (size_t i = 0; i < song.project.media.size (); ++i) {
+			cancelled (cancel); auto const& media = song.project.media[i];
+			std::string path = Glib::build_filename (media_directory, "source-" + std::to_string (i + 1) + ".wav");
+			write_audio (assets.at (media.id), path, cancel); song.audio_files[media.id] = path;
+		}
+	}
+	std::string filename = Glib::build_filename (output, "Project.song");
+	StudioOneSong::write (song, filename, Glib::build_filename (destination, "Project.song"), cancel);
+	/* Enforce the reader's structural limits before publishing a native folder. */
+	auto verified = StudioOneSong::read (filename, cancel);
+	if (has_unsupported_features (verified.project)) { throw ExchangeError ("The generated native song contains unsupported data"); }
+	cancelled (cancel); stage.publish (destination); stage.published.clear ();
+}
+
 } }

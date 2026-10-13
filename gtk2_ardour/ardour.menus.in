@@ -37,6 +37,7 @@
         <menuitem action='ExportVideo'/>
         <menuitem action='ExportDAWproject'/>
         <menuitem action='ExportLogicProject'/>
+        <menuitem action='ExportStudioOneSong'/>
       </menu>
 
       <separator/>

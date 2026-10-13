@@ -484,8 +484,11 @@ StudioOneSongData Reader::read ()
 	require (metadata["Document:MimeType"] == "application/x.presonus-song", "This file is not a Studio One song");
 	require (metadata["Document:FormatVersion"] == "9", "This Studio One native format version has not yet been validated (supported: 9)");
 	result.project.application = "Studio One / Studio Pro"; result.project.application_version = metadata["Document:Generator"];
+	result.title = metadata["Document:Title"];
 	Node song = document ("Song/song.xml", "Song"); Node root_node = child (song, "Attributes", "Root"); require (root_node, "Native song has no arrangement");
 	Node context = child (root_node, "Attributes", "timeContext"); require (context, "Native song has no time context");
+	result.sample_rate = integer (context, "sampleRate", 48000);
+	require (result.sample_rate >= 8000 && result.sample_rate <= 768000, "Invalid native song sample rate");
 	transport (context);
 	Node media = document ("Song/mediapool.xml", "MediaPool");
 	std::string original = url_path (value (child (media, "Attributes", "documentPath"), "url"));

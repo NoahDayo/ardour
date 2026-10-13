@@ -178,6 +178,20 @@ static int run (const std::vector<std::string>& args)
 			for (auto const& marker : song.markers) { if (!first) { std::cout << ','; } first = false; std::cout << "["; quoted (marker.name); std::cout << ','; time_json (marker.position); std::cout << ']'; }
 			std::cout << "]}\n";
 		}
+		else if ((args[1] == "repack-song" || args[1] == "cancel-song") && (args.size () == 4 || args.size () == 5)) {
+			auto song = StudioOneSong::read (args[2]);
+			CancelCheck cancel;
+			if (args[1] == "cancel-song") {
+				gchar* directory = g_path_get_dirname (args[3].c_str ()); gchar* basename = g_path_get_basename (args[3].c_str ());
+				std::string parent (directory), prefix = std::string (basename) + ".part-"; g_free (directory); g_free (basename);
+				cancel = [parent, prefix] {
+					GDir* dir = g_dir_open (parent.c_str (), 0, nullptr); bool found = false;
+					if (dir) { while (const char* name = g_dir_read_name (dir)) { if (std::string (name).compare (0, prefix.size (), prefix) == 0) { found = true; break; } } g_dir_close (dir); }
+					return found;
+				};
+			}
+			StudioOneSong::write (song, args[3], args.size () == 5 ? args[4] : args[3], cancel);
+		}
 		else if (args[1] == "rewrite" && args.size () == 4) {
 			std::string xml = DawProject::write_xml (DawProject::parse_xml (read_text (args[2])));
 			if (!g_file_set_contents (args[3].c_str (), xml.c_str (), xml.size (), NULL)) { throw ExchangeError ("Cannot write test file"); }

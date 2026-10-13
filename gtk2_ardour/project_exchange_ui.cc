@@ -323,13 +323,17 @@ bool ProjectExchangeUI::import_prepared (Gtk::Window* parent, ImportRequest cons
 	return false;
 }
 
-static void export_project (Gtk::Window* parent, bool logic)
+enum class ExportKind { DawProject, Logic, StudioOne };
+
+static void export_project (Gtk::Window* parent, ExportKind kind)
 {
 	ARDOUR_UI& ui = *ARDOUR_UI::instance ();
 	ARDOUR::Session* session = ui.the_session ();
 	if (!parent || !session || exchange_active || ui.session_load_in_progress) { return; }
 	PBD::Unwinder<bool> active (exchange_active, true);
-	std::string title = logic ? _("Export AAF + MIDI to a new folder") : _("Export DAWproject");
+	const bool dawproject = kind == ExportKind::DawProject;
+	const bool native = kind == ExportKind::StudioOne;
+	std::string title = native ? _("Export Studio One song to a new folder (Experimental)") : dawproject ? _("Export DAWproject") : _("Export AAF + MIDI to a new folder");
 	if (session->transport_rolling () || session->actively_recording ()) {
 		show_report (*parent, title, _("Stop playback and recording before exporting a project."));
 		return;
@@ -338,13 +342,17 @@ static void export_project (Gtk::Window* parent, bool logic)
 	Gtkmm2ext::add_volume_shortcuts (dialog);
 	dialog.add_button (Gtk::Stock::CANCEL, Gtk::RESPONSE_CANCEL);
 	dialog.add_button (_("Export"), Gtk::RESPONSE_ACCEPT);
-	dialog.set_current_name (session->name () + (logic ? " AAF-MIDI" : ".dawproject"));
+	dialog.set_current_name (session->name () + (native ? " Studio One" : dawproject ? ".dawproject" : " AAF-MIDI"));
 	dialog.set_current_folder (Glib::path_get_dirname (session->path ()));
 	Gtk::FileFilter filter;
-	filter.set_name (logic ? _("All files and folders") : _("DAWproject files"));
-	filter.add_pattern (logic ? "*" : "*.dawproject");
+	filter.set_name (dawproject ? _("DAWproject files") : _("All files and folders"));
+	filter.add_pattern (dawproject ? "*.dawproject" : "*");
 	dialog.add_filter (filter);
 	Gtk::VBox options_box (false, 8);
+	Gtk::Label native_hint (_("Creates Project.song and a Media folder. Opening and playback in Studio One / Studio Pro have not yet been verified. Keep the complete folder together."));
+	native_hint.set_line_wrap (true);
+	native_hint.set_alignment (0, 0.5);
+	if (native) { options_box.pack_start (native_hint, false, false); }
 	Gtk::CheckButton render_mix (_("Render current mix as one stereo audio track"));
 	Gtk::Label render_hint (_("Includes instruments, effects, automation, routing, mute and solo. Individual tracks and MIDI notes become audio. Renders from timeline zero through session end, plus the extra time below. Content within that extra time is included too."));
 	render_hint.set_line_wrap (true);
@@ -371,10 +379,10 @@ static void export_project (Gtk::Window* parent, bool logic)
 	options.render_mix = render_mix.get_active ();
 	options.render_tail_seconds = tail.get_value ();
 	dialog.hide ();
-	if (!logic && (destination.size () < 11 || g_ascii_strcasecmp (destination.c_str () + destination.size () - 11, ".dawproject"))) { destination += ".dawproject"; }
+	if (dawproject && (destination.size () < 11 || g_ascii_strcasecmp (destination.c_str () + destination.size () - 11, ".dawproject"))) { destination += ".dawproject"; }
 	std::vector<PX::Diagnostic> report;
 	try {
-		ExchangeProgress progress (*parent, logic ? _("Exporting AAF + MIDI") : _("Exporting DAWproject"), options.render_mix);
+		ExchangeProgress progress (*parent, native ? _("Exporting Studio One song") : dawproject ? _("Exporting DAWproject") : _("Exporting AAF + MIDI"), options.render_mix);
 		if (ui.the_session () != session) { throw PX::ExchangeError (_("The session changed. Choose the project to export again.")); }
 		auto check = [&] {
 			bool cancelled = progress.check ();
@@ -384,8 +392,9 @@ static void export_project (Gtk::Window* parent, bool logic)
 			}
 			return cancelled;
 		};
-		if (logic) { PX::SessionExchange::export_logic (*session, destination, report, options, check); }
-		else { PX::SessionExchange::export_dawproject (*session, destination, report, options, check); }
+		if (native) { PX::SessionExchange::export_studio_one (*session, destination, report, options, check); }
+		else if (dawproject) { PX::SessionExchange::export_dawproject (*session, destination, report, options, check); }
+		else { PX::SessionExchange::export_logic (*session, destination, report, options, check); }
 	} catch (PX::ArchiveCancelled const&) {
 		show_report (*parent, _("Export cancelled"), _("No project was created."));
 		return;
@@ -399,8 +408,9 @@ static void export_project (Gtk::Window* parent, bool logic)
 		show_report (*parent, _("Project not exported"), _("An unexpected error occurred while exporting the project."));
 		return;
 	}
-	show_report (*parent, logic ? _("AAF + MIDI exported") : _("DAWproject exported"), _("Project saved to:") + std::string ("\n") + destination, report);
+	show_report (*parent, native ? _("Studio One song exported") : dawproject ? _("DAWproject exported") : _("AAF + MIDI exported"), _("Project saved to:") + std::string ("\n") + destination, report);
 }
 
-void ProjectExchangeUI::export_dawproject (Gtk::Window* parent) { export_project (parent, false); }
-void ProjectExchangeUI::export_logic (Gtk::Window* parent) { export_project (parent, true); }
+void ProjectExchangeUI::export_dawproject (Gtk::Window* parent) { export_project (parent, ExportKind::DawProject); }
+void ProjectExchangeUI::export_logic (Gtk::Window* parent) { export_project (parent, ExportKind::Logic); }
+void ProjectExchangeUI::export_studio_one (Gtk::Window* parent) { export_project (parent, ExportKind::StudioOne); }

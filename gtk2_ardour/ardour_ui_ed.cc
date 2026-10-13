@@ -296,6 +296,11 @@ ARDOUR_UI::install_actions ()
 	ActionManager::session_sensitive_actions.push_back (act);
 	ActionManager::rec_sensitive_actions.push_back (act);
 
+	act = ActionManager::register_action (main_actions, X_("ExportStudioOneSong"), _("Export Studio One Song (Experimental)..."),
+	                                      sigc::bind (sigc::ptr_fun (&ProjectExchangeUI::export_studio_one), (Gtk::Window*) &_main_window));
+	ActionManager::session_sensitive_actions.push_back (act);
+	ActionManager::rec_sensitive_actions.push_back (act);
+
 	act = ActionManager::register_action (main_actions, X_("FlushWastebasket"), _("Flush Wastebasket"),  sigc::mem_fun (*(ARDOUR_UI::instance()), &ARDOUR_UI::flush_trash));
 
 	act = ActionManager::register_action (main_actions, X_("PrintKeyBindings"), _("Print Keyboard Shortcuts"),  sigc::ptr_fun (&KeyEditor::print));

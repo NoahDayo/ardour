@@ -49,6 +49,10 @@ public:
 	                          std::vector<Diagnostic>& report, CancelCheck = CancelCheck ());
 	static void export_logic (Session&, const std::string& destination,
 	                          std::vector<Diagnostic>& report, const ExportOptions&, CancelCheck = CancelCheck ());
+	/* A new portable folder with Project.song and collected Media. Native
+	 * format version 9 is experimental pending target-application validation. */
+	static void export_studio_one (Session&, const std::string& destination,
+	                               std::vector<Diagnostic>& report, const ExportOptions&, CancelCheck = CancelCheck ());
 };
 
 } }

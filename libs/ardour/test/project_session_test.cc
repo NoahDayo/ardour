@@ -482,6 +482,9 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (native_song_import);
 	CPPUNIT_TEST (native_song_timing_and_gain);
 	CPPUNIT_TEST (native_song_fades);
+	CPPUNIT_TEST (native_song_export_roundtrip);
+	CPPUNIT_TEST (native_song_export_guards);
+	CPPUNIT_TEST (native_song_render_export);
 	CPPUNIT_TEST (bus_sends_roundtrip);
 	CPPUNIT_TEST (native_song_cancel);
 	CPPUNIT_TEST (native_song_unsupported);
@@ -514,6 +517,9 @@ public:
 	void native_song_import ();
 	void native_song_timing_and_gain ();
 	void native_song_fades ();
+	void native_song_export_roundtrip ();
+	void native_song_export_guards ();
+	void native_song_render_export ();
 	void bus_sends_roundtrip ();
 	void native_song_cancel ();
 	void native_song_unsupported ();
@@ -532,6 +538,113 @@ public:
 };
 
 CPPUNIT_TEST_SUITE_REGISTRATION (ProjectSessionTest);
+
+void ProjectSessionTest::native_song_export_roundtrip ()
+{
+	Fixture fixture; auto input = example (fixture);
+	input.tracks.erase (input.tracks.begin () + 1);
+	for (auto& track : input.tracks) {
+		track.parent.clear (); if (!track.master) { track.destination = "master"; }
+		for (auto& clip : track.clips) { for (auto& note : clip.notes) { note.channel = 0; note.release_velocity = 64.0 / 127; } }
+	}
+	input.tempos = {{PX::Time (0), 100, false}, {PX::Time (3), 120, false}};
+	input.meters = {{PX::Time (0), 3, 4}, {PX::Time (3), 5, 8}};
+	input.markers.push_back ({"Verse", PX::Time (6)});
+	auto& clip = input.tracks[1].clips[0]; clip.gain = .5;
+	clip.envelope.unit = PX::TimeUnit::Seconds;
+	clip.envelope.points = {{0, 0, true}, {.125, 1, true}, {.375, 1, true}, {.5, 0, true}};
+	package (fixture, input);
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"), fixture.path ("NativeSource"), "NativeSource", fixture.report);
+	const unsigned rate = fixture.session->sample_rate ();
+	fixture.session->set_session_extents (Temporal::timepos_t (samplepos_t (rate / 2)), Temporal::timepos_t (samplepos_t (6 * rate)));
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	const std::string saved = Glib::file_get_contents (fixture.path ("NativeSource/NativeSource.ardour"));
+	PX::SessionExchange::ExportOptions options;
+	PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("Exported Song"), fixture.report, options);
+	CPPUNIT_ASSERT_EQUAL (saved, Glib::file_get_contents (fixture.path ("NativeSource/NativeSource.ardour")));
+	CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
+	CPPUNIT_ASSERT (!fixture.session->dirty ());
+	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& d) { return d.detail.find ("Experimental") != std::string::npos; }));
+	CPPUNIT_ASSERT_EQUAL (0, g_unlink (fixture.path ("input.dawproject").c_str ()));
+	CPPUNIT_ASSERT_EQUAL (0, g_unlink (fixture.path ("source.wav").c_str ()));
+	CPPUNIT_ASSERT_EQUAL (0, g_rename (fixture.path ("Exported Song").c_str (), fixture.path ("Moved Song").c_str ()));
+	auto output = PX::StudioOneSong::read (fixture.path ("Moved Song/Project.song"));
+	CPPUNIT_ASSERT_EQUAL (std::string ("NativeSource"), output.title);
+	CPPUNIT_ASSERT_EQUAL (rate, output.sample_rate);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.5, output.start.value, 1.0 / rate); CPPUNIT_ASSERT_DOUBLES_EQUAL (6, output.end.value, 1.0 / rate);
+	CPPUNIT_ASSERT_EQUAL (size_t (2), output.project.tempos.size ()); CPPUNIT_ASSERT_EQUAL (size_t (2), output.project.meters.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (1), output.project.markers.size ());
+	auto pcm = read_rendered_pcm (output.audio_files.at (output.project.media.front ().id), 2 * rate, rate);
+	for (size_t i = 0; i < pcm.size () / 2; ++i) {
+		CPPUNIT_ASSERT_EQUAL (float (int (i % 37) - 18) / 32, pcm[2 * i]);
+		CPPUNIT_ASSERT_EQUAL (float (int (i % 61) - 30) / 64, pcm[2 * i + 1]);
+	}
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_studio_one (*AudioEngine::instance (), fixture.path ("Moved Song/Project.song"), fixture.path ("NativeReturn"), "NativeReturn", fixture.report);
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("NativeReturn"), "NativeReturn", nullptr, "", true));
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("returned.dawproject"));
+	auto returned = PX::DawProject::read (fixture.path ("returned.dawproject"));
+	auto const& audio = track_named (returned, "Stereo"); auto const& midi = track_named (returned, "Notes");
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.75, audio.volume, 1e-6); CPPUNIT_ASSERT_DOUBLES_EQUAL (.3, audio.pan, 1e-6);
+	CPPUNIT_ASSERT_EQUAL (std::string ("#12ab34"), audio.color);
+	CPPUNIT_ASSERT_EQUAL (size_t (2), audio.clips.size ()); CPPUNIT_ASSERT (!audio.clips[1].enabled);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (1.25, audio.clips[0].position.value, 1.0 / rate);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.375, audio.clips[0].offset.value, 1.0 / rate);
+	for (double at : {0.0, .0625, .125, .25, .4375, .499}) {
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (clip.gain * curve_value (clip.envelope, at), audio.clips[0].gain * curve_value (audio.clips[0].envelope, at), 1e-6);
+	}
+	CPPUNIT_ASSERT_EQUAL (size_t (1), midi.clips.size ()); CPPUNIT_ASSERT_EQUAL (size_t (2), midi.clips[0].notes.size ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (4, midi.clips[0].position.value, 1e-6); CPPUNIT_ASSERT_DOUBLES_EQUAL (1, midi.clips[0].offset.value, 1e-6);
+	for (size_t i = 0; i < 2; ++i) {
+		auto const& expected = input.tracks[2].clips[0].notes[i]; auto const& actual = midi.clips[0].notes[i];
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (expected.time, actual.time, 1e-6); CPPUNIT_ASSERT_DOUBLES_EQUAL (expected.duration, actual.duration, 1e-6);
+		CPPUNIT_ASSERT_EQUAL (expected.key, actual.key); CPPUNIT_ASSERT_EQUAL (expected.channel, actual.channel);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (expected.velocity, actual.velocity, 1e-6);
+	}
+	std::cout << "Native song audio/MIDI export, relocation and session reopen passed" << std::endl;
+}
+
+void ProjectSessionTest::native_song_export_guards ()
+{
+	Fixture fixture; native_package (fixture);
+	fixture.session = PX::SessionExchange::import_studio_one (*AudioEngine::instance (), fixture.path ("input.song"), fixture.path ("Native"), "Native", fixture.report);
+	PX::SessionExchange::ExportOptions options;
+	CPPUNIT_ASSERT_EQUAL (0, g_mkdir (fixture.path ("Existing").c_str (), 0700));
+	std::ofstream (fixture.path ("Existing/keep.txt")) << "keep";
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("Existing"), fixture.report, options), PX::ExchangeError);
+	CPPUNIT_ASSERT_EQUAL (std::string ("keep"), Glib::file_get_contents (fixture.path ("Existing/keep.txt")));
+	bool staged = false;
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("Cancelled"), fixture.report, options,
+		[&] { return staged = stages (fixture.root) != 0; }), PX::ArchiveCancelled);
+	CPPUNIT_ASSERT (staged); CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
+	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("Cancelled"), Glib::FILE_TEST_EXISTS));
+	{
+		auto route = fixture.session->route_by_name ("Native audio"); auto list = route->gain_control ()->alist ();
+		list->clear (); list->add (Temporal::timepos_t (samplepos_t (0)), .5); list->add (Temporal::timepos_t (samplepos_t (48000)), 1); list->set_automation_state (Play);
+	}
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("Unsupported"), fixture.report, options), PX::ExchangeError);
+	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& d) { return d.disposition == PX::Disposition::Unsupported; }));
+	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("Unsupported"), Glib::FILE_TEST_EXISTS)); CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
+	std::cout << "Native song cancellation, overwrite and unsupported-feature guards passed" << std::endl;
+}
+
+void ProjectSessionTest::native_song_render_export ()
+{
+	Fixture fixture; make_render_fixture (fixture); const unsigned rate = fixture.session->sample_rate ();
+	const samplecnt_t frames = fixture.session->current_end_sample () + 1024;
+	PX::SessionExchange::ExportOptions options; options.render_mix = true; options.render_tail_seconds = 1024.0 / rate;
+	RenderSourceState original (fixture);
+	PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("RenderedSong"), fixture.report, options);
+	original.check (fixture);
+	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& d) { return d.disposition == PX::Disposition::Rendered; }));
+	auto song = PX::StudioOneSong::read (fixture.path ("RenderedSong/Project.song"));
+	assert_render_model (song.project, frames, rate);
+	assert_graph_pcm (read_rendered_pcm (song.audio_files.at (song.project.media.front ().id), frames, rate), rate, 1e-6);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (0, song.start.value, 1e-9); CPPUNIT_ASSERT_DOUBLES_EQUAL (double (frames) / rate, song.end.value, 1.0 / rate);
+	std::cout << "Native song rendered master graph PCM and source restoration passed" << std::endl;
+}
 
 void ProjectSessionTest::render_mix_roundtrip ()
 {

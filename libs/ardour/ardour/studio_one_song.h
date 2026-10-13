@@ -14,6 +14,8 @@ using SongMarker = Marker;
  * song's directory, including after that directory has been relocated. */
 struct StudioOneSongData {
 	Project project;
+	std::string title;
+	unsigned sample_rate = 48000;
 	std::map<std::string, std::string> audio_files;
 	std::vector<SongMarker> markers;
 	Time start;
@@ -24,6 +26,12 @@ struct StudioOneSongData {
 class LIBARDOUR_API StudioOneSong {
 public:
 	static StudioOneSongData read (const std::string& filename, CancelCheck = CancelCheck ());
+	static std::vector<Diagnostic> export_report (const Project&);
+	/* Media must already be collected below filename's parent. document_path
+	 * is the final song filename after the caller publishes its staged folder;
+	 * this avoids putting temporary paths into the native document. */
+	static void write (const StudioOneSongData&, const std::string& filename,
+	                   const std::string& document_path, CancelCheck = CancelCheck ());
 };
 
 } }

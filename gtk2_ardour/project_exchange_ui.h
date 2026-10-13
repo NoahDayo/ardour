@@ -18,4 +18,5 @@ bool import_prepared (Gtk::Window*, ImportRequest const&, bool offer_session_dia
 void import_dawproject (Gtk::Window* parent);
 void export_dawproject (Gtk::Window* parent);
 void export_logic (Gtk::Window* parent);
+void export_studio_one (Gtk::Window* parent);
 }
