@@ -383,7 +383,8 @@ void make_render_fixture (Fixture& fixture, bool automated = false)
 	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"), fixture.path ("Render"), "Render", fixture.report);
 	{
 		auto route = std::dynamic_pointer_cast<ARDOUR::Track> (fixture.session->route_by_name ("Stereo")); CPPUNIT_ASSERT (route);
-		for (auto const& region : *route->playlist ()->region_list ()) {
+		auto regions = route->playlist ()->region_list ();
+		for (auto const& region : *regions) {
 			auto audio = std::dynamic_pointer_cast<AudioRegion> (region); CPPUNIT_ASSERT (audio);
 			audio->set_fade_in_active (false); audio->set_fade_out_active (false); audio->set_envelope_active (false);
 		}
