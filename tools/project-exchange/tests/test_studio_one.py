@@ -193,6 +193,37 @@ class NativeSongTest(unittest.TestCase):
                 self.entries["Song/song.xml"] = SONG.replace('name="Trimmed"', f'name="Trimmed" gain="{gain}"')
                 self.read(status=1)
 
+    def test_native_event_fade_lengths(self):
+        original = SONG
+        self.entries["Song/song.xml"] = original.replace(
+            'name="Trimmed" start="1" length="1" offset="0.25" timeFormat="0"/>',
+            'name="Trimmed" start="1" length="1" offset="0.25" timeFormat="0">'
+            '<Attributes x:id="volumeCurve" fadeIn.length="0.25" fadeOut.length="0.125"/></AudioEvent>')
+        project = self.read()["project"]
+        self.assertEqual(project["tracks"][0]["clips"][0]["envelope"],
+                         [[0, 0, True], [.25, 1, True], [.875, 1, True], [1, 0, True]])
+        self.assertTrue(any(d["disposition"] == 1 and "fade lengths" in d["detail"] for d in project["report"]))
+        self.assertFalse(any(d["disposition"] == 3 for d in project["report"]))
+        faded = self.entries["Song/song.xml"]
+        for bad in ('-0.1', '1.1', 'nan'):
+            with self.subTest(length=bad):
+                self.entries["Song/song.xml"] = faded.replace('fadeIn.length="0.25"', f'fadeIn.length="{bad}"')
+                self.read(status=1)
+        self.entries["Song/song.xml"] = faded.replace('fadeIn.length="0.25"', 'fadeIn.length="0.9"')
+        self.assertTrue(any(d["disposition"] == 3 and "Overlapping" in d["detail"] for d in self.read()["project"]["report"]))
+        self.entries["Song/song.xml"] = faded.replace('fadeIn.length="0.25"', 'fadeIn.length="0.25" shape="custom"')
+        self.assertTrue(any(d["disposition"] == 3 and "shape" in d["detail"] for d in self.read()["project"]["report"]))
+
+    def test_actual_studio_pro_edited_fade(self):
+        sample = os.environ.get("ARDOUR_STUDIO_PRO_FADE_TEST_PROJECT")
+        if not sample:
+            self.skipTest("Set ARDOUR_STUDIO_PRO_FADE_TEST_PROJECT to an app-saved .song with a simple fade")
+        project = self.read(path=Path(sample))["project"]
+        clips = [clip for track in project["tracks"] for clip in track["clips"] if clip["name"] == "Soft pulse"]
+        self.assertEqual(len(clips), 1)
+        self.assertEqual(clips[0]["envelope"], [[0, 0, True], [.875, 1, True]])
+        self.assertFalse(any(d["disposition"] == 3 for d in project["report"]))
+
     def test_invalid_transport_refused(self):
         changes = [
             ('start="0" tempo', 'start="1" tempo'),

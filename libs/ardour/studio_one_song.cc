@@ -390,12 +390,36 @@ void Reader::track (Node n)
 		std::string key = value (e, "clipID"); auto entry = pool.find (key); require (entry != pool.end (), "Native event references missing media");
 		if (midi) { require (is (entry->second, "MusicClip"), "Wrong native MIDI media type"); notes (c, entry->second); }
 		else { c.media = audio (key); c.gain = number (e, "gain", 1); }
+		if (Node curve = child (e, "Attributes", "volumeCurve")) {
+			attributes (curve, {"x:id", "id", "fadeIn.length", "fadeOut.length"}, c.name);
+			for (Node part : children (curve)) { unsupported (c.name, "Native event volume-curve content is not yet supported: " + std::string (reinterpret_cast<const char*> (part->name))); }
+			double fade_in = number (curve, "fadeIn.length"), fade_out = number (curve, "fadeOut.length");
+			require (fade_in >= 0 && fade_out >= 0, "Invalid native event fade length");
+			if (fade_in || fade_out) {
+				if (midi || c.position.unit != TimeUnit::Seconds) { unsupported (c.name, "Native event fades on MIDI or musical-time audio require an explicit conversion"); }
+				else {
+					double duration = c.duration; // This path accepts only second-timed audio events.
+					require (fade_in <= duration && fade_out <= duration, "Native event fade exceeds clip length");
+					if (fade_in + fade_out > duration) { unsupported (c.name, "Overlapping native event fades need an explicit conversion"); }
+					else {
+						c.envelope.unit = TimeUnit::Seconds;
+						c.envelope.points.push_back ({0, fade_in ? 0.0 : 1.0, true});
+						if (fade_in) { c.envelope.points.push_back ({fade_in, 1, true}); }
+						if (fade_out && duration - fade_out > fade_in) { c.envelope.points.push_back ({duration - fade_out, 1, true}); }
+						if (fade_out) { c.envelope.points.push_back ({duration, 0, true}); }
+						result.project.report.push_back ({Disposition::Transformed, c.name, "Native default event fade lengths converted to editable linear-amplitude clip envelope"});
+					}
+				}
+			}
+		}
 		for (const char* attr : {"transpose", "tune", "normalize", "modification", "velocity", "fadeIn", "fadeOut", "loop"}) {
 			if (number (e, attr)) { unsupported (c.name, "Native event processing is not yet supported: " + std::string (attr)); }
 		}
 		if (number (e, "speed", 1) != 1) { unsupported (c.name, "Event speed adjustment is not yet supported"); }
 		if (midi && number (e, "gain", 1) != 1) { unsupported (c.name, "MIDI event gain requires instrument rendering"); }
-		if (!children (e).empty ()) { unsupported (c.name, "Event envelopes, fades or other nested processing are not yet supported"); }
+		for (Node part : children (e)) {
+			if (!is (part, "Attributes") || id (part) != "volumeCurve") { unsupported (c.name, "Event envelopes or other nested processing are not yet supported"); }
+		}
 		t.clips.push_back (c);
 	}
 	if (t.kind == TrackKind::Audio && !t.clips.empty () && integer (n, "tempoFollow") == 2 &&

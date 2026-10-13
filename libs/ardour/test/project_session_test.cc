@@ -26,6 +26,7 @@
 #include "ardour/panner_shell.h"
 #include "ardour/pannable.h"
 #include "ardour/project_session.h"
+#include "ardour/studio_one_song.h"
 #include "ardour/recent_sessions.h"
 #include "ardour/session.h"
 #include "ardour/sndfileimportable.h"
@@ -138,7 +139,7 @@ void package (Fixture& fixture, const PX::Project& project, const std::string& n
 	PX::DawProject::write (project, fixture.path (name), {{"source", fixture.path ("source.wav")}});
 }
 
-void native_package (Fixture& fixture, bool processing = false, bool variable = false)
+void native_package (Fixture& fixture, bool processing = false, bool variable = false, bool fades = false)
 {
 	auto project = example (fixture);
 	auto uri = [] (const std::string& path) {
@@ -159,13 +160,16 @@ void native_package (Fixture& fixture, bool processing = false, bool variable = 
 <AudioEvent clipID="media" start="8" length="1" offset="0.375" timeFormat="2" gain="2" name="Loud"/>
 <AudioEvent clipID="media" start="10" length="1" offset="0.375" timeFormat="2" gain="0" name="Silent"/>)";
 	}
+	if (fades) {
+		events = R"(<AudioEvent clipID="media" start="1.25" length="0.5" offset="0.375" timeFormat="0" name="Faded clip"><Attributes x:id="volumeCurve" fadeIn.length="0.125" fadeOut.length="0.125"/></AudioEvent>)";
+	}
 	song.add_text ("Song/song.xml", std::string (R"(<Song><Attributes x:id="Root"><Attributes x:id="timeContext">)") + transport +
 	               R"(</Attributes><List x:id="Tracks"><MarkerTrack timeFormat="2"><MarkerEvent markerType="2")" +
 	               (variable ? R"( start="2.3" timeFormat="0")" : "") + R"(/><MarkerEvent markerType="3" start="12"/><MarkerEvent name="Verse" start="8"/></MarkerTrack>
 <MediaTrack trackID="audio" mediaType="Audio" name="Native audio" timeFormat="0" color="FF34AB12"><UID x:id="channelID" uid="channel"/>
 <List x:id="Events">)" + events + R"(</List></MediaTrack></List></Attributes></Song>)");
 	song.add_text ("Song/mediapool.xml", "<MediaPool><Attributes x:id=\"documentPath\" url=\"" + uri (fixture.path ("input.song")) + "\"/><AudioClip mediaID=\"media\"><Url x:id=\"path\" url=\"" + uri (fixture.path ("source.wav")) + "\"/><Attributes x:id=\"format\" sampleRate=\"" + std::to_string (project.media[0].sample_rate) + "\" numChannels=\"2\" frameCount=\"" + std::to_string (project.media[0].sample_rate * 2) + "\"/></AudioClip></MediaPool>");
-	song.add_text ("Devices/audiomixer.xml", std::string (R"(<AudioMixer><AudioTrackChannel gain="0.75" pan=")") + (variable ? "0.5" : "0.3") + R"("><UID x:id="uniqueID" uid="channel"/><Connection x:id="destination" objectID="master/Input"/></AudioTrackChannel><AudioOutputChannel label="Main"><UID x:id="uniqueID" uid="master"/></AudioOutputChannel></AudioMixer>)");
+	song.add_text ("Devices/audiomixer.xml", std::string (R"(<AudioMixer><AudioTrackChannel gain="0.75" pan=")") + (variable || fades ? "0.5" : "0.3") + R"("><UID x:id="uniqueID" uid="channel"/><Connection x:id="destination" objectID="master/Input"/></AudioTrackChannel><AudioOutputChannel label="Main"><UID x:id="uniqueID" uid="master"/></AudioOutputChannel></AudioMixer>)");
 	song.finish ();
 }
 
@@ -213,6 +217,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (reject_unmapped_processing);
 	CPPUNIT_TEST (native_song_import);
 	CPPUNIT_TEST (native_song_timing_and_gain);
+	CPPUNIT_TEST (native_song_fades);
 	CPPUNIT_TEST (bus_sends_roundtrip);
 	CPPUNIT_TEST (native_song_cancel);
 	CPPUNIT_TEST (native_song_unsupported);
@@ -240,6 +245,7 @@ public:
 	void reject_unmapped_processing ();
 	void native_song_import ();
 	void native_song_timing_and_gain ();
+	void native_song_fades ();
 	void bus_sends_roundtrip ();
 	void native_song_cancel ();
 	void native_song_unsupported ();
@@ -790,6 +796,58 @@ void ProjectSessionTest::native_song_timing_and_gain ()
 		                        : PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("native-steps.dawproject"), fixture.path (name), name, fixture.report);
 		reopen (name); check_audio ();
 		PX::SessionExchange::export_dawproject (*fixture.session, fixture.path (name + ".dawproject")); check_timing (name + ".dawproject");
+		AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	}
+}
+
+void ProjectSessionTest::native_song_fades ()
+{
+	Fixture fixture;
+	native_package (fixture, false, false, true);
+	auto parsed = PX::StudioOneSong::read (fixture.path ("input.song"));
+	auto const& original = track_named (parsed.project, "Native audio").clips.front ().envelope.points;
+	CPPUNIT_ASSERT_EQUAL (size_t (4), original.size ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (0, original[0].value, 1e-9);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.125, original[1].time, 1e-9);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (1, original[1].value, 1e-9);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.375, original[2].time, 1e-9);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.5, original[3].time, 1e-9);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (0, original[3].value, 1e-9);
+	CPPUNIT_ASSERT (!PX::has_unsupported_features (parsed.project));
+	fixture.session = PX::SessionExchange::import_studio_one (*AudioEngine::instance (), fixture.path ("input.song"), fixture.path ("NativeFade"), "NativeFade", fixture.report);
+	CPPUNIT_ASSERT_EQUAL (0, g_unlink (fixture.path ("input.song").c_str ()));
+	CPPUNIT_ASSERT_EQUAL (0, g_unlink (fixture.path ("source.wav").c_str ()));
+	auto check = [&] {
+		auto route = std::dynamic_pointer_cast<ARDOUR::Track> (fixture.session->route_by_name ("Native audio")); CPPUNIT_ASSERT (route);
+		auto regions = route->playlist ()->region_list (); CPPUNIT_ASSERT_EQUAL (size_t (1), regions->size ());
+		auto audio = std::dynamic_pointer_cast<AudioRegion> (*regions->begin ()); CPPUNIT_ASSERT (audio && audio->envelope_active ());
+		const samplecnt_t rate = fixture.session->sample_rate ();
+		const samplecnt_t fade = std::llround (.125 * rate);
+		for (samplecnt_t at : {samplecnt_t (0), fade / 2, fade, fade * 2, audio->length_samples () - fade / 2, audio->length_samples () - 1}) {
+			float output = 0, mix = 0, gain = 0;
+			CPPUNIT_ASSERT_EQUAL (samplecnt_t (1), audio->read_at (&output, &mix, &gain, audio->position_sample () + at, 1, 0));
+			size_t source_frame = size_t (at + std::llround (.375 * rate));
+			double raw = double (int (source_frame % 37) - 18) / 32;
+			double fade_level = std::min ({1.0, double (at) / fade, double (audio->length_samples () - at) / fade});
+			CPPUNIT_ASSERT_DOUBLES_EQUAL (raw * fade_level, output, .0003);
+		}
+	};
+	auto reopen = [&] (const std::string& name) {
+		CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+		AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+		fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path (name), name, nullptr, "", true));
+	};
+	check (); reopen ("NativeFade"); check ();
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("native-fade.dawproject"));
+	auto exported = PX::DawProject::read (fixture.path ("native-fade.dawproject"));
+	CPPUNIT_ASSERT (!track_named (exported, "Native audio").clips.front ().envelope.points.empty ());
+	PX::SessionExchange::export_logic (*fixture.session, fixture.path ("NativeFadeLogic"), fixture.report);
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	for (bool logic : {false, true}) {
+		std::string name = logic ? "FadeAAFReturn" : "FadeDAWReturn";
+		fixture.session = logic ? PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("NativeFadeLogic/Project.aaf"), fixture.path ("NativeFadeLogic/Project.mid"), fixture.path (name), name, fixture.report)
+		                        : PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("native-fade.dawproject"), fixture.path (name), name, fixture.report);
+		reopen (name); check ();
 		AudioEngine::instance ()->remove_session (); fixture.session.reset ();
 	}
 }
