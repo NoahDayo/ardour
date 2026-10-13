@@ -37,6 +37,7 @@
 #include "ardour/automation_list.h"
 #include "ardour/filesystem_paths.h"
 #include "ardour/import_status.h"
+#include "ardour/internal_send.h"
 #include "ardour/io.h"
 #include "ardour/lua_api.h"
 #include "ardour/midi_region.h"
@@ -45,6 +46,7 @@
 #include "ardour/midi_track.h"
 #include "ardour/playlist.h"
 #include "ardour/panner_shell.h"
+#include "ardour/pannable.h"
 #include "ardour/phase_control.h"
 #include "ardour/polarity_processor.h"
 #include "ardour/triggerbox.h"
@@ -451,6 +453,28 @@ void populate (Session& session, const Project& project, const std::map<std::str
 				}
 			}
 		}
+		for (auto const& send : track.sends) {
+			cancelled (cancel);
+			auto target = routes.at (send.destination);
+			if (send.volume > route->gain_control ()->upper ()) { throw ExchangeError (track.name + ": send gain exceeds Ardour's range"); }
+			session.add_internal_send (target, route->before_processor_for_placement (send.pre_fader ? PreFader : PostFader), route);
+			std::shared_ptr<InternalSend> inserted;
+			route->foreach_processor ([&] (std::weak_ptr<Processor> weak) {
+				if (auto item = std::dynamic_pointer_cast<InternalSend> (weak.lock ())) {
+					if (item->role () == Delivery::Aux && item->target_route () == target) { inserted = item; }
+				}
+			});
+			if (!inserted || inserted->get_pre_fader () != send.pre_fader) { throw ExchangeError ("Cannot create imported bus send: " + track.name); }
+			inserted->gain_control ()->set_value (send.volume, PBD::Controllable::NoGroup);
+			auto shell = inserted->panner_shell ();
+			if (!shell) { throw ExchangeError ("Imported bus send has no panner"); }
+			shell->set_linked_to_route (false);
+			shell->select_panner_by_uri ("http://ardour.org/plugin/panner_balance");
+			if (shell->current_panner_uri () != "http://ardour.org/plugin/panner_balance") { throw ExchangeError ("Ardour's bus-send balance panner is not available"); }
+			if (auto pan = shell->pannable ()->pan_azimuth_control) { pan->set_value (send.pan, PBD::Controllable::NoGroup); }
+			else if (send.pan != .5) { throw ExchangeError ("Imported bus send cannot set its pan"); }
+			if (!send.enabled) { inserted->deactivate (); }
+		}
 		for (auto const& clip : track.clips) {
 			cancelled (cancel);
 			bool midi = clip.kind == ClipKind::MIDI;
@@ -807,6 +831,32 @@ Project collect (Session& session, AudioAssets& assets, const CancelCheck& cance
 		route->foreach_processor ([&] (std::weak_ptr<Processor> weak) {
 			auto processor = weak.lock ();
 			if (!processor) { return; }
+			if (auto send = std::dynamic_pointer_cast<InternalSend> (processor)) {
+				if (send->role () != Delivery::Aux || !send->target_route () || send->target_route ()->is_master () ||
+				    std::find (routes.begin (), routes.end (), send->target_route ()) == routes.end ()) {
+					unsupported (project, track.name, "Unsupported internal send destination or role");
+					return;
+				}
+				auto shell = send->panner_shell ();
+				if (!shell || shell->bypassed () ||
+				    (shell->current_panner_uri () != "http://ardour.org/plugin/panner_balance" &&
+				     shell->current_panner_uri () != "http://ardour.org/plugin/panner_1in2out")) {
+					unsupported (project, track.name, "Unsupported bus-send panner"); return;
+				}
+				if (!shell->pannable ()) { unsupported (project, track.name, "Bus send has no pan controls"); return; }
+				Send item;
+				item.destination = "track-" + send->target_route ()->id ().to_s ();
+				item.pre_fader = send->get_pre_fader ();
+				item.enabled = send->active ();
+				item.volume = send->gain_control ()->get_value ();
+				if (auto pan = shell->pannable ()->pan_azimuth_control) {
+					item.pan = pan->get_value ();
+					check_control (project, track.name + " send pan", pan);
+				}
+				check_control (project, track.name + " send gain", send->gain_control ());
+				track.sends.push_back (item);
+				return;
+			}
 			if (auto box = std::dynamic_pointer_cast<TriggerBox> (processor)) {
 				if (!box->empty ()) { unsupported (project, track.name, "Cue clips cannot yet be exchanged"); }
 				return;
@@ -1189,6 +1239,7 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 		if (track.kind == TrackKind::Bus || track.kind == TrackKind::Folder || !track.parent.empty () || track.destination != master) {
 			unsupported (project, track.name, "AAF/MIDI export currently requires tracks connected directly to the master, without folders or buses");
 		}
+		if (!track.sends.empty ()) { unsupported (project, track.name, "AAF/MIDI export cannot preserve bus sends; render or remove them first"); }
 		if (track.solo) { unsupported (project, track.name, "Clear solo before AAF/MIDI export"); }
 		if (track.kind == TrackKind::Audio && track.channels == 2 && (track.pan != .5 || !track.pan_automation.points.empty ())) {
 			unsupported (project, track.name, "Stereo balance cannot yet be represented in AAF export");

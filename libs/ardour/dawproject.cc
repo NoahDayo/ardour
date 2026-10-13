@@ -236,7 +236,7 @@ struct Parser {
 			}
 		}
 		if ((is (node, "Application") || is (node, "Tempo") || is (node, "TimeSignature") ||
-		     is (node, "Volume") || is (node, "Pan") || is (node, "Mute") || is (node, "File")) && !children (node).empty ()) {
+		     is (node, "Volume") || is (node, "Pan") || is (node, "Mute") || is (node, "Enable") || is (node, "File")) && !children (node).empty ()) {
 			throw ExchangeError ("Unexpected child element in project parameter");
 		}
 		if (has (node, "id")) {
@@ -291,6 +291,40 @@ struct Parser {
 			} else if (is (item, "Mute")) {
 				attributes (item, {"id", "name", "value"});
 				track.mute = boolean (item, "value", false);
+			} else if (is (item, "Sends")) {
+				attributes (item, {});
+				for (Node entry : children (item)) {
+					if (!is (entry, "Send")) { diagnostic (entry, "Unknown send element"); continue; }
+					attributes (entry, {"id", "destination", "type"});
+					Send send;
+					send.destination = required (entry, "destination");
+					std::string type = required (entry, "type");
+					if (type != "pre" && type != "post") { throw ExchangeError ("Invalid send placement"); }
+					send.pre_fader = type == "pre";
+					Node volume = child (entry, "Volume");
+					if (!volume) { throw ExchangeError ("Send has no volume"); }
+					attributes (volume, {"id", "value", "unit"});
+					std::string unit = required (volume, "unit");
+					double value = number (volume, "value", 1);
+					if (unit == "linear") { send.volume = value; }
+					else if (unit == "decibel") { send.volume = std::pow (10, value / 20); }
+					else { throw ExchangeError ("Unsupported send volume unit: " + unit); }
+					if (Node enabled = child (entry, "Enable")) {
+						attributes (enabled, {"id", "value"});
+						send.enabled = boolean (enabled, "value", true);
+					}
+					if (Node pan = child (entry, "Pan")) {
+						attributes (pan, {"id", "unit", "value"});
+						if (required (pan, "unit") != "normalized") { throw ExchangeError ("Unsupported send pan unit"); }
+						send.pan = number (pan, "value", .5);
+					}
+					for (Node parameter : children (entry)) {
+						if (!is (parameter, "Enable") && !is (parameter, "Pan") && !is (parameter, "Volume")) {
+							diagnostic (parameter, "Unknown send parameter");
+						}
+					}
+					track.sends.push_back (send);
+				}
 			} else if (!children (item).empty ()) {
 				diagnostic (item, "Channel processing or routing is not yet converted");
 			} else if (!is (item, "Devices") && !is (item, "Sends")) {
@@ -612,6 +646,11 @@ Parser::parse (Node root)
 			if (found == channel_tracks.end ()) { throw ExchangeError ("Unknown channel destination: " + track.destination); }
 			track.destination = found->second;
 		}
+		for (auto& send : track.sends) {
+			auto found = channel_tracks.find (send.destination);
+			if (found == channel_tracks.end ()) { throw ExchangeError ("Unknown send destination: " + send.destination); }
+			send.destination = found->second;
+		}
 	}
 	if (Node arrangement = child (root, "Arrangement")) {
 		attributes (arrangement, {"id"});
@@ -715,6 +754,22 @@ struct Writer {
 		property (pan, "id", channel_ids.at (track.id) + "-pan");
 		property (pan, "unit", "normalized");
 		property (pan, "value", track.pan);
+		if (!track.sends.empty ()) {
+			Node sends = element (output, "Sends");
+			for (auto const& send : track.sends) {
+				Node entry = element (sends, "Send");
+				property (entry, "destination", channel_ids.at (send.destination));
+				property (entry, "type", send.pre_fader ? "pre" : "post");
+				if (!send.enabled) { property (element (entry, "Enable"), "value", "false"); }
+				if (send.pan != .5) {
+					Node pan = element (entry, "Pan");
+					property (pan, "unit", "normalized"); property (pan, "value", send.pan);
+				}
+				Node volume = element (entry, "Volume");
+				property (volume, "unit", "linear");
+				property (volume, "value", send.volume);
+			}
+		}
 		Node volume = element (output, "Volume");
 		property (volume, "id", channel_ids.at (track.id) + "-volume");
 		property (volume, "unit", "linear");

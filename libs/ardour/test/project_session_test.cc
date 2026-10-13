@@ -2,7 +2,9 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <map>
 #include <set>
+#include <tuple>
 #include <glib/gstdio.h>
 #include <glibmm/fileutils.h>
 #include <glibmm/miscutils.h>
@@ -12,6 +14,7 @@
 #include "ardour/audioengine.h"
 #include "ardour/audioregion.h"
 #include "ardour/gain_control.h"
+#include "ardour/internal_send.h"
 #include "ardour/automation_list.h"
 #include "pbd/control_math.h"
 #include "ardour/midi_model.h"
@@ -20,6 +23,8 @@
 #include "ardour/logic_project.h"
 #include "temporal/tempo.h"
 #include "ardour/playlist.h"
+#include "ardour/panner_shell.h"
+#include "ardour/pannable.h"
 #include "ardour/project_session.h"
 #include "ardour/recent_sessions.h"
 #include "ardour/session.h"
@@ -208,6 +213,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (reject_unmapped_processing);
 	CPPUNIT_TEST (native_song_import);
 	CPPUNIT_TEST (native_song_timing_and_gain);
+	CPPUNIT_TEST (bus_sends_roundtrip);
 	CPPUNIT_TEST (native_song_cancel);
 	CPPUNIT_TEST (native_song_unsupported);
 	CPPUNIT_TEST (marker_roundtrip);
@@ -234,6 +240,7 @@ public:
 	void reject_unmapped_processing ();
 	void native_song_import ();
 	void native_song_timing_and_gain ();
+	void bus_sends_roundtrip ();
 	void native_song_cancel ();
 	void native_song_unsupported ();
 	void marker_roundtrip ();
@@ -785,6 +792,70 @@ void ProjectSessionTest::native_song_timing_and_gain ()
 		PX::SessionExchange::export_dawproject (*fixture.session, fixture.path (name + ".dawproject")); check_timing (name + ".dawproject");
 		AudioEngine::instance ()->remove_session (); fixture.session.reset ();
 	}
+}
+
+void ProjectSessionTest::bus_sends_roundtrip ()
+{
+	Fixture fixture;
+	auto input = example (fixture);
+	input.tracks.erase (input.tracks.begin () + 3); // MIDI track.
+	input.tracks.erase (input.tracks.begin () + 1); // Folder.
+	auto& audio = input.tracks[1];
+	audio.parent.clear (); audio.destination = "master"; audio.pan = .5;
+	audio.sends = {{"room", true, true, .25, .8}, {"delay", false, false, .625, .2}};
+	PX::Track room; room.id = "room"; room.name = "Room"; room.kind = PX::TrackKind::Bus; room.destination = "master";
+	PX::Track delay = room; delay.id = "delay"; delay.name = "Delay";
+	input.tracks.push_back (room); input.tracks.push_back (delay);
+	package (fixture, input);
+	auto parsed = PX::DawProject::read (fixture.path ("input.dawproject"));
+	CPPUNIT_ASSERT_EQUAL (size_t (2), track_named (parsed, "Stereo").sends.size ());
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"), fixture.path ("Sends"), "Sends", fixture.report);
+	auto check = [&] {
+		auto route = fixture.session->route_by_name ("Stereo"); CPPUNIT_ASSERT (route);
+		std::map<std::string, std::shared_ptr<InternalSend>> sends;
+		route->foreach_processor ([&] (std::weak_ptr<Processor> weak) {
+			if (auto send = std::dynamic_pointer_cast<InternalSend> (weak.lock ())) {
+				if (send->role () == Delivery::Aux && send->target_route ()) { sends[send->target_route ()->name ()] = send; }
+			}
+		});
+		CPPUNIT_ASSERT_EQUAL (size_t (2), sends.size ());
+		for (auto const& expected : {std::make_tuple ("Room", true, true, .25, .8),
+		                            std::make_tuple ("Delay", false, false, .625, .2)}) {
+			auto send = sends.at (std::get<0> (expected));
+			CPPUNIT_ASSERT_EQUAL (std::get<1> (expected), send->get_pre_fader ());
+			CPPUNIT_ASSERT_EQUAL (std::get<2> (expected), send->active ());
+			CPPUNIT_ASSERT_DOUBLES_EQUAL (std::get<3> (expected), send->gain_control ()->get_value (), .000001);
+			CPPUNIT_ASSERT (send->panner_shell () && send->panner_shell ()->pannable ());
+			CPPUNIT_ASSERT (send->panner_shell ()->pannable ()->pan_azimuth_control);
+			CPPUNIT_ASSERT_DOUBLES_EQUAL (std::get<4> (expected), send->panner_shell ()->pannable ()->pan_azimuth_control->get_value (), .000001);
+		}
+	};
+	check ();
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("Sends"), "Sends", nullptr, "", true));
+	check ();
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("sends.dawproject"));
+	auto exported = PX::DawProject::read (fixture.path ("sends.dawproject"));
+	auto const& out_sends = track_named (exported, "Stereo").sends;
+	CPPUNIT_ASSERT_EQUAL (size_t (2), out_sends.size ());
+	for (auto const& send : out_sends) {
+		auto found = std::find_if (exported.tracks.begin (), exported.tracks.end (), [&] (const PX::Track& t) { return t.id == send.destination; });
+		CPPUNIT_ASSERT (found != exported.tracks.end ());
+		std::string target = found->name;
+		CPPUNIT_ASSERT (target == "Room" || target == "Delay");
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (target == "Room" ? .8 : .2, send.pan, .000001);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (target == "Room" ? .25 : .625, send.volume, .000001);
+		CPPUNIT_ASSERT_EQUAL (target == "Room", send.pre_fader);
+		CPPUNIT_ASSERT_EQUAL (target == "Room", send.enabled);
+	}
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_logic (*fixture.session, fixture.path ("SendsAAF"), fixture.report), PX::ExchangeError);
+	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& d) {
+		return d.disposition == PX::Disposition::Unsupported && d.detail.find ("bus sends") != std::string::npos;
+	}));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("sends.dawproject"), fixture.path ("SendsReturn"), "SendsReturn", fixture.report);
+	check ();
 }
 
 void ProjectSessionTest::native_song_cancel ()

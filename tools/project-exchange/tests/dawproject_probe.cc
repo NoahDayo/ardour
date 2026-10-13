@@ -74,6 +74,16 @@ static void dump (const Project& p)
 			}
 			std::cout << "]}";
 		}
+		std::cout << ",\"sends\":[";
+		for (size_t i = 0; i < t.sends.size (); ++i) {
+			if (i) { std::cout << ','; }
+			auto const& send = t.sends[i];
+			std::cout << "{\"destination\":"; quoted (send.destination);
+			std::cout << ",\"pre_fader\":" << (send.pre_fader ? "true" : "false")
+			          << ",\"enabled\":" << (send.enabled ? "true" : "false") << ",\"volume\":" << send.volume
+			          << ",\"pan\":" << send.pan << '}';
+		}
+		std::cout << ']';
 		std::cout << ",\"clips\":[";
 		bool first_clip = true;
 		for (auto const& c : t.clips) {

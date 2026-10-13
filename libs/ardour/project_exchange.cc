@@ -350,6 +350,13 @@ validate_project (const Project& project)
 		tracks.emplace (track.id, &track);
 		require (track.channels > 0 && track.channels <= 64, "Invalid track channel count");
 		require (nonnegative (track.volume) && normalized (track.pan), "Invalid track volume or pan");
+		require (track.sends.size () <= 128 && (track.sends.empty () || (!track.master && track.kind != TrackKind::Folder)), "Invalid send count or source");
+		std::set<std::string> send_targets;
+		for (auto const& send : track.sends) {
+			text (send.destination);
+			require (!send.destination.empty () && send_targets.insert (send.destination).second &&
+			         nonnegative (send.volume) && send.volume <= std::numeric_limits<float>::max () && normalized (send.pan), "Invalid send destination, volume or pan");
+		}
 		for (bool pan : {false, true}) {
 			auto const& curve = pan ? track.pan_automation : track.volume_automation;
 			require (curve.points.size () <= 100000, "Automation exceeds the event limit");
@@ -415,6 +422,21 @@ validate_project (const Project& project)
 			}
 		}
 	}
+	std::map<std::string, int> routing_state;
+	std::function<void (const Track&, size_t)> visit = [&] (const Track& track, size_t depth) {
+		require (depth < 128 && routing_state[track.id] != 1, "Cyclic or excessively deep track routing");
+		if (routing_state[track.id] == 2) { return; }
+		routing_state[track.id] = 1;
+		if (!track.destination.empty ()) { visit (*tracks.at (track.destination), depth + 1); }
+		for (auto const& send : track.sends) {
+			auto target = tracks.find (send.destination);
+			require (target != tracks.end () && target->second->kind == TrackKind::Bus && !target->second->master,
+			         "Send destination must be an existing audio bus");
+			visit (*target->second, depth + 1);
+		}
+		routing_state[track.id] = 2;
+	};
+	for (auto const& track : project.tracks) { visit (track, 0); }
 }
 
 } }

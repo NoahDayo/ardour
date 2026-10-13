@@ -72,6 +72,13 @@ struct Clip {
 };
 
 enum class TrackKind { Audio, MIDI, Folder, Bus };
+struct Send {
+	std::string destination; // Bus track ID, independent of the main output.
+	bool pre_fader = false;
+	bool enabled = true;
+	double volume = 1; // Linear amplitude.
+	double pan = 0.5; // Normalized left-to-right.
+};
 struct Track {
 	std::string id;
 	std::string name;
@@ -87,6 +94,7 @@ struct Track {
 	double pan = 0.5; // Normalized left-to-right.
 	Automation volume_automation; // Linear amplitude, absolute arrangement times.
 	Automation pan_automation; // Normalized left-to-right.
+	std::vector<Send> sends;
 	std::vector<Clip> clips;
 };
 

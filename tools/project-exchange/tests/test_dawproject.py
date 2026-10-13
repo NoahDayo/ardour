@@ -98,6 +98,8 @@ class DawProjectTest(unittest.TestCase):
             del track["id"]
             track["parent"] = names.get(track["parent"], "")
             track["destination"] = names.get(track["destination"], "")
+            for send in track["sends"]:
+                send["destination"] = names.get(send["destination"], "")
             for clip in track["clips"]:
                 clip["media"] = media.get(clip["media"], "")
         del result["report"]
@@ -133,6 +135,44 @@ class DawProjectTest(unittest.TestCase):
         self.assertEqual(len(root.findall(".//Clip[@reference]")), 1)
         self.assertEqual(len(root.findall(".//Note")), 2)
         self.assertEqual(root.find(".//Track[@name='Stereo café']").get("color"), "#abcdef")
+
+    def test_pre_post_bus_sends_round_trip_and_invalid_routing(self):
+        xml = PROJECT.replace('<Channel id="master"',
+            '<Channel id="aux1" name="Room" role="effect" audioChannels="2" destination="master"/>'
+            '<Channel id="aux2" name="Delay" role="effect" audioChannels="2" destination="master"/>'
+            '<Channel id="master"').replace(
+            '<Volume unit="linear" value="0.8"/>',
+            '<Sends><Send destination="aux1" type="pre"><Pan unit="normalized" value="0.8"/><Volume unit="linear" value="0.25"/></Send>'
+            '<Send destination="aux2" type="post"><Enable value="false"/><Volume unit="decibel" value="-6"/></Send></Sends>'
+            '<Volume unit="linear" value="0.8"/>')
+        parsed = self.parse(xml)
+        sends = parsed['tracks'][1]['sends']
+        self.assertEqual([(s['destination'], s['pre_fader'], s['enabled']) for s in sends],
+                         [('aux1', True, True), ('aux2', False, False)])
+        self.assertAlmostEqual(sends[0]['volume'], .25)
+        self.assertAlmostEqual(sends[0]['pan'], .8)
+        self.assertAlmostEqual(sends[1]['volume'], 10 ** (-6 / 20))
+        output = self.root / 'sends.xml'
+        self.command('rewrite', self.input, output)
+        self.assert_schema(output)
+        self.assertEqual(self.semantic(json.loads(self.command('parse', output).stdout)), self.semantic(parsed))
+        for bad, error in [
+            ('destination="aux1" type="pre"', 'destination="master" type="pre"'),
+            ('destination="aux1" type="pre"', 'destination="ca" type="pre"'),
+            ('destination="aux2" type="post"', 'destination="aux1" type="post"'),
+            ('destination="aux1" type="pre"', 'destination="missing" type="pre"'),
+            ('value="0.25"/></Send>', 'value="-1"/></Send>'),
+            ('<Pan unit="normalized" value="0.8"/>', '<Pan unit="normalized" value="1.1"/>'),
+        ]:
+            with self.subTest(error=error):
+                self.parse(xml.replace(bad, error), status=1)
+        cycle = xml.replace('<Channel id="aux1" name="Room" role="effect" audioChannels="2" destination="master"/>',
+            '<Channel id="aux1" name="Room" role="effect" audioChannels="2" destination="master">'
+            '<Sends><Send destination="aux2" type="pre"><Volume unit="linear" value="1"/></Send></Sends></Channel>').replace(
+            '<Channel id="aux2" name="Delay" role="effect" audioChannels="2" destination="master"/>',
+            '<Channel id="aux2" name="Delay" role="effect" audioChannels="2" destination="master">'
+            '<Sends><Send destination="aux1" type="post"><Volume unit="linear" value="1"/></Send></Sends></Channel>')
+        self.assertIn('cyclic', self.parse(cycle, status=1).stderr.lower())
 
     def test_official_schema(self):
         if self.schema is None:
