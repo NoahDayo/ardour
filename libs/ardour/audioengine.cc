@@ -828,7 +828,14 @@ AudioEngine::remove_session ()
 
 	} else {
 		session_deleted = true;
+#ifdef TRACE_SETSESSION_NULL
+		/* This is an explicit engine detach, as in the process callback's
+		 * running-backend path, rather than a Session DropReferences callback. */
+		_session_connections.drop_connections ();
+		_session = 0;
+#else
 		SessionHandlePtr::set_session (0);
+#endif
 	}
 
 	remove_session_ports ();

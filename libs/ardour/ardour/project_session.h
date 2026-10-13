@@ -14,6 +14,10 @@ namespace ProjectExchange {
 
 class LIBARDOUR_API SessionExchange {
 public:
+	struct ExportOptions {
+		bool render_mix = false;
+		double render_tail_seconds = 2.0;
+	};
 	/* Requires a running engine with no session attached. Builds in a private
 	 * sibling directory, saves, then moves and reopens the completed session.
 	 * The returned session is attached to the engine and owned by the caller. */
@@ -34,10 +38,17 @@ public:
 	 * export, so the caller can present every required conversion together. */
 	static void export_dawproject (Session&, const std::string& destination,
 	                               std::vector<Diagnostic>& report, CancelCheck = CancelCheck ());
+	/* Explicit fallback: render the current stereo master mix from zero to
+	 * session end plus tail (0..600 seconds). Tracks, MIDI and processing become
+	 * one audio clip; tempo, meter and ordinary markers remain editable. */
+	static void export_dawproject (Session&, const std::string& destination,
+	                               std::vector<Diagnostic>& report, const ExportOptions&, CancelCheck = CancelCheck ());
 	/* Publish an AAF with embedded audio and a coordinated type-1 MIDI file
 	 * in a new directory. Both use timeline/timecode origin zero. */
 	static void export_logic (Session&, const std::string& destination,
 	                          std::vector<Diagnostic>& report, CancelCheck = CancelCheck ());
+	static void export_logic (Session&, const std::string& destination,
+	                          std::vector<Diagnostic>& report, const ExportOptions&, CancelCheck = CancelCheck ());
 };
 
 } }

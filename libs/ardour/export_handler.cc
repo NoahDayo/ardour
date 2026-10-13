@@ -134,7 +134,7 @@ ExportHandler::ExportHandler (Session & session)
 
 ExportHandler::~ExportHandler ()
 {
-	if (export_status->aborted () && !current_timespan->vapor ().empty () && session.surround_master ()) {
+	if (export_status->aborted () && current_timespan && !current_timespan->vapor ().empty () && session.surround_master ()) {
 		PBD::Mutex::Lock l (export_status->lock());
 		session.surround_master ()->surround_return ()->finalize_export ();
 	}
@@ -167,10 +167,16 @@ ExportHandler::_timespan_thread_run (void* me)
 		} else {
 			Temporal::TempoMap::fetch ();
 			self->process_connection.disconnect ();
-			PBD::Mutex::Lock l (self->export_status->lock());
-			DiskReader::allocate_working_buffers ();
-			self->start_timespan ();
-			DiskReader::free_working_buffers ();
+			int result;
+			{
+				PBD::Mutex::Lock l (self->export_status->lock());
+				DiskReader::allocate_working_buffers ();
+				result = self->start_timespan ();
+				DiskReader::free_working_buffers ();
+			}
+			if (result == -2) {
+				self->export_status->abort (true);
+			}
 		}
 	}
 	pthread_mutex_unlock (&self->_timespan_mutex);
@@ -223,19 +229,50 @@ ExportHandler::do_export ()
 
 	/* Start export */
 
-	PBD::Mutex::Lock l (export_status->lock());
-	return start_timespan ();
+	int result;
+	{
+		PBD::Mutex::Lock l (export_status->lock());
+		result = start_timespan ();
+	}
+	if (result == -2) { export_status->abort (true); }
+	return result;
 }
 
 int
 ExportHandler::start_timespan ()
 {
+	AudioEngine* engine = AudioEngine::instance ();
+	auto stop_with_error = [&] (const char* message) {
+		/* The caller already owns this lock; abort() would lock recursively. */
+		export_status->stop = true;
+		error << message << endmsg;
+		return -2;
+	};
+	if (!_timespan_thread_active.load ()) {
+		return stop_with_error (_("Audio export stopped because its helper thread is shutting down."));
+	}
+	if (!engine->running ()) {
+		return stop_with_error (_("Audio export stopped because the audio engine is no longer running."));
+	}
 	/* stop freewheeling and wait for latency callbacks */
-	if (AudioEngine::instance()->freewheeling ()) {
-		AudioEngine::instance()->freewheel (false);
-		do {
-			Glib::usleep (AudioEngine::instance()->usecs_per_cycle ());
-		} while (AudioEngine::instance()->freewheeling ());
+	if (engine->freewheeling ()) {
+		if (engine->freewheel (false) != 0) {
+			return stop_with_error (_("Audio export could not request an end to offline processing."));
+		}
+		const gint64 deadline = g_get_monotonic_time () + 10000000;
+		while (engine->freewheeling ()) {
+			if (!_timespan_thread_active.load ()) {
+				return stop_with_error (_("Audio export stopped because its helper thread is shutting down."));
+			}
+			if (!engine->running ()) {
+				return stop_with_error (_("Audio export stopped because the audio engine is no longer running."));
+			}
+			if (g_get_monotonic_time () >= deadline) {
+				return stop_with_error (_("Audio export timed out waiting for offline processing to stop."));
+			}
+			const int delay = engine->usecs_per_cycle ();
+			Glib::usleep (delay > 0 && delay < 10000 ? delay : 10000);
+		}
 		session.reset_xrun_count ();
 	}
 

@@ -252,7 +252,12 @@ Session::start_audio_export (samplepos_t position, bool realtime, bool region_ex
 void
 Session::process_export (pframes_t nframes)
 {
-	if (_export_rolling && export_status->stop) {
+	bool stop_requested;
+	{
+		PBD::Mutex::Lock lock (export_status->lock ());
+		stop_requested = export_status->stop;
+	}
+	if (_export_rolling && stop_requested) {
 		stop_audio_export ();
 	}
 
@@ -299,6 +304,19 @@ Session::process_export (pframes_t nframes)
 void
 Session::process_export_fw (pframes_t nframes)
 {
+	bool aborted = false;
+	if (_export_rolling) {
+		PBD::Mutex::Lock lock (export_status->lock ());
+		aborted = export_status->aborted ();
+	}
+	if (_export_rolling && aborted) {
+		/* Acknowledge cancellation in the audio thread, including during
+		 * preroll. Control-thread cleanup can then safely flush and join. */
+		if (!_realtime_export) { _transport_fsm->hard_stop (); }
+		stop_audio_export ();
+		PBD::Mutex::Lock lock (export_status->lock ());
+		export_status->stop = true;
+	}
 	if (!_export_rolling) {
 		if (_realtime_export) {
 			fail_roll (nframes);
@@ -450,6 +468,11 @@ Session::finalize_audio_export (TransportRequestSource trs)
 	*/
 
 	_exporting = false;
+	if (!_engine.running ()) {
+		/* A halted backend cannot complete a queued transport stop. Reset the
+		 * FSM before restoring automation or locating after an engine restart. */
+		_transport_fsm->hard_stop ();
+	}
 
 	if (_export_rolling) {
 		stop_audio_export ();

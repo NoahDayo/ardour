@@ -2,6 +2,7 @@
 #include "evoral/ControlList.h"
 #include "evoral/Curve.h"
 #include <stdlib.h>
+#include <vector>
 
 CPPUNIT_TEST_SUITE_REGISTRATION (CurveTest);
 
@@ -177,6 +178,46 @@ CurveTest::twoPointLinear ()
 	cl->curve ().get_vector (t9998, t9999, vec, 8);
 	for (int i = 0; i < 8; ++i) {
 		CPPUNIT_ASSERT_EQUAL_MESSAGE ("veclen=8 @ 9998..9999", 4096.f, vec[i]);
+	}
+}
+
+void
+CurveTest::twoPointDiscrete ()
+{
+	for (TimeDomain domain : {AudioTime, BeatTime}) {
+		auto cl = TestCtrlList (domain);
+		cl->create_curve ();
+		cl->set_interpolation (ControlList::Discrete);
+		auto position = [domain] (int64_t value) {
+			return domain == BeatTime ? timepos_t::from_ticks (value) : timepos_t::from_superclock (value);
+		};
+		cl->fast_simple_add (position (100), .25);
+		cl->fast_simple_add (position (200), .75);
+		auto check_vector = [&] (int64_t start, int64_t end, const std::vector<float>& expected) {
+			std::vector<float> actual (expected.size ());
+			cl->curve ().get_vector (position (start), position (end), actual.data (), actual.size ());
+			for (size_t i = 0; i < expected.size (); ++i) {
+				CPPUNIT_ASSERT_EQUAL (expected[i], actual[i]);
+			}
+		};
+		check_vector (50, 80, {.25f, .25f, .25f});
+		check_vector (110, 190, {.25f, .25f, .25f, .25f, .25f});
+		check_vector (199, 201, {.25f, .75f, .75f});
+		check_vector (200, 200, {.75f, .75f});
+		check_vector (210, 230, {.75f, .75f, .75f});
+		check_vector (0, 250, {.25f, .25f, .25f, .25f, .75f, .75f});
+		/* The penultimate sample is at 187.5, before the step at 200. */
+		check_vector (0, 250, {.25f, .25f, .25f, .25f, .75f});
+		for (int64_t value : {50, 100, 199, 200, 201, 250}) {
+			check_vector (value, value, {value < 200 ? .25f : .75f});
+		}
+		/* A scalar vector uses the start of its requested range. */
+		check_vector (150, 250, {.25f});
+		float realtime[3];
+		CPPUNIT_ASSERT (cl->curve ().rt_safe_get_vector (position (199), position (201), realtime, 3));
+		CPPUNIT_ASSERT_EQUAL (.25f, realtime[0]);
+		CPPUNIT_ASSERT_EQUAL (.75f, realtime[1]);
+		CPPUNIT_ASSERT_EQUAL (.75f, realtime[2]);
 	}
 }
 

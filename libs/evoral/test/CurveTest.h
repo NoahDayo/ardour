@@ -11,6 +11,7 @@ class CurveTest : public CppUnit::TestFixture
 	CPPUNIT_TEST (trivial);
 	CPPUNIT_TEST (rtGet);
 	CPPUNIT_TEST (twoPointLinear);
+	CPPUNIT_TEST (twoPointDiscrete);
 	CPPUNIT_TEST (threePointLinear);
 	CPPUNIT_TEST (threePointDiscete);
 	CPPUNIT_TEST (constrainedCubic);
@@ -21,15 +22,16 @@ public:
 	void trivial ();
 	void rtGet ();
 	void twoPointLinear ();
+	void twoPointDiscrete ();
 	void threePointLinear ();
 	void threePointDiscete ();
 	void constrainedCubic ();
 	void ctrlListEval ();
 
 private:
-	std::shared_ptr<Evoral::ControlList> TestCtrlList() {
+	std::shared_ptr<Evoral::ControlList> TestCtrlList(Temporal::TimeDomain domain = Temporal::AudioTime) {
 		Evoral::Parameter param (Evoral::Parameter(0));
 		const Evoral::ParameterDescriptor desc;
-		return std::shared_ptr<Evoral::ControlList> (new Evoral::ControlList(param, desc, Temporal::TimeDomainProvider (Temporal::AudioTime)));
+		return std::shared_ptr<Evoral::ControlList> (new Evoral::ControlList(param, desc, Temporal::TimeDomainProvider (domain)));
 	}
 };

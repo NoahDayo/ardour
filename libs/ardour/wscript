@@ -188,6 +188,7 @@ libardour_sources = [
         'project_archive.cc',
         'project_exchange.cc',
         'project_session.cc',
+        'project_render.cc',
         'project_midi.cc',
         'logic_project.cc',
         'studio_one_song.cc',

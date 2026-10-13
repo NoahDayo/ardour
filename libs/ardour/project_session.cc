@@ -2,6 +2,7 @@
 #include "ardour/project_session.h"
 #include "ardour/studio_one_song.h"
 #include "ardour/logic_project.h"
+#include "project_render.h"
 
 #include <algorithm>
 #include <array>
@@ -119,6 +120,7 @@ struct OwnedDirectory {
 	}
 	~OwnedDirectory ()
 	{
+		if (retained) { return; }
 		FileObject root = file_object (path);
 		remove_owned_tree (root.get ());
 		if (!published.empty ()) { FileObject destination = file_object (published); remove_owned_tree (destination.get ()); }
@@ -137,6 +139,7 @@ struct OwnedDirectory {
 	}
 	std::string path;
 	std::string published;
+	bool retained = false;
 };
 
 samplepos_t samples (double seconds, samplecnt_t rate)
@@ -789,7 +792,7 @@ std::string destination_for (Project& project, const std::shared_ptr<Route>& rou
 
 typedef std::map<std::string, SourceList> AudioAssets;
 
-Project collect (Session& session, AudioAssets& assets, const CancelCheck& cancel)
+Project collect_timing (Session& session)
 {
 	Project project;
 	project.application = "Ardour";
@@ -835,6 +838,59 @@ Project collect (Session& session, AudioAssets& assets, const CancelCheck& cance
 	})) {
 		project.report.push_back ({Disposition::Transformed, "Markers", "Mixed musical and sample-time markers exported in seconds using the tempo map"});
 	}
+	return project;
+}
+
+Project collect_mix (Session& session, const SessionExchange::ExportOptions& options)
+{
+	if (!std::isfinite (options.render_tail_seconds) || options.render_tail_seconds < 0 || options.render_tail_seconds > 600) {
+		throw ExchangeError ("Rendered audio tail must be between zero and 600 seconds");
+	}
+	samplecnt_t end = session.current_end_sample ();
+	if (end <= 0) { throw ExchangeError ("Set the session end before rendering the mix"); }
+	samplecnt_t tail = samples (options.render_tail_seconds, session.sample_rate ());
+	if (end > std::numeric_limits<samplecnt_t>::max () - tail) { throw ExchangeError ("Rendered audio range exceeds the sample limit"); }
+	samplecnt_t length = end + tail;
+	if (uint64_t (length) > 0xffff0000ULL / (2 * sizeof (float))) { throw ExchangeError ("Rendered mix exceeds the supported WAV file size; shorten the session range"); }
+	Project project = collect_timing (session);
+	Track master;
+	master.id = "master";
+	master.name = "Master";
+	master.kind = TrackKind::Bus;
+	master.master = true;
+	Track mix;
+	mix.id = "mix-track";
+	mix.name = session.name () + " Mix";
+	mix.destination = master.id;
+	Media media;
+	media.id = "rendered-mix";
+	media.path = "audio/rendered-mix.wav";
+	media.sample_rate = session.sample_rate ();
+	media.channels = 2;
+	media.duration = double (length) / media.sample_rate;
+	Clip clip;
+	clip.name = mix.name;
+	clip.position = Time (0, TimeUnit::Seconds);
+	clip.offset = Time (0, TimeUnit::Seconds);
+	clip.duration = media.duration;
+	clip.media = media.id;
+	mix.clips.push_back (clip);
+	project.media.push_back (media);
+	project.tracks = {master, mix};
+	project.report.push_back ({Disposition::Rendered, "Current master mix",
+		"All audible tracks, MIDI instruments, effects, automation and bus routing become one stereo audio clip. Individual tracks, notes and processors are no longer editable; current mute and solo states are included."});
+	std::ostringstream range;
+	range << "Rendered from timeline zero to session end (" << double (end) / media.sample_rate
+		<< " seconds), plus " << options.render_tail_seconds
+		<< " extra seconds for tails. Timeline content inside the extended range is included too; audio beyond it is excluded. Tempo, meter and ordinary markers remain editable.";
+	project.report.push_back ({Disposition::Transformed, "Render range", range.str ()});
+	validate_project (project);
+	return project;
+}
+
+Project collect (Session& session, AudioAssets& assets, const CancelCheck& cancel)
+{
+	Project project = collect_timing (session);
 	RouteList routes (*session.get_routes ());
 	routes.remove_if ([] (const std::shared_ptr<Route>& route) { return route->is_auditioner () || route->is_monitor (); });
 	routes.sort ([] (const std::shared_ptr<Route>& a, const std::shared_ptr<Route>& b) {
@@ -1102,6 +1158,44 @@ void write_audio (const SourceList& sources, const std::string& path, const Canc
 	if (sf_close (output.release ())) { throw ExchangeError ("Cannot finish export audio file"); }
 }
 
+/* AAF embeds integer PCM. Convert the rendered float file without registering
+ * new Sources or Regions in the user's session, and reject clipping. */
+void write_rendered_pcm24 (const std::string& source, const std::string& path, const CancelCheck& cancel)
+{
+	SF_INFO info = {};
+	PBD::ScopedFileDescriptor input_fd (g_open (source.c_str (), O_RDONLY
+#ifdef O_BINARY
+	                                          | O_BINARY
+#endif
+	                                          , 0));
+	std::unique_ptr<SNDFILE, int (*) (SNDFILE*)> input (input_fd >= 0 ? sf_open_fd (input_fd, SFM_READ, &info, SF_FALSE) : nullptr, sf_close);
+	if (!input || info.frames <= 0 || info.channels != 2 || uint64_t (info.frames) > 0xffff0000ULL / (3 * info.channels)) {
+		throw ExchangeError ("Cannot convert rendered audio to the supported AAF PCM format");
+	}
+	SF_INFO output_info = info;
+	output_info.format = SF_FORMAT_WAV | SF_FORMAT_PCM_24;
+	int fd = g_open (path.c_str (), O_WRONLY | O_CREAT | O_EXCL
+#ifdef O_BINARY
+	                 | O_BINARY
+#endif
+	                 , 0600);
+	if (fd < 0) { throw ExchangeError ("Cannot create rendered AAF audio file"); }
+	std::unique_ptr<SNDFILE, int (*) (SNDFILE*)> output (sf_open_fd (fd, SFM_WRITE, &output_info, SF_TRUE), sf_close);
+	if (!output) { close (fd); throw ExchangeError ("Cannot open rendered AAF audio file"); }
+	std::vector<float> data (8192 * info.channels);
+	for (sf_count_t position = 0; position < info.frames;) {
+		cancelled (cancel);
+		sf_count_t count = std::min (sf_count_t (8192), info.frames - position);
+		if (sf_readf_float (input.get (), data.data (), count) != count) { throw ExchangeError ("Cannot read complete rendered audio"); }
+		if (std::any_of (data.begin (), data.begin () + count * info.channels, [] (float value) {
+			return !std::isfinite (value) || value < -1 || value > 1;
+		})) { throw ExchangeError ("Rendered mix exceeds 24-bit PCM range; reduce the master level before AAF export"); }
+		if (sf_writef_float (output.get (), data.data (), count) != count) { throw ExchangeError ("Cannot write complete rendered AAF audio"); }
+		position += count;
+	}
+	if (sf_close (output.release ())) { throw ExchangeError ("Cannot finish rendered AAF audio"); }
+}
+
 void run_logic_writer (const std::string& manifest, const std::string& destination, const CancelCheck& cancel)
 {
 	std::string base = Glib::build_filename (ardour_dll_directory (), "project-exchange");
@@ -1293,6 +1387,12 @@ SessionExchange::export_dawproject (Session& session, const std::string& destina
 void
 SessionExchange::export_dawproject (Session& session, const std::string& destination, std::vector<Diagnostic>& report, CancelCheck cancel)
 {
+	export_dawproject (session, destination, report, ExportOptions (), cancel);
+}
+
+void
+SessionExchange::export_dawproject (Session& session, const std::string& destination, std::vector<Diagnostic>& report, const ExportOptions& options, CancelCheck cancel)
+{
 	report.clear ();
 	if (session.transport_rolling () || session.actively_recording ()) { throw ExchangeError ("Stop playback and recording before exporting a project"); }
 	if (!Glib::path_is_absolute (destination)) { throw ExchangeError ("Export destination must be absolute"); }
@@ -1300,14 +1400,21 @@ SessionExchange::export_dawproject (Session& session, const std::string& destina
 	if (g_file_query_exists (target.get (), NULL)) { throw ExchangeError ("Export destination already exists"); }
 	cancelled (cancel);
 	AudioAssets assets;
-	Project project = collect (session, assets, cancel);
+	Project project = options.render_mix ? collect_mix (session, options) : collect (session, assets, cancel);
 	report = project.report;
 	for (auto const& item : project.report) {
 		if (item.disposition == Disposition::Unsupported) { throw ExchangeError (item.object + ": " + item.detail); }
 	}
 	OwnedDirectory stage (Glib::path_get_dirname (destination));
 	std::map<std::string, std::string> files;
+	if (options.render_mix) {
+		try {
+			auto mix = render_session_mix (session, stage.path, samples (project.media.front ().duration, session.sample_rate ()), cancel);
+			files[project.media.front ().id] = mix.path;
+		} catch (RenderShutdownFailed const&) { stage.retained = true; throw; }
+	}
 	for (auto const& media : project.media) {
+		if (files.count (media.id)) { continue; }
 		std::string path = Glib::build_filename (stage.path, media.id + ".wav");
 		write_audio (assets.at (media.id), path, cancel);
 		files[media.id] = path;
@@ -1318,6 +1425,12 @@ SessionExchange::export_dawproject (Session& session, const std::string& destina
 void
 SessionExchange::export_logic (Session& session, const std::string& destination, std::vector<Diagnostic>& report, CancelCheck cancel)
 {
+	export_logic (session, destination, report, ExportOptions (), cancel);
+}
+
+void
+SessionExchange::export_logic (Session& session, const std::string& destination, std::vector<Diagnostic>& report, const ExportOptions& options, CancelCheck cancel)
+{
 	report.clear ();
 	if (session.transport_rolling () || session.actively_recording ()) { throw ExchangeError ("Stop playback and recording before exporting a project"); }
 	if (!Glib::path_is_absolute (destination)) { throw ExchangeError ("Export destination must be absolute"); }
@@ -1325,7 +1438,7 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 	if (g_file_query_exists (target.get (), NULL)) { throw ExchangeError ("Export destination already exists"); }
 	cancelled (cancel);
 	AudioAssets assets;
-	Project project = collect (session, assets, cancel);
+	Project project = options.render_mix ? collect_mix (session, options) : collect (session, assets, cancel);
 	std::string master;
 	for (auto const& track : project.tracks) { if (track.master) { master = track.id; } }
 	for (auto const& track : project.tracks) {
@@ -1357,6 +1470,11 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 	for (auto const& item : report) { if (item.disposition == Disposition::Unsupported) { throw ExchangeError (item.object + ": " + item.detail); } }
 	validate_project (project);
 	OwnedDirectory stage (Glib::path_get_dirname (destination));
+	std::string rendered;
+	if (options.render_mix) {
+		try { rendered = render_session_mix (session, stage.path, samples (project.media.front ().duration, session.sample_rate ()), cancel).path; }
+		catch (RenderShutdownFailed const&) { stage.retained = true; throw; }
+	}
 	std::string output = Glib::build_filename (stage.path, "session");
 	if (g_mkdir (output.c_str (), 0700)) { throw ExchangeError ("Cannot create AAF/MIDI export staging directory"); }
 	XMLTree manifest;
@@ -1386,12 +1504,13 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 	for (auto const& media : project.media) {
 		cancelled (cancel);
 		std::string path = Glib::build_filename (stage.path, media.id + ".wav");
-		write_audio (assets.at (media.id), path, cancel, true);
+		if (options.render_mix) { write_rendered_pcm24 (rendered, path, cancel); }
+		else { write_audio (assets.at (media.id), path, cancel, true); }
 		XMLNode& source = *root.add_child ("Media");
 		source.set_property ("id", media.id);
 		source.set_property ("path", path);
 		source.set_property ("channels", media.channels);
-		source.set_property ("frames", assets.at (media.id).front ()->length ().samples ());
+		source.set_property ("frames", options.render_mix ? samples (media.duration, session.sample_rate ()) : assets.at (media.id).front ()->length ().samples ());
 	}
 	for (auto const& track : project.tracks) {
 		if (track.master) { continue; }
@@ -1471,8 +1590,8 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 	if (!manifest.write (path)) { throw ExchangeError ("Cannot write AAF/MIDI export manifest"); }
 	run_logic_writer (path, output, cancel);
 	report.push_back ({Disposition::Transformed, "Audio", "Embedded 24-bit PCM; floating-point sources are quantized to 24 bits"});
-	report.push_back ({Disposition::Transformed, "MIDI", "Clips merged per track; notes trimmed to clip boundaries and rounded to 1/19200 beat; notes crossing the left edge are retriggered"});
-	report.push_back ({Disposition::Transformed, "Metadata", "Original clip structure and colors retained in Metadata.xml; target applications may not display this metadata"});
+	if (!options.render_mix) { report.push_back ({Disposition::Transformed, "MIDI", "Clips merged per track; notes trimmed to clip boundaries and rounded to 1/19200 beat; notes crossing the left edge are retriggered"}); }
+	if (!options.render_mix) { report.push_back ({Disposition::Transformed, "Metadata", "Original clip structure and colors retained in Metadata.xml; target applications may not display this metadata"}); }
 	report.push_back ({Disposition::Transformed, "Timeline", "AAF and MIDI start at zero, with 25 fps zero timecode; load both files at that origin"});
 	report.push_back ({Disposition::Transformed, "Mixing", "Gain and pan use AAF rational values; target panning laws can differ"});
 	cancelled (cancel);

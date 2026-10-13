@@ -236,6 +236,24 @@ Curve::_get_vector (Temporal::timepos_t x0, Temporal::timepos_t x1, float *vec, 
 	max_x = _list.events().back()->when.val();
 	min_x = _list.events().front()->when.val();
 
+	if (npoints == 2 && _list.interpolation() == ControlList::Discrete) {
+		const double lval = _list.events().front()->value;
+		const double uval = _list.events().back()->value;
+		/* Evaluate the original grid: clipping a vector to the control-point
+		 * range can move a discrete transition to an earlier sample.
+		 */
+		if (veclen > 1) {
+			const double dx = (end - start) / (veclen - 1);
+			for (i = 0; i < veclen; ++i) {
+				const double x = i == veclen - 1 ? end : start + i * dx;
+				vec[i] = x < max_x ? lval : uval;
+			}
+		} else {
+			vec[0] = start < max_x ? lval : uval;
+		}
+		return;
+	}
+
 	if (start > max_x) {
 		/* totally past the end - just fill the entire array with the final value */
 		for (int32_t i = 0; i < veclen; ++i) {
@@ -329,9 +347,6 @@ Curve::_get_vector (Temporal::timepos_t x0, Temporal::timepos_t x1, float *vec, 
 						vec[i] = interpolate_gain (lval, uval, fraction, upper);
 					}
 					break;
-				case ControlList::Discrete:
-					// any discrete vector curves somewhere?
-					assert (0);
 				case ControlList::Curved:
 					/* no 2 point spline */
 					[[fallthrough]];
@@ -350,9 +365,6 @@ Curve::_get_vector (Temporal::timepos_t x0, Temporal::timepos_t x1, float *vec, 
 				case ControlList::Exponential:
 					vec[0] = interpolate_gain (lval, uval, fraction, _list.descriptor().upper);
 					break;
-				case ControlList::Discrete:
-					// any discrete vector curves somewhere?
-					assert (0);
 				case ControlList::Curved:
 					/* no 2 point spline */
 					[[fallthrough]];

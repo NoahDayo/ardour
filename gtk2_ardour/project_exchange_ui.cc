@@ -14,6 +14,7 @@
 #include <ytkmm/label.h>
 #include <ytkmm/main.h>
 #include <ytkmm/scrolledwindow.h>
+#include <ytkmm/spinbutton.h>
 #include <ytkmm/stock.h>
 #include <ytkmm/textview.h>
 #include <ytkmm/uimanager.h>
@@ -173,7 +174,7 @@ private:
  * disabled application actions prevent edits during cancellation checks. */
 class ExchangeProgress : public ArdourDialog {
 public:
-	ExchangeProgress (Gtk::Window& parent, const std::string& title)
+	ExchangeProgress (Gtk::Window& parent, const std::string& title, bool rendering = false)
 		: ArdourDialog (parent, title, true), cancelled (false)
 	{
 		disallow_idle ();
@@ -184,7 +185,7 @@ public:
 			enabled.push_back (group->get_sensitive ());
 			group->set_sensitive (false);
 		}
-		Gtk::Label* label = Gtk::manage (new Gtk::Label (_("Copying and converting the project. Please wait...")));
+		Gtk::Label* label = Gtk::manage (new Gtk::Label (rendering ? _("Rendering the current mix and copying the project. Please wait...") : _("Copying and converting the project. Please wait...")));
 		get_vbox ()->pack_start (*label, false, false, 20);
 		add_button (Gtk::Stock::CANCEL, Gtk::RESPONSE_CANCEL);
 		signal_response ().connect (sigc::mem_fun (*this, &ExchangeProgress::response));
@@ -343,21 +344,48 @@ static void export_project (Gtk::Window* parent, bool logic)
 	filter.set_name (logic ? _("All files and folders") : _("DAWproject files"));
 	filter.add_pattern (logic ? "*" : "*.dawproject");
 	dialog.add_filter (filter);
+	Gtk::VBox options_box (false, 8);
+	Gtk::CheckButton render_mix (_("Render current mix as one stereo audio track"));
+	Gtk::Label render_hint (_("Includes instruments, effects, automation, routing, mute and solo. Individual tracks and MIDI notes become audio. Renders from timeline zero through session end, plus the extra time below. Content within that extra time is included too."));
+	render_hint.set_line_wrap (true);
+	render_hint.set_alignment (0, 0.5);
+	Gtk::HBox tail_row (false, 8);
+	Gtk::Label tail_label (_("Extend past session end (seconds):"));
+	Gtk::SpinButton tail;
+	tail.set_range (0, 600);
+	tail.set_increments (0.1, 1);
+	tail.set_digits (1);
+	tail.set_value (2);
+	tail_row.pack_start (tail_label, false, false);
+	tail_row.pack_start (tail, false, false);
+	tail_row.set_sensitive (false);
+	render_mix.signal_toggled ().connect ([&] { tail_row.set_sensitive (render_mix.get_active ()); });
+	options_box.pack_start (render_mix, false, false);
+	options_box.pack_start (render_hint, false, false);
+	options_box.pack_start (tail_row, false, false);
+	options_box.show_all ();
+	dialog.set_extra_widget (options_box);
 	if (dialog.run () != Gtk::RESPONSE_ACCEPT) { return; }
 	std::string destination = dialog.get_filename ();
+	PX::SessionExchange::ExportOptions options;
+	options.render_mix = render_mix.get_active ();
+	options.render_tail_seconds = tail.get_value ();
 	dialog.hide ();
 	if (!logic && (destination.size () < 11 || g_ascii_strcasecmp (destination.c_str () + destination.size () - 11, ".dawproject"))) { destination += ".dawproject"; }
 	std::vector<PX::Diagnostic> report;
 	try {
-		ExchangeProgress progress (*parent, logic ? _("Exporting AAF + MIDI") : _("Exporting DAWproject"));
+		ExchangeProgress progress (*parent, logic ? _("Exporting AAF + MIDI") : _("Exporting DAWproject"), options.render_mix);
 		if (ui.the_session () != session) { throw PX::ExchangeError (_("The session changed. Choose the project to export again.")); }
 		auto check = [&] {
 			bool cancelled = progress.check ();
-			if (ui.the_session () != session || session->transport_rolling ()) { throw PX::ExchangeError (_("The session changed during export. Stop playback and try again.")); }
+			if (ui.the_session () != session || session->actively_recording () ||
+			    (session->transport_rolling () && !(options.render_mix && session->exporting ()))) {
+				throw PX::ExchangeError (_("The session changed during export. Stop playback and try again."));
+			}
 			return cancelled;
 		};
-		if (logic) { PX::SessionExchange::export_logic (*session, destination, report, check); }
-		else { PX::SessionExchange::export_dawproject (*session, destination, report, check); }
+		if (logic) { PX::SessionExchange::export_logic (*session, destination, report, options, check); }
+		else { PX::SessionExchange::export_dawproject (*session, destination, report, options, check); }
 	} catch (PX::ArchiveCancelled const&) {
 		show_report (*parent, _("Export cancelled"), _("No project was created."));
 		return;
