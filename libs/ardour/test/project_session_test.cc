@@ -425,6 +425,46 @@ void ProjectSessionTest::vst3_plugin_exchange ()
 	CPPUNIT_ASSERT_EQUAL (devices[0].state, track_named (returned, "Stereo").plugins.at (0).state);
 	CPPUNIT_ASSERT (!track_named (returned, "Stereo").plugins.at (0).enabled);
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (changed_value, parameter_value (), 1e-5);
+	if (const char* external = std::getenv ("ARDOUR_STUDIO_PRO_VST3_TEST_PROJECT")) {
+		if (!*external) { return; }
+		auto assert_supported = [] (const std::vector<PX::Diagnostic>& report) {
+			std::string unsupported;
+			for (auto const& diagnostic : report) {
+				if (diagnostic.disposition == PX::Disposition::Unsupported) {
+					unsupported += "\n" + diagnostic.object + ": " + diagnostic.detail;
+				}
+			}
+			CPPUNIT_ASSERT_MESSAGE ("Unsupported Studio Pro return features:" + unsupported, unsupported.empty ());
+		};
+		auto external_project = PX::DawProject::read (external);
+		assert_supported (external_project.report);
+		auto const& external_devices = track_named (external_project, "Stereo").plugins;
+		CPPUNIT_ASSERT_EQUAL (size_t (1), external_devices.size ());
+		CPPUNIT_ASSERT_EQUAL (devices[0].id, external_devices[0].id);
+		AudioEngine::instance ()->remove_session ();
+		fixture.session.reset ();
+		fixture.report.clear ();
+		fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), external,
+		                                                       fixture.path ("StudioReturned"), "Exchange", fixture.report);
+		CPPUNIT_ASSERT (fixture.session);
+		assert_supported (fixture.report);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (changed_value, parameter_value (), 1e-5);
+		CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state ("Exchange"));
+		AudioEngine::instance ()->remove_session ();
+		fixture.session.reset ();
+		fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("StudioReturned"), "Exchange", nullptr, "", true));
+		AudioEngine::instance ()->set_session (fixture.session.get ());
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (changed_value, parameter_value (), 1e-5);
+		fixture.report.clear ();
+		PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("studio-returned.dawproject"), fixture.report);
+		assert_supported (fixture.report);
+		auto studio_returned = PX::DawProject::read (fixture.path ("studio-returned.dawproject"));
+		auto const& studio_devices = track_named (studio_returned, "Stereo").plugins;
+		CPPUNIT_ASSERT_EQUAL (size_t (1), studio_devices.size ());
+		CPPUNIT_ASSERT_EQUAL (external_devices[0].id, studio_devices[0].id);
+		CPPUNIT_ASSERT_EQUAL (external_devices[0].enabled, studio_devices[0].enabled);
+		std::cout << "Studio Pro VST3 return: import/save/reopen/export passed" << std::endl;
+	}
 }
 
 void ProjectSessionTest::region_fades_roundtrip ()

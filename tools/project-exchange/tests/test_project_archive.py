@@ -47,6 +47,12 @@ class ProjectArchiveTest(unittest.TestCase):
         media.write_bytes(payload)
         package = work / "交換.dawproject"
         self.command("write", package, "audio/波形.wav", media)
+        # Hosts can reject ZIPs padded after the end-of-central-directory record.
+        packed = package.read_bytes()
+        end = packed.rfind(b"PK\x05\x06")
+        self.assertGreaterEqual(end, 0)
+        comment_length = struct.unpack_from("<H", packed, end + 20)[0]
+        self.assertEqual(end + 22 + comment_length, len(packed))
         media.unlink()
         with zipfile.ZipFile(package) as check:
             self.assertIsNone(check.testzip())

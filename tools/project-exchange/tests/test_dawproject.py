@@ -20,7 +20,7 @@ PROJECT = '''<Project version="1.0">
   <Application name="Independent fixture" version="1"/>
   <Transport><Tempo unit="bpm" value="100"/><TimeSignature numerator="7" denominator="8"/></Transport>
   <Structure>
-    <Track id="folder" name="Band &amp; Friends"><Channel id="cf" audioChannels="2" destination="master"/>
+    <Track id="folder" name="Band &amp; Friends" contentType="tracks"><Channel id="cf" audioChannels="2" destination="master"/>
       <Track id="audio" name="Stereo café" contentType="audio" color="#abcdef">
         <Channel id="ca" audioChannels="2" destination="master" solo="true">
           <Mute value="false"/><Pan unit="normalized" value="0.25"/><Volume unit="linear" value="0.8"/>
@@ -136,6 +136,11 @@ class DawProjectTest(unittest.TestCase):
         self.assertEqual(len(root.findall(".//Clip[@reference]")), 1)
         self.assertEqual(len(root.findall(".//Note")), 2)
         self.assertEqual(root.find(".//Track[@name='Stereo café']").get("color"), "#abcdef")
+        folder = root.find(".//Track[@name='Band & Friends']")
+        self.assertEqual(folder.get("contentType"), "tracks")
+        self.assertEqual([track.get("name") for track in folder.findall("Track")], ["Stereo café", "Keys"])
+        legacy = self.parse(PROJECT.replace(' contentType="tracks"', "", 1))
+        self.assertEqual(self.semantic(legacy), self.semantic(before))
 
     def test_pre_post_bus_sends_round_trip_and_invalid_routing(self):
         xml = PROJECT.replace('<Channel id="master"',
@@ -388,6 +393,7 @@ class DawProjectTest(unittest.TestCase):
 
     def test_vst3_state_archive_round_trip_and_rejection(self):
         class_id = "00112233445566778899AABBCCDDEEFF"
+        uuid = "00112233-4455-6677-8899-AABBCCDDEEFF"
         path = "plugins/effect.vstpreset"
         state = (b"VST3" + struct.pack("<I", 1) + class_id.encode("ascii") + struct.pack("<Q", 48) + b"List"
                  + struct.pack("<I", 1) + b"Comp" + struct.pack("<QQ", 48, 0))
@@ -398,9 +404,12 @@ class DawProjectTest(unittest.TestCase):
         self.assertEqual(parsed["report"], [])
         self.assertEqual(parsed["tracks"][1]["plugins"], [{"id": class_id, "name": "Shared Effect", "role": "audioFX",
                                                          "state_path": path, "state_size": 0, "enabled": False}])
+        hyphenated = self.parse(xml.replace(class_id.lower(), uuid.lower()))
+        self.assertEqual(self.semantic(hyphenated), self.semantic(parsed))
         rewritten = self.root / "plugin.xml"
         self.command("rewrite", self.input, rewritten)
         self.assert_schema(rewritten)
+        self.assertEqual(ET.parse(rewritten).find(".//Vst3Plugin").get("deviceID"), class_id)
         self.assertEqual(self.semantic(json.loads(self.command("parse", rewritten).stdout)), self.semantic(parsed))
 
         source = self.package(xml)
@@ -411,8 +420,11 @@ class DawProjectTest(unittest.TestCase):
         output = self.root / "plugin-output.dawproject"
         self.command("repack", source, output, self.root)
         with zipfile.ZipFile(output) as archive:
+            self.assertEqual(ET.fromstring(archive.read("project.xml")).find(".//Vst3Plugin").get("deviceID"), class_id)
             self.assertEqual(archive.read(path), state)
             self.assert_schema(self.root / "plugin.xml")
+        returned = json.loads(self.command("read", output).stdout)
+        self.assertEqual(returned["tracks"][1]["plugins"][0]["id"], class_id)
 
         for bad in [state.replace(class_id.encode("ascii"), b"F" * 32), b"wrong" + state[5:],
                     state[:-4] + struct.pack("<I", 1), state.replace(b"Comp", b"Prog"), state.replace(b"Comp", b"Info"),

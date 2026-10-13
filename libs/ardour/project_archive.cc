@@ -315,6 +315,8 @@ struct ProjectArchiveWriter::Impl {
 		if (!handle) { throw ArchiveError ("Cannot allocate ZIP writer"); }
 		check_archive (archive_write_set_format_zip (handle.get ()), handle.get ());
 		check_archive (archive_write_set_format_option (handle.get (), "zip", "hdrcharset", "UTF-8"), handle.get ());
+		/* ZIP readers may require the end-of-central-directory record at EOF. */
+		check_archive (archive_write_set_bytes_in_last_block (handle.get (), 1), handle.get ());
 		check_archive (archive_write_open_FILE (handle.get (), output.file.get ()), handle.get ());
 	}
 	void begin (const std::string& name, uint64_t size)

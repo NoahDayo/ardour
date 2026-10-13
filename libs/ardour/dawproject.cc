@@ -391,7 +391,7 @@ struct Parser {
 			if (!boolean (node, "loaded", true)) { diagnostic (node, "Unloaded track content requires a rendered fallback"); }
 			std::string type = attr (node, "contentType");
 			if (type == "notes") { track.kind = TrackKind::MIDI; }
-			else if (type.empty ()) { track.kind = TrackKind::Folder; }
+			else if (type.empty () || type == "tracks") { track.kind = TrackKind::Folder; }
 			else if (!type.empty () && type != "audio") { throw ExchangeError ("Unsupported track content type: " + type); }
 			bool folder = false;
 			for (Node item : children (node)) {
@@ -835,6 +835,8 @@ struct Writer {
 			if (!track.color.empty ()) { property (output, "color", track.color); }
 			if (track.kind == TrackKind::Audio || track.kind == TrackKind::MIDI) {
 				property (output, "contentType", track.kind == TrackKind::Audio ? "audio" : "notes");
+			} else if (track.kind == TrackKind::Folder) {
+				property (output, "contentType", "tracks");
 			}
 			channel (output, track);
 			tracks (output, track.id);
