@@ -1914,14 +1914,15 @@ PortAudioPort::~PortAudioPort () { }
 void* PortAudioPort::get_buffer (pframes_t n_samples)
 {
 	if (is_input ()) {
-		std::set<BackendPortPtr>::const_iterator it = get_connections ().begin ();
-		if (it == get_connections ().end ()) {
+		auto connections = get_connections ();
+		auto it = connections->begin ();
+		if (it == connections->end ()) {
 			memset (_buffer, 0, n_samples * sizeof (Sample));
 		} else {
 			std::shared_ptr<const PortAudioPort> source = std::dynamic_pointer_cast<const PortAudioPort>(*it);
 			assert (source && source->is_output ());
 			memcpy (_buffer, source->const_buffer (), n_samples * sizeof (Sample));
-			while (++it != get_connections ().end ()) {
+			while (++it != connections->end ()) {
 				source = std::dynamic_pointer_cast<const PortAudioPort>(*it);
 				assert (source && source->is_output ());
 				Sample* dst = buffer ();
@@ -1960,8 +1961,9 @@ void* PortMidiPort::get_buffer (pframes_t /* nframes */)
 {
 	if (is_input ()) {
 		(_buffer[_bufperiod]).clear ();
-		for (std::set<BackendPortPtr>::const_iterator i = get_connections ().begin ();
-				i != get_connections ().end ();
+		auto connections = get_connections ();
+		for (auto i = connections->begin ();
+				i != connections->end ();
 				++i) {
 			const PortMidiBuffer * src = std::dynamic_pointer_cast<const PortMidiPort>(*i)->const_buffer ();
 			for (PortMidiBuffer::const_iterator it = src->begin (); it != src->end (); ++it) {

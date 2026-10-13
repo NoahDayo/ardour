@@ -13,9 +13,10 @@ for argument in "$@"; do
         --build) build=true ;;
         --debug) mode=debug ;;
         --exchange-only) mode=exchange ;;
+        --baseline-only) mode=baseline ;;
         --logic) mode=logic ;;
         --all) mode=all ;;
-        *) echo "Usage: $0 [--build] [--exchange-only|--logic|--all|--debug]" >&2; exit 2 ;;
+        *) echo "Usage: $0 [--build] [--baseline-only|--exchange-only|--logic|--all|--debug]" >&2; exit 2 ;;
     esac
 done
 # Read only the configured output path; never execute the lock file, which
@@ -132,7 +133,10 @@ if [[ $mode == logic ]]; then
     "$libs/ardour/test_logic_session" 2>&1 | tee build-evidence/logic-session-tests.log
     exit 0
 fi
-if [[ $mode == session ]]; then
+if [[ $mode == session || $mode == baseline ]]; then
     "$libs/ardour/test_session" 2>&1 | tee build-evidence/baseline-session-tests.log
+fi
+if [[ $mode == baseline ]]; then
+    exit 0
 fi
 "$libs/ardour/test_project_session" 2>&1 | tee build-evidence/project-session-tests.log

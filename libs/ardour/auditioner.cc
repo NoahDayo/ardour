@@ -186,7 +186,9 @@ Auditioner::unload_synth (bool need_lock)
 int
 Auditioner::connect ()
 {
-	XMLNode const* mns = _session.misc_port_state () ? _session.misc_port_state ()->child ("Auditioner") : 0;
+	/* Disconnecting can synchronously replace the remembered connection state. */
+	std::unique_ptr<XMLNode> state = _session.misc_port_state ();
+	XMLNode const* mns = state ? state->child ("Auditioner") : 0;
 	XMLNode const* node = 0;
 
 	string left;
@@ -642,9 +644,9 @@ Auditioner::output_changed (IOChange change)
 	if (_session.reconnection_in_progress ()) {
 		return;
 	}
-	if (_session.misc_port_state ()) {
-		update_misc_port_state (*_session.misc_port_state ());
-	}
+	XMLNode state (X_("SessionPorts"));
+	update_misc_port_state (state);
+	_session.merge_misc_port_state (state);
 }
 
 ChanCount
@@ -680,10 +682,10 @@ Auditioner::update_misc_port_state (XMLNode& root) {
 
 	XMLNode* anode;
 	if (_session.monitor_out ()) {
-		node->remove_nodes ("Monitor");
+		node->remove_nodes_and_delete ("Monitor");
 		anode = node->add_child ("Monitor");
 	} else {
-		node->remove_nodes ("DirectOut");
+		node->remove_nodes_and_delete ("DirectOut");
 		anode = node->add_child ("DirectOut");
 	}
 	anode->add_child_nocopy (_output->get_state ());

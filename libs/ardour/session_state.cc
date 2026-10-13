@@ -1366,10 +1366,45 @@ Session::load_misc_port_state ()
 		return false;
 	}
 
-	delete _misc_port_state;
-	_misc_port_state = new XMLNode (*tree.root());
+	std::unique_ptr<XMLNode> state (new XMLNode (*tree.root()));
+	{
+		PBD::Mutex::Lock lm (_misc_port_state_lock);
+		delete _misc_port_state;
+		_misc_port_state = state.release ();
+	}
 
 	return true;
+}
+
+static void
+merge_misc_port_state_nodes (XMLNode& root, const XMLNode& state)
+{
+	for (auto const& child : state.children ()) {
+		if (child->name () == "Auditioner") {
+			XMLNode* node = root.child ("Auditioner");
+			if (!node) {
+				node = root.add_child ("Auditioner");
+			}
+			/* Direct and monitor connections are remembered independently. */
+			for (auto const& mode : child->children ()) {
+				node->remove_nodes_and_delete (mode->name ());
+				node->add_child_copy (*mode);
+			}
+		} else {
+			root.remove_nodes_and_delete (child->name ());
+			root.add_child_copy (*child);
+		}
+	}
+}
+
+void
+Session::merge_misc_port_state (const XMLNode& state)
+{
+	PBD::Mutex::Lock lm (_misc_port_state_lock);
+	if (!_misc_port_state) {
+		_misc_port_state = new XMLNode (X_("SessionPorts"));
+	}
+	merge_misc_port_state_nodes (*_misc_port_state, state);
 }
 
 bool
@@ -1377,34 +1412,45 @@ Session::save_misc_port_state () const
 {
 	const std::string rcfile = Glib::build_filename (user_config_directory(), "session_port.rc");
 	XMLTree tree;
-	XMLNode* root = _misc_port_state ? _misc_port_state : new XMLNode(X_("SessionPorts"));
+	/* Collect IO state before taking the shared XML lock. */
+	XMLNode state (X_("SessionPorts"));
 
 	if (_click_io) {
-		root->remove_nodes ("Click");
-		XMLNode* node = root->add_child ("Click");
+		XMLNode* node = state.add_child ("Click");
 		node->add_child_nocopy (_click_io->get_state ());
 		node->add_child_nocopy (_click_gain->get_state ());
 	}
 
 	if (auditioner) {
-		auditioner->update_misc_port_state (*root);
+		auditioner->update_misc_port_state (state);
 	}
 
 	if (_ltc_output_port) {
-		root->remove_nodes ("LTC");
-		XMLNode* node = root->add_child ("LTC");
+		XMLNode* node = state.add_child ("LTC");
 		node->add_child_nocopy (_ltc_output_port->get_state ());
 	}
+	std::unique_ptr<XMLNode> root;
+	{
+		PBD::Mutex::Lock lm (_misc_port_state_lock);
+		if (_misc_port_state) {
+			/* Reconnecting restores cached processor state as well as ports. */
+			merge_misc_port_state_nodes (*_misc_port_state, state);
+			root.reset (new XMLNode (*_misc_port_state));
+		} else {
+			root.reset (new XMLNode (X_("SessionPorts")));
+			merge_misc_port_state_nodes (*root, state);
+		}
+	}
 
-	tree.set_root (root);
+	/* The writer owns its snapshot; connection callbacks can update the live
+	 * tree without changing XML nodes being serialized here.
+	 */
+	tree.set_root (root.release ());
 	bool ok = tree.write (rcfile.c_str());
 
 	if (!ok) {
 		error << string_compose (_("port connections could not be saved to %1"), rcfile) << endmsg;
 	}
-
-	/* retain _misc_port_state */
-	tree.set_root (0);
 
 	return ok;
 }

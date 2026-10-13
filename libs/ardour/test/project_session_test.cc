@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <set>
@@ -25,6 +26,8 @@
 #include "ardour/playlist.h"
 #include "ardour/panner_shell.h"
 #include "ardour/pannable.h"
+#include "ardour/plugin_insert.h"
+#include "ardour/plugin_manager.h"
 #include "ardour/project_session.h"
 #include "ardour/studio_one_song.h"
 #include "ardour/recent_sessions.h"
@@ -205,6 +208,7 @@ double curve_value (const PX::Automation& curve, double at)
 class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST_SUITE (ProjectSessionTest);
 	CPPUNIT_TEST (roundtrip);
+	CPPUNIT_TEST (vst3_plugin_exchange);
 	CPPUNIT_TEST (bad_media);
 	CPPUNIT_TEST (corrupt_media);
 	CPPUNIT_TEST (existing_destination);
@@ -233,6 +237,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST_SUITE_END ();
 public:
 	void roundtrip ();
+	void vst3_plugin_exchange ();
 	void bad_media ();
 	void corrupt_media ();
 	void existing_destination ();
@@ -261,6 +266,166 @@ public:
 };
 
 CPPUNIT_TEST_SUITE_REGISTRATION (ProjectSessionTest);
+
+void ProjectSessionTest::vst3_plugin_exchange ()
+{
+	{
+		Fixture fixture;
+		auto project = example (fixture);
+		PX::PluginDevice missing;
+		missing.id = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
+		missing.name = "Missing VST3";
+		missing.role = "audioFX";
+		missing.state_path = "plugins/missing.vstpreset";
+		missing.state = "VST3";
+		missing.state.append ("\x01\0\0\0", 4);
+		missing.state += missing.id;
+		missing.state.append ("\x30\0\0\0\0\0\0\0", 8);
+		missing.state += "List";
+		missing.state.append ("\x01\0\0\0", 4);
+		missing.state += "Comp";
+		missing.state.append ("\x30\0\0\0\0\0\0\0", 8);
+		missing.state.append (8, '\0');
+		project.tracks[2].plugins.push_back (missing);
+		package (fixture, project);
+		CPPUNIT_ASSERT_THROW (PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"),
+		                                                            fixture.path ("Unavailable"), "Exchange", fixture.report), PX::ExchangeError);
+		CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
+		CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("Unavailable"), Glib::FILE_TEST_EXISTS));
+	}
+
+	/* Set this only in a private run with an installed VST3 effect. The normal
+	 * session suite tests the missing-plugin transaction without host plugins. */
+	const char* requested = std::getenv ("ARDOUR_VST3_TEST_PLUGIN");
+	if (!requested || !*requested) { return; }
+	Fixture fixture;
+	PluginManager::instance ().refresh (false);
+	PluginInfoPtr info;
+	for (auto const& candidate : PluginManager::instance ().vst3_plugin_info ()) {
+		if (candidate->name == requested) { info = candidate; break; }
+	}
+	CPPUNIT_ASSERT_MESSAGE ("Requested VST3 test plugin was not discovered", info);
+	CPPUNIT_ASSERT (info->is_effect ());
+	package (fixture, example (fixture));
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"),
+	                                                       fixture.path ("Original"), "Exchange", fixture.report);
+	std::shared_ptr<Route> route;
+	for (auto const& item : *fixture.session->get_routes ()) { if (item->name () == "Stereo") { route = item; break; } }
+	CPPUNIT_ASSERT (route);
+	auto plugin = info->load (*fixture.session);
+	CPPUNIT_ASSERT (plugin);
+	auto insert = std::make_shared<PluginInsert> (*fixture.session, *fixture.session, plugin);
+	auto reject_export = [&] (const std::string& detail, const std::string& context) {
+		fixture.report.clear ();
+		bool rejected = false;
+		try { PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("unsupported.dawproject"), fixture.report); }
+		catch (const PX::ExchangeError&) { rejected = true; }
+		CPPUNIT_ASSERT_MESSAGE (context, rejected);
+		CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [&] (const PX::Diagnostic& item) {
+			return item.disposition == PX::Disposition::Unsupported && item.detail.find (detail) != std::string::npos;
+		}));
+		CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("unsupported.dawproject"), Glib::FILE_TEST_EXISTS));
+	};
+	CPPUNIT_ASSERT_EQUAL (0, route->add_processor (insert, PostFader));
+	reject_export ("must precede the fader and sends", "Post-fader plugin");
+	CPPUNIT_ASSERT_EQUAL (0, route->remove_processor (insert));
+	insert.reset ();
+	plugin = info->load (*fixture.session);
+	CPPUNIT_ASSERT (plugin);
+	insert = std::make_shared<PluginInsert> (*fixture.session, *fixture.session, plugin);
+	CPPUNIT_ASSERT_EQUAL (0, route->add_processor (insert, PreFader));
+	CPPUNIT_ASSERT_EQUAL (uint32_t (1), insert->get_count ());
+	auto input = insert->input_map (0), output = insert->output_map (0), thru = insert->thru_map ();
+	for (bool output_pin : {false, true}) {
+		auto changed = output_pin ? output : input;
+		changed.unset (DataType::AUDIO, 0);
+		changed.unset (DataType::AUDIO, 1);
+		changed.set (DataType::AUDIO, 0, 1);
+		changed.set (DataType::AUDIO, 1, 0);
+		if (output_pin) { insert->set_output_map (0, changed); }
+		else { insert->set_input_map (0, changed); }
+		CPPUNIT_ASSERT_MESSAGE (output_pin ? "Output swap retained" : "Input swap retained", changed == (output_pin ? insert->output_map (0) : insert->input_map (0)));
+		CPPUNIT_ASSERT (changed != (output_pin ? output : input));
+		reject_export ("Custom VST3 pin routing", output_pin ? "Swapped plugin outputs" : "Swapped plugin inputs");
+		if (output_pin) { insert->set_output_map (0, output); }
+		else { insert->set_input_map (0, input); }
+	}
+	ChanMapping bypass; bypass.set (DataType::AUDIO, 0, 0);
+	auto disconnected = output; disconnected.unset (DataType::AUDIO, 0);
+	insert->set_output_map (0, disconnected);
+	insert->set_thru_map (bypass);
+	CPPUNIT_ASSERT_EQUAL (uint32_t (1), insert->thru_map ().n_total ());
+	reject_export ("Custom VST3 pin routing", "Plugin thru routing");
+	insert->set_thru_map (thru);
+	insert->set_output_map (0, output);
+	uint32_t changed_parameter = 0;
+	float changed_value = 0, original_value = 0;
+	bool altered = false;
+	for (uint32_t index = 0; index < plugin->parameter_count (); ++index) {
+		bool ok = false;
+		uint32_t parameter = plugin->nth_parameter (index, ok);
+		ParameterDescriptor descriptor;
+		if (!ok || !plugin->parameter_is_input (parameter) || plugin->get_parameter_descriptor (parameter, descriptor) ||
+		    descriptor.toggled || descriptor.enumeration || descriptor.integer_step || descriptor.upper <= descriptor.lower) { continue; }
+		auto control = insert->automation_control (Evoral::Parameter (PluginAutomation, 0, parameter));
+		if (!control) { continue; }
+		float original = plugin->get_parameter (parameter);
+		float target = descriptor.lower + (descriptor.upper - descriptor.lower) * (descriptor.to_interface (original) < .5 ? .73 : .27);
+		control->set_value (target, PBD::Controllable::NoGroup);
+		changed_value = plugin->get_parameter (parameter);
+		if (std::fabs (changed_value - original) > 1e-5) { changed_parameter = parameter; original_value = original; altered = true; break; }
+	}
+	CPPUNIT_ASSERT_MESSAGE ("Real plugin test needs a nondefault continuous parameter", altered);
+	auto parameter_value = [&] () {
+		bool found = false;
+		float current = 0;
+		for (auto const& item : *fixture.session->get_routes ()) {
+			if (item->name () != "Stereo") { continue; }
+			item->foreach_processor ([&] (std::weak_ptr<Processor> weak) {
+				if (auto value = std::dynamic_pointer_cast<PluginInsert> (weak.lock ())) {
+					CPPUNIT_ASSERT (!found);
+					current = value->plugin (0)->get_parameter (changed_parameter);
+					found = true;
+				}
+			});
+		}
+		CPPUNIT_ASSERT (found);
+		return current;
+	};
+	// Let the dummy engine deliver the parameter change to the plugin DSP.
+	g_usleep (100000);
+	insert->deactivate ();
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state ("Exchange"));
+	plugin.reset ();
+	insert.reset ();
+	route.reset ();
+	AudioEngine::instance ()->remove_session ();
+	fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("Original"), "Exchange", NULL, "", true));
+	AudioEngine::instance ()->set_session (fixture.session.get ());
+	// The plugin may quantize a requested parameter. Use its saved native
+	// value as the exchange reference, and still prove it is nondefault.
+	changed_value = parameter_value ();
+	CPPUNIT_ASSERT (std::fabs (changed_value - original_value) > 1e-5);
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("with-plugin.dawproject"));
+	auto exported = PX::DawProject::read (fixture.path ("with-plugin.dawproject"));
+	auto const& devices = track_named (exported, "Stereo").plugins;
+	CPPUNIT_ASSERT_EQUAL (size_t (1), devices.size ());
+	CPPUNIT_ASSERT_EQUAL (PX::canonical_vst3_id (info->unique_id), devices[0].id);
+	CPPUNIT_ASSERT (!devices[0].enabled);
+	PX::validate_vst3_state (devices[0].id, devices[0].state);
+	AudioEngine::instance ()->remove_session ();
+	fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("with-plugin.dawproject"),
+	                                                       fixture.path ("Returned"), "Exchange", fixture.report);
+	CPPUNIT_ASSERT (fixture.session);
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("returned.dawproject"));
+	auto returned = PX::DawProject::read (fixture.path ("returned.dawproject"));
+	CPPUNIT_ASSERT_EQUAL (devices[0].id, track_named (returned, "Stereo").plugins.at (0).id);
+	CPPUNIT_ASSERT_EQUAL (devices[0].state, track_named (returned, "Stereo").plugins.at (0).state);
+	CPPUNIT_ASSERT (!track_named (returned, "Stereo").plugins.at (0).enabled);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (changed_value, parameter_value (), 1e-5);
+}
 
 void ProjectSessionTest::region_fades_roundtrip ()
 {

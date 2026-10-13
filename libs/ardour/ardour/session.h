@@ -710,7 +710,8 @@ public:
 	void add_instant_xml (XMLNode&, bool write_to_config = true);
 	XMLNode* instant_xml (const std::string& str);
 
-	XMLNode* misc_port_state () { return _misc_port_state; };
+	std::unique_ptr<XMLNode> misc_port_state () const;
+	void merge_misc_port_state (const XMLNode&);
 
 	enum StateOfTheState {
 		Clean = 0x0,
@@ -1679,7 +1680,8 @@ private:
 	bool save_misc_port_state () const;
 	void update_misc_port_state (IOChange);
 
-	XMLNode*    _misc_port_state;
+	mutable PBD::Mutex _misc_port_state_lock;
+	XMLNode*           _misc_port_state;
 
 	samplepos_t _last_roll_location;
 	/** the session sample time at which we last rolled, located, or changed transport direction */

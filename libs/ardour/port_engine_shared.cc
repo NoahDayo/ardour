@@ -35,6 +35,7 @@ BackendPort::BackendPort (PortEngineSharedImpl &b, const std::string& name, Port
 	: _backend (b)
 	, _name  (name)
 	, _flags (flags)
+	, _connections (new BackendConnections)
 {
 	_capture_latency_range.min = 0;
 	_capture_latency_range.max = 0;
@@ -47,7 +48,7 @@ BackendPort::BackendPort (PortEngineSharedImpl &b, const std::string& name, Port
 BackendPort::~BackendPort ()
 {
 	_backend.port_connect_add_remove_callback (); // XXX -> RT
-	assert (_connections.empty());
+	assert (_connections.reader ()->empty ());
 }
 
 int
@@ -98,13 +99,16 @@ BackendPort::connect (BackendPortHandle port, BackendPortHandle self)
 void
 BackendPort::store_connection (BackendPortHandle port)
 {
-	/* XXX TODO: _connections MUST NOT CHANGE WHILE PROCESSING.
-	 * Most callers already hold the process-lock, so TRY-LOCK is the sucks-least stopgap
-	 * solution. Eventually connection changes SHOULD be done in sync with processing.
-	 * delegate via _port_connection_queue (and perhaps maintain a separate list for is_connected())
+	/* Keep the processing graph stable when the caller does not already own
+	 * the process lock. Readers outside processing (e.g. latency callbacks)
+	 * retain an immutable snapshot even when this try-lock cannot succeed.
 	 */
 	PBD::Mutex::Lock lm (AudioEngine::instance()->process_lock (), PBD::Mutex::TryLock);
-	_connections.insert (port);
+	{
+		RCUWriter<BackendConnections> writer (_connections);
+		writer.get_copy ()->insert (port);
+	}
+	_connections.flush ();
 }
 
 int
@@ -131,44 +135,42 @@ BackendPort::disconnect (BackendPortHandle port, BackendPortHandle self)
 
 void BackendPort::remove_connection (BackendPortHandle port)
 {
-	/* XXX TODO: _connections MUST NOT CHANGE WHILE PROCESSING.
-	 * Most callers already hold the process-lock, so TRY-LOCK is the sucks-least stopgap
-	 * solution. Eventually connection changes SHOULD be done in sync with processing.
-	 * delegate via _port_connection_queue (and perhaps maintain a separate list for is_connected())
-	 */
 	PBD::Mutex::Lock lm (AudioEngine::instance()->process_lock (), PBD::Mutex::TryLock);
-
-	std::set<BackendPortPtr>::iterator it = _connections.find (port);
-	assert (it != _connections.end ());
-	_connections.erase (it);
+	{
+		RCUWriter<BackendConnections> writer (_connections);
+		writer.get_copy ()->erase (port);
+	}
+	/* Old bidirectional connection sets must not keep ports in a reference
+	 * cycle after disconnection. Active readers still own their snapshots.
+	 */
+	_connections.flush ();
 }
 
 
 void BackendPort::disconnect_all (BackendPortHandle self)
 {
-	/* XXX TODO: _connections MUST NOT CHANGE WHILE PROCESSING.
-	 * Most callers already hold the process-lock, so TRY-LOCK is the sucks-least stopgap
-	 * solution. Eventually connection changes SHOULD be done in sync with processing.
-	 * delegate via _port_connection_queue (and perhaps maintain a separate list for is_connected())
-	 */
 	PBD::Mutex::Lock lm (AudioEngine::instance()->process_lock (), PBD::Mutex::TryLock);
-	while (!_connections.empty ()) {
-		std::set<BackendPortPtr>::iterator it = _connections.begin ();
-		(*it)->remove_connection (self);
-		_backend.port_connect_callback (name(), (*it)->name(), false);
-		_connections.erase (it);
+	auto connections = get_connections ();
+	for (auto const& port : *connections) {
+		/* Release each writer before touching the peer's connection set. */
+		remove_connection (port);
+		port->remove_connection (self);
+		_backend.port_connect_callback (name(), port->name(), false);
 	}
+	_connections.flush ();
 }
 
 bool
 BackendPort::is_connected (BackendPortHandle port) const
 {
-	return _connections.find (port) != _connections.end ();
+	auto connections = get_connections ();
+	return connections->find (port) != connections->end ();
 }
 
 bool BackendPort::is_physically_connected () const
 {
-	for (std::set<BackendPortPtr>::const_iterator it = _connections.begin (); it != _connections.end (); ++it) {
+	auto connections = get_connections ();
+	for (auto it = connections->begin (); it != connections->end (); ++it) {
 		if ((*it)->is_physical ()) {
 			return true;
 		}
@@ -187,7 +189,8 @@ BackendPort::set_latency_range (const LatencyRange &latency_range, bool for_play
 
 	lr = latency_range;
 
-	for (std::set<BackendPortPtr>::const_iterator it = _connections.begin (); it != _connections.end (); ++it) {
+	auto connections = get_connections ();
+	for (auto it = connections->begin (); it != connections->end (); ++it) {
 		if ((*it)->is_physical ()) {
 			(*it)->update_connected_latency (is_input ());
 		}
@@ -199,7 +202,8 @@ BackendPort::update_connected_latency (bool for_playback)
 {
 	LatencyRange lr;
 	lr.min = lr.max = 0;
-	for (std::set<BackendPortPtr>::const_iterator it = _connections.begin (); it != _connections.end (); ++it) {
+	auto connections = get_connections ();
+	for (auto it = connections->begin (); it != connections->end (); ++it) {
 		LatencyRange l;
 		l = (*it)->latency_range (for_playback);
 		lr.min = std::max (lr.min, l.min);
@@ -823,9 +827,9 @@ PortEngineSharedImpl::get_connections (PortEngine::PortHandle port_handle, std::
 
 	assert (0 == names.size ());
 
-	const std::set<BackendPortPtr>& connected_ports = port->get_connections ();
+	auto connected_ports = port->get_connections ();
 
-	for (std::set<BackendPortPtr>::const_iterator i = connected_ports.begin (); i != connected_ports.end (); ++i) {
+	for (std::set<BackendPortPtr>::const_iterator i = connected_ports->begin (); i != connected_ports->end (); ++i) {
 		names.push_back ((*i)->name ());
 	}
 
@@ -866,8 +870,8 @@ PortEngineSharedImpl::get_state () const
 	XMLNode* node (new XMLNode (X_("PortEngine")));
 	for (auto const& port : _system_inputs) {
 		assert (port->is_physical () && port->is_terminal ());
-		const std::set<BackendPortPtr>& connected_ports = port->get_connections ();
-		for (auto const& other : connected_ports) {
+		auto connected_ports = port->get_connections ();
+		for (auto const& other : *connected_ports) {
 			if (!other->is_physical () || !other->is_terminal ()) {
 				continue;
 			}
@@ -878,8 +882,8 @@ PortEngineSharedImpl::get_state () const
 	}
 	for (auto const& port : _system_midi_in) {
 		assert (port->is_physical () && port->is_terminal ());
-		const std::set<BackendPortPtr>& connected_ports = port->get_connections ();
-		for (auto const& other : connected_ports) {
+		auto connected_ports = port->get_connections ();
+		for (auto const& other : *connected_ports) {
 			if (!other->is_physical () || !other->is_terminal ()) {
 				continue;
 			}

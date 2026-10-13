@@ -317,6 +317,57 @@ has_unsupported_features (const Project& project)
 	return false;
 }
 
+std::string
+canonical_vst3_id (const std::string& id)
+{
+	std::string result;
+	if (id.size () != 32 && id.size () != 36) { throw ExchangeError ("Invalid VST3 class ID"); }
+	for (size_t i = 0; i < id.size (); ++i) {
+		if (id.size () == 36 && (i == 8 || i == 13 || i == 18 || i == 23)) {
+			if (id[i] != '-') { throw ExchangeError ("Invalid VST3 class ID"); }
+			continue;
+		}
+		if (!g_ascii_isxdigit (id[i])) { throw ExchangeError ("Invalid VST3 class ID"); }
+		result += g_ascii_toupper (id[i]);
+	}
+	return result;
+}
+
+void
+validate_vst3_state (const std::string& id, const std::string& state)
+{
+	/* A VST3 preset stores its class ID as 32 ASCII hex digits in the header.
+	 * Check it before handing opaque state to a plugin instance. */
+	require (state.size () >= 48 && state.size () <= 64 * 1024 * 1024 && state.compare (0, 4, "VST3") == 0,
+	         "Invalid VST3 preset header or size");
+	require (canonical_vst3_id (state.substr (8, 32)) == canonical_vst3_id (id), "VST3 preset class ID does not match the device");
+	uint64_t list = 0;
+	for (unsigned i = 0; i < 8; ++i) { list |= uint64_t (uint8_t (state[40 + i])) << (8 * i); }
+	require (list >= 48 && list <= state.size () - 8 && state.compare (size_t (list), 4, "List") == 0,
+	         "Invalid VST3 preset chunk list");
+	auto unsigned_at = [&] (size_t offset, unsigned bytes) {
+		uint64_t value = 0;
+		for (unsigned i = 0; i < bytes; ++i) { value |= uint64_t (uint8_t (state[offset + i])) << (8 * i); }
+		return value;
+	};
+	uint64_t count = unsigned_at (size_t (list) + 4, 4);
+	require (unsigned_at (4, 4) == 1, "Unsupported VST3 preset version");
+	require (count > 0 && count <= 10000 && count <= (state.size () - size_t (list) - 8) / 20,
+	         "Invalid VST3 preset chunk count");
+	std::set<std::string> chunks;
+	bool transferable = false;
+	for (uint64_t i = 0; i < count; ++i) {
+		size_t entry = size_t (list) + 8 + size_t (i) * 20;
+		std::string type = state.substr (entry, 4);
+		require ((type == "Comp" || type == "Cont" || type == "Info") && chunks.insert (type).second,
+		         "Unsupported or duplicate VST3 preset chunk; provide a rendered fallback");
+		transferable |= type == "Comp" || type == "Cont";
+		uint64_t offset = unsigned_at (entry + 4, 8), length = unsigned_at (entry + 12, 8);
+		require (offset >= 48 && offset <= list && length <= list - offset, "Invalid VST3 preset chunk range");
+	}
+	require (transferable, "VST3 preset has no component or controller state");
+}
+
 void
 validate_project (const Project& project)
 {
@@ -342,6 +393,7 @@ validate_project (const Project& project)
 	}
 	std::map<std::string, const Track*> tracks;
 	size_t masters = 0;
+	size_t plugin_state_bytes = 0;
 	for (auto const& track : project.tracks) {
 		text (track.id);
 		text (track.name);
@@ -356,6 +408,16 @@ validate_project (const Project& project)
 			text (send.destination);
 			require (!send.destination.empty () && send_targets.insert (send.destination).second &&
 			         nonnegative (send.volume) && send.volume <= std::numeric_limits<float>::max () && normalized (send.pan), "Invalid send destination, volume or pan");
+		}
+		require (track.plugins.size () <= 128 && (track.plugins.empty () || track.kind != TrackKind::Folder), "Invalid plugin count or track");
+		for (auto const& plugin : track.plugins) {
+			text (plugin.id); text (plugin.name); text (plugin.role); text (plugin.state_path);
+			require (canonical_vst3_id (plugin.id) == plugin.id && !plugin.name.empty () &&
+			         (plugin.role == "audioFX" || plugin.role == "instrument") && !plugin.state_path.empty () &&
+			         paths.insert (plugin.state_path).second, "Invalid VST3 plugin metadata or duplicate state path");
+			plugin_state_bytes += plugin.state.size ();
+			require (plugin_state_bytes <= 512 * 1024 * 1024, "Project plugin state exceeds the size limit");
+			if (!plugin.state.empty ()) { validate_vst3_state (plugin.id, plugin.state); }
 		}
 		for (bool pan : {false, true}) {
 			auto const& curve = pan ? track.pan_automation : track.volume_automation;

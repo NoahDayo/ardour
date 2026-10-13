@@ -43,6 +43,7 @@ class BackendPort;
 
 typedef std::shared_ptr<BackendPort> BackendPortPtr;
 typedef std::shared_ptr<BackendPort> const & BackendPortHandle;
+typedef std::set<BackendPortPtr> BackendConnections;
 
 class LIBARDOUR_API BackendPort : public ProtoPort
 {
@@ -80,13 +81,13 @@ class LIBARDOUR_API BackendPort : public ProtoPort
 	bool is_output ()    const { return flags () & IsOutput; }
 	bool is_physical ()  const { return flags () & IsPhysical; }
 	bool is_terminal ()  const { return flags () & IsTerminal; }
-	bool is_connected () const { return _connections.size () != 0; }
+	bool is_connected () const { return !_connections.reader ()->empty (); }
 
 	bool is_connected (BackendPortHandle port) const;
 	bool is_physically_connected () const;
 
-	const std::set<BackendPortPtr>& get_connections () const {
-		return _connections;
+	std::shared_ptr<BackendConnections const> get_connections () const {
+		return _connections.reader ();
 	}
 
 	int  connect (BackendPortHandle port, BackendPortHandle self);
@@ -114,7 +115,7 @@ private:
 	const PortFlags        _flags;
 	LatencyRange           _capture_latency_range;
 	LatencyRange           _playback_latency_range;
-	std::set<BackendPortPtr> _connections;
+	SerializedRCUManager<BackendConnections> _connections;
 
 	void store_connection (BackendPortHandle);
 	void remove_connection (BackendPortHandle);

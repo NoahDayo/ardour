@@ -79,6 +79,14 @@ struct Send {
 	double volume = 1; // Linear amplitude.
 	double pan = 0.5; // Normalized left-to-right.
 };
+struct PluginDevice {
+	std::string id; // VST3 class ID, 32 hexadecimal characters.
+	std::string name;
+	std::string role; // audioFX or instrument.
+	std::string state_path; // Embedded DAWproject .vstpreset member.
+	std::string state; // Binary VST3 preset, populated when reading an archive.
+	bool enabled = true;
+};
 struct Track {
 	std::string id;
 	std::string name;
@@ -95,6 +103,7 @@ struct Track {
 	Automation volume_automation; // Linear amplitude, absolute arrangement times.
 	Automation pan_automation; // Normalized left-to-right.
 	std::vector<Send> sends;
+	std::vector<PluginDevice> plugins; // Ordered channel processors.
 	std::vector<Clip> clips;
 };
 
@@ -161,6 +170,8 @@ LIBARDOUR_API double automation_value (const Automation&, double time);
 LIBARDOUR_API Automation slice_automation (const Automation&, double start, double end);
 LIBARDOUR_API Automation linearize_automation (const Automation&, double quantum);
 LIBARDOUR_API Automation multiply_automation (const Automation&, const Automation&, double quantum, double tolerance = 0.00001);
+LIBARDOUR_API std::string canonical_vst3_id (const std::string&);
+LIBARDOUR_API void validate_vst3_state (const std::string& id, const std::string& state);
 LIBARDOUR_API void validate_project (const Project&);
 LIBARDOUR_API bool has_unsupported_features (const Project&);
 

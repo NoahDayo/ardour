@@ -733,8 +733,11 @@ Session::destroy ()
 
 	delete _engine_state;
 
-	delete _misc_port_state;
-	_misc_port_state = 0;
+	{
+		PBD::Mutex::Lock lm (_misc_port_state_lock);
+		delete _misc_port_state;
+		_misc_port_state = 0;
+	}
 
 	delete state_tree;
 	state_tree = 0;
@@ -991,7 +994,8 @@ Session::reconnect_ltc_output ()
 	if (!_ltc_output_port) {
 		return;
 	}
-	XMLNode* n = _misc_port_state ? _misc_port_state->child ("LTC") : 0;
+	std::unique_ptr<XMLNode> state = misc_port_state ();
+	XMLNode* n = state ? state->child ("LTC") : 0;
 	XMLNode* p = n ? n->child ("Port") : 0;
 	if (p) {
 		PBD::Unwinder uw (_reconnecting_routes_in_progress, true);
@@ -1029,11 +1033,8 @@ void
 Session::reconnect_click_output ()
 {
 	PBD::Unwinder uw (_reconnecting_routes_in_progress, true);
-	if (_misc_port_state) {
-		setup_click_state (_misc_port_state);
-	} else {
-		setup_click_state (0);
-	}
+	std::unique_ptr<XMLNode> state = misc_port_state ();
+	setup_click_state (state.get ());
 }
 
 void
@@ -1066,12 +1067,16 @@ Session::setup_click_state (const XMLNode* node)
 	_clicking = Config->get_clicking ();
 }
 
+std::unique_ptr<XMLNode>
+Session::misc_port_state () const
+{
+	PBD::Mutex::Lock lm (_misc_port_state_lock);
+	return std::unique_ptr<XMLNode> (_misc_port_state ? new XMLNode (*_misc_port_state) : nullptr);
+}
+
 void
 Session::update_misc_port_state (IOChange change)
 {
-	if (!_misc_port_state) {
-		return;
-	}
 	if (0 == (change.type & IOChange::ConnectionsChanged)) {
 		return;
 	}
@@ -1082,18 +1087,21 @@ Session::update_misc_port_state (IOChange change)
 		return;
 	}
 
+	/* IO state can take the process lock or emit callbacks. Collect it before
+	 * locking the shared XML tree.
+	 */
+	XMLNode state (X_("SessionPorts"));
 	if (_click_io) {
-		_misc_port_state->remove_nodes ("Click");
-		XMLNode* node = _misc_port_state->add_child ("Click");
+		XMLNode* node = state.add_child ("Click");
 		node->add_child_nocopy (_click_io->get_state ());
 		node->add_child_nocopy (_click_gain->get_state ());
 	}
 
 	if (_ltc_output_port) {
-		_misc_port_state->remove_nodes ("LTC");
-		XMLNode* node = _misc_port_state->add_child ("LTC");
+		XMLNode* node = state.add_child ("LTC");
 		node->add_child_nocopy (_ltc_output_port->get_state ());
 	}
+	merge_misc_port_state (state);
 }
 
 void

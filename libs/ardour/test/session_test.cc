@@ -5,6 +5,8 @@
 #include <stdexcept>
 #include <chrono>
 #include <future>
+#include <atomic>
+#include <thread>
 
 #include "pbd/textreceiver.h"
 #include "pbd/file_utils.h"
@@ -14,6 +16,11 @@
 #include "ardour/midi_model.h"
 #include "ardour/midi_patch_manager.h"
 #include "ardour/search_paths.h"
+#include "ardour/port_engine_shared.h"
+#include "ardour/auditioner.h"
+#include "ardour/filesystem_paths.h"
+#include "ardour/amp.h"
+#include "ardour/gain_control.h"
 
 #include "test_util.h"
 
@@ -24,6 +31,165 @@ CPPUNIT_TEST_SUITE_REGISTRATION (SessionTest);
 using namespace std;
 using namespace ARDOUR;
 using namespace PBD;
+
+namespace {
+class ConnectionTestPort : public BackendPort {
+public:
+	ConnectionTestPort (PortEngineSharedImpl& backend, const std::string& name, PortFlags flags)
+		: BackendPort (backend, name, flags) {}
+	DataType type () const override { return DataType::AUDIO; }
+	void* get_buffer (pframes_t) override { return nullptr; }
+};
+
+class ConnectionTestBackend : public PortEngineSharedImpl {
+public:
+	ConnectionTestBackend (PortManager& manager) : PortEngineSharedImpl (manager, "Connections") {}
+	~ConnectionTestBackend () {
+		unregister_ports ();
+		for (auto* change : _port_connection_queue) { delete change; }
+	}
+private:
+	BackendPort* port_factory (const std::string& name, DataType, PortFlags flags) override {
+		return new ConnectionTestPort (*this, name, flags);
+	}
+};
+}
+
+void
+SessionTest::backend_connections ()
+{
+	ConnectionTestBackend backend (*AudioEngine::create ());
+	auto output = std::dynamic_pointer_cast<BackendPort> (backend.register_port ("source", DataType::AUDIO, IsOutput));
+	auto input = std::dynamic_pointer_cast<BackendPort> (backend.register_port ("sink", DataType::AUDIO, IsInput));
+	CPPUNIT_ASSERT (output && input);
+	CPPUNIT_ASSERT_EQUAL (0, backend.connect (output, input->name ()));
+	auto old_output = output->get_connections ();
+	auto old_input = input->get_connections ();
+	CPPUNIT_ASSERT_EQUAL (0, backend.disconnect (output, input->name ()));
+	CPPUNIT_ASSERT (output->get_connections ()->empty ());
+	CPPUNIT_ASSERT (input->get_connections ()->empty ());
+	CPPUNIT_ASSERT_EQUAL (size_t (1), old_output->size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (1), old_input->size ());
+	CPPUNIT_ASSERT (*old_output->begin () == input);
+	CPPUNIT_ASSERT (*old_input->begin () == output);
+
+	/* Latency/graph readers run outside the engine process lock. Their
+	 * connection iterators must survive concurrent connect/disconnect. */
+	std::atomic<bool> done (false), valid (true);
+	std::atomic<unsigned> reads (0);
+	std::promise<void> reading;
+	auto started = reading.get_future ();
+	std::thread reader ([&] {
+		reading.set_value ();
+		do {
+			auto snapshot = input->get_connections ();
+			for (auto const& port : *snapshot) {
+				if (port != output) { valid.store (false); }
+			}
+			std::vector<std::string> names;
+			if (backend.get_connections (input, names, false) < 0 || names.size () > 1 ||
+			    (!names.empty () && names.front () != output->name ())) { valid.store (false); }
+			++reads;
+		} while (!done.load ());
+	});
+	started.wait ();
+	bool changed = true;
+	for (unsigned i = 0; i < 2000; ++i) {
+		if (backend.connect (output, input->name ()) || backend.disconnect (output, input->name ())) { changed = false; break; }
+	}
+	done.store (true);
+	reader.join ();
+	CPPUNIT_ASSERT (changed && valid.load () && reads.load () > 0);
+	CPPUNIT_ASSERT (output->get_connections ()->empty () && input->get_connections ()->empty ());
+
+	/* Retained generations own ports, but disconnected graphs must not
+	 * leave mutual references in the RCU manager after readers release. */
+	std::weak_ptr<BackendPort> weak_output = output, weak_input = input;
+	backend.unregister_port (output);
+	backend.unregister_port (input);
+	output.reset (); input.reset ();
+	CPPUNIT_ASSERT (!weak_output.expired () && !weak_input.expired ());
+	old_output.reset (); old_input.reset ();
+	CPPUNIT_ASSERT (weak_output.expired () && weak_input.expired ());
+}
+
+void
+SessionTest::misc_port_state ()
+{
+	struct Fixture {
+		Fixture () { create_and_start_dummy_backend (); }
+		~Fixture () { AudioEngine::instance ()->remove_session (); session.reset (); stop_and_destroy_backend (); }
+		std::unique_ptr<Session> session;
+	} fixture;
+	const auto path = Glib::build_filename (new_test_output_dir ("misc-ports"), "Ports");
+	fixture.session.reset (load_session (path, "Ports"));
+	Session& session = *fixture.session;
+	CPPUNIT_ASSERT (session.the_auditioner ());
+	XMLNode patch ("SessionPorts");
+	session.the_auditioner ()->update_misc_port_state (patch);
+	patch.child ("Auditioner")->add_child ("Monitor")->set_property ("sequence", "initial");
+	session.merge_misc_port_state (patch);
+	auto saved = session.misc_port_state ();
+	CPPUNIT_ASSERT (saved && saved->child ("Auditioner")->child ("DirectOut"));
+	/* disconnect emits output_changed synchronously. Restoring the saved
+	 * DirectOut must not dereference the child that callback replaces. */
+	CPPUNIT_ASSERT_EQUAL (0, session.the_auditioner ()->connect ());
+	CPPUNIT_ASSERT (saved->child ("Auditioner")->child ("DirectOut"));
+	auto click_gain = session.click_gain ()->gain_control ();
+	click_gain->set_value (0.25, PBD::Controllable::NoGroup);
+	XMLNode click_patch ("SessionPorts");
+	click_patch.add_child ("Click")->add_child_nocopy (session.click_gain ()->get_state ());
+	session.merge_misc_port_state (click_patch);
+	click_gain->set_value (0.375, PBD::Controllable::NoGroup);
+	CPPUNIT_ASSERT_EQUAL (0, session.save_state ("Ports"));
+	session.reconnect_click_output ();
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (0.375, click_gain->get_value (), 1e-7);
+
+	std::atomic<bool> done (false);
+	std::atomic<unsigned> updates (0);
+	std::promise<void> writing;
+	auto started = writing.get_future ();
+	std::thread writer ([&] {
+		writing.set_value ();
+		do {
+			XMLNode change ("SessionPorts");
+			change.add_child ("Auditioner")->add_child ("Monitor")->set_property ("sequence", ++updates);
+			session.merge_misc_port_state (change);
+		} while (!done.load ());
+	});
+	started.wait ();
+	bool valid = true;
+	const auto rcfile = Glib::build_filename (user_config_directory (), "session_port.rc");
+	for (unsigned i = 0; i < 20; ++i) {
+		if (session.save_state ("Ports")) { valid = false; break; }
+		XMLTree parsed;
+		if (!parsed.read (rcfile) || !parsed.root () || parsed.root ()->name () != "SessionPorts") { valid = false; break; }
+		auto auditioner = parsed.root ()->child ("Auditioner");
+		if (!auditioner || !auditioner->child ("DirectOut") || !auditioner->child ("Monitor")) { valid = false; break; }
+		auto snapshot = session.misc_port_state ();
+		std::string before, after;
+		snapshot->child ("Auditioner")->child ("Monitor")->get_property ("sequence", before);
+		g_usleep (500);
+		snapshot->child ("Auditioner")->child ("Monitor")->get_property ("sequence", after);
+		if (before != after) { valid = false; break; }
+	}
+	done.store (true);
+	writer.join ();
+	CPPUNIT_ASSERT (valid && updates.load () > 0);
+	std::string initial;
+	CPPUNIT_ASSERT (saved->child ("Auditioner")->child ("Monitor")->get_property ("sequence", initial));
+	CPPUNIT_ASSERT_EQUAL (std::string ("initial"), initial);
+	CPPUNIT_ASSERT_EQUAL (0, session.save_state ("Ports"));
+	click_gain.reset ();
+	AudioEngine::instance ()->remove_session ();
+	fixture.session.reset ();
+	fixture.session.reset (load_session (path, "Ports"));
+	auto restored = fixture.session->misc_port_state ();
+	CPPUNIT_ASSERT (restored && restored->child ("Auditioner")->child ("DirectOut"));
+	unsigned sequence = 0;
+	CPPUNIT_ASSERT (restored->child ("Auditioner")->child ("Monitor")->get_property ("sequence", sequence));
+	CPPUNIT_ASSERT_EQUAL (updates.load (), sequence);
+}
 
 void
 SessionTest::midnam_shutdown ()

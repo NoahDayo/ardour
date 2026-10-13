@@ -1162,16 +1162,16 @@ void*
 PulseAudioPort::get_buffer (pframes_t n_samples)
 {
 	if (is_input ()) {
-		const std::set<BackendPortPtr>&          connections = get_connections ();
-		std::set<BackendPortPtr>::const_iterator it          = connections.begin ();
+		auto connections = get_connections ();
+		std::set<BackendPortPtr>::const_iterator it          = connections->begin ();
 
-		if (it == connections.end ()) {
+		if (it == connections->end ()) {
 			memset (_buffer, 0, n_samples * sizeof (Sample));
 		} else {
 			std::shared_ptr<PulseAudioPort> source = std::dynamic_pointer_cast<PulseAudioPort> (*it);
 			assert (source && source->is_output ());
 			memcpy (_buffer, source->const_buffer (), n_samples * sizeof (Sample));
-			while (++it != connections.end ()) {
+			while (++it != connections->end ()) {
 				source = std::dynamic_pointer_cast<PulseAudioPort> (*it);
 				assert (source && source->is_output ());
 				Sample*       dst = _buffer;
@@ -1208,9 +1208,9 @@ void* PulseMidiPort::get_buffer (pframes_t /*n_samples*/)
 {
 	if (is_input ()) {
 		_buffer.clear ();
-		const std::set<BackendPortPtr>& connections = get_connections ();
-		for (std::set<BackendPortPtr>::const_iterator i = connections.begin ();
-		     i != connections.end ();
+		auto connections = get_connections ();
+		for (std::set<BackendPortPtr>::const_iterator i = connections->begin ();
+		     i != connections->end ();
 		     ++i) {
 			const PulseMidiBuffer* src = std::dynamic_pointer_cast<PulseMidiPort> (*i)->const_buffer ();
 			for (PulseMidiBuffer::const_iterator it = src->begin (); it != src->end (); ++it) {

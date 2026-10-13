@@ -325,15 +325,52 @@ struct Parser {
 					}
 					track.sends.push_back (send);
 				}
+			} else if (is (item, "Devices")) {
+				attributes (item, {});
+				for (Node device : children (item)) {
+					if (!is (device, "Vst3Plugin")) { diagnostic (device, "Device requires a compatible plugin or rendered fallback"); continue; }
+					attributes (device, {"id", "name", "color", "comment", "deviceID", "deviceName", "deviceRole", "deviceVendor", "loaded", "pluginVersion"});
+					if (!boolean (device, "loaded", true) || !has (device, "deviceID")) {
+						diagnostic (device, "Unloaded or unidentified VST3 plugin requires a rendered fallback"); continue;
+					}
+					PluginDevice plugin;
+					plugin.id = canonical_vst3_id (attr (device, "deviceID"));
+					plugin.name = attr (device, "deviceName");
+					plugin.role = attr (device, "deviceRole");
+					if (plugin.role != "audioFX" && plugin.role != "instrument") {
+						diagnostic (device, "Unsupported VST3 role requires a rendered fallback"); continue;
+					}
+					Node state = child (device, "State");
+					if (!state || boolean (state, "external", false)) {
+						diagnostic (device, "VST3 plugin needs embedded preset state"); continue;
+					}
+					attributes (state, {"path", "external"});
+					if (!children (state).empty ()) { throw ExchangeError ("VST3 preset reference has unexpected content"); }
+					plugin.state_path = required (state, "path");
+					if (Node enabled = child (device, "Enabled")) {
+						attributes (enabled, {"id", "name", "value"});
+						if (!children (enabled).empty ()) { throw ExchangeError ("VST3 enabled parameter has unexpected content"); }
+						plugin.enabled = boolean (enabled, "value", true);
+					}
+					for (Node parameter : children (device)) {
+						if (is (parameter, "Parameters")) {
+							attributes (parameter, {});
+							if (!children (parameter).empty ()) { diagnostic (parameter, "Independent VST3 parameter values or automation require verification against preset state"); }
+						} else if (!is (parameter, "Enabled") && !is (parameter, "State")) {
+							diagnostic (parameter, "Unknown VST3 device element");
+						}
+					}
+					track.plugins.push_back (std::move (plugin));
+				}
 			} else if (!children (item).empty ()) {
 				diagnostic (item, "Channel processing or routing is not yet converted");
-			} else if (!is (item, "Devices") && !is (item, "Sends")) {
+			} else if (!is (item, "Sends")) {
 				diagnostic (item, "Unknown channel element");
 			} else {
 				attributes (item, {});
 			}
 		}
-		child (node, "Volume"); child (node, "Pan"); child (node, "Mute");
+		child (node, "Volume"); child (node, "Pan"); child (node, "Mute"); child (node, "Devices");
 	}
 
 	void structure (Node node, const std::string& parent = "")
@@ -748,6 +785,18 @@ struct Writer {
 		property (output, "audioChannels", track.channels);
 		property (output, "solo", track.solo ? "true" : "false");
 		if (!track.destination.empty ()) { property (output, "destination", channel_ids.at (track.destination)); }
+		if (!track.plugins.empty ()) {
+			Node devices = element (output, "Devices");
+			for (auto const& plugin : track.plugins) {
+				Node device = element (devices, "Vst3Plugin");
+				property (device, "deviceID", plugin.id);
+				property (device, "deviceName", plugin.name);
+				property (device, "deviceRole", plugin.role);
+				property (device, "loaded", "true");
+				property (element (device, "Enabled"), "value", plugin.enabled ? "true" : "false");
+				property (element (device, "State"), "path", plugin.state_path);
+			}
+		}
 		Node mute = element (output, "Mute");
 		property (mute, "value", track.mute ? "true" : "false");
 		Node pan = element (output, "Pan");
@@ -969,6 +1018,16 @@ DawProject::read (const std::string& filename, CancelCheck cancel)
 			throw ExchangeError ("Missing embedded media: " + media.path);
 		}
 	}
+	size_t remaining_state = 512 * 1024 * 1024;
+	for (auto& track : result.tracks) {
+		for (auto& plugin : track.plugins) {
+			if (cancel && cancel ()) { throw ArchiveCancelled (); }
+			plugin.state = archive.read_text (plugin.state_path, std::min (size_t (64 * 1024 * 1024), remaining_state));
+			remaining_state -= plugin.state.size ();
+			validate_vst3_state (plugin.id, plugin.state);
+		}
+	}
+	validate_project (result);
 	return result;
 }
 
@@ -983,6 +1042,11 @@ DawProject::write (const Project& project, const std::string& filename,
                    const std::map<std::string, std::string>& media_sources, CancelCheck cancel)
 {
 	std::string xml = write_xml (project);
+	for (auto const& track : project.tracks) {
+		for (auto const& plugin : track.plugins) {
+			if (plugin.state.empty ()) { throw ExchangeError ("Missing embedded VST3 preset state: " + plugin.name); }
+		}
+	}
 	ProjectArchiveWriter output (filename, ArchiveLimits (), cancel);
 	output.add_text ("project.xml", xml);
 	output.add_text ("metadata.xml", "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<MetaData/>\n");
@@ -991,6 +1055,12 @@ DawProject::write (const Project& project, const std::string& filename,
 		auto source = media_sources.find (media.id);
 		if (source == media_sources.end ()) { throw ExchangeError ("Missing export media source: " + media.id); }
 		output.add_file (media.path, source->second);
+	}
+	for (auto const& track : project.tracks) {
+		for (auto const& plugin : track.plugins) {
+			if (cancel && cancel ()) { throw ArchiveCancelled (); }
+			output.add_text (plugin.state_path, plugin.state);
+		}
 	}
 	output.finish ();
 }

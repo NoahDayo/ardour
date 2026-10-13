@@ -642,6 +642,7 @@ VST3Plugin::set_state (const XMLNode& node, int version)
 	}
 
 	XMLNode* chunk;
+	bool chunk_failed = false;
 	if ((chunk = find_named_node (node, X_("chunk"))) != 0) {
 		for (iter = chunk->children ().begin (); iter != chunk->children ().end (); ++iter) {
 			if ((*iter)->is_content ()) {
@@ -650,12 +651,14 @@ VST3Plugin::set_state (const XMLNode& node, int version)
 				RAMStream stream (_data, size);
 				if (!_plug->load_state (stream)) {
 					error << string_compose (_("VST3<%1>: failed to load chunk-data"), name ()) << endmsg;
+					chunk_failed = true;
 				}
 			}
 		}
 	}
 
-	return Plugin::set_state (node, version);
+	int result = Plugin::set_state (node, version);
+	return chunk_failed ? -1 : result;
 }
 
 /* ****************************************************************************/
@@ -2776,7 +2779,7 @@ VST3PI::load_state (RAMStream& stream)
 				synced = true;
 			}
 
-			if (!(re2 == kResultOk || re2 == kNotImplemented || res == kResultOk || res == kNotImplemented)) {
+			if (!((re2 == kResultOk || re2 == kNotImplemented) && (res == kResultOk || res == kNotImplemented))) {
 				DEBUG_TRACE (DEBUG::VST3Config, "VST3PI::load_state: failed to restore component state\n");
 				rv = false;
 			}

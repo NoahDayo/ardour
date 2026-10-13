@@ -7,6 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -384,6 +385,49 @@ class DawProjectTest(unittest.TestCase):
                 target = self.root / "lost.xml"
                 self.command("rewrite", self.input, target, status=1)
                 self.assertFalse(target.exists())
+
+    def test_vst3_state_archive_round_trip_and_rejection(self):
+        class_id = "00112233445566778899AABBCCDDEEFF"
+        path = "plugins/effect.vstpreset"
+        state = (b"VST3" + struct.pack("<I", 1) + class_id.encode("ascii") + struct.pack("<Q", 48) + b"List"
+                 + struct.pack("<I", 1) + b"Comp" + struct.pack("<QQ", 48, 0))
+        device = ('<Devices><Vst3Plugin deviceID="%s" deviceName="Shared Effect" deviceRole="audioFX">'
+                  '<Enabled value="false"/><State path="%s"/></Vst3Plugin></Devices>') % (class_id.lower(), path)
+        xml = PROJECT.replace('<Mute value="false"/>', device + '<Mute value="false"/>', 1)
+        parsed = self.parse(xml)
+        self.assertEqual(parsed["report"], [])
+        self.assertEqual(parsed["tracks"][1]["plugins"], [{"id": class_id, "name": "Shared Effect", "role": "audioFX",
+                                                         "state_path": path, "state_size": 0, "enabled": False}])
+        rewritten = self.root / "plugin.xml"
+        self.command("rewrite", self.input, rewritten)
+        self.assert_schema(rewritten)
+        self.assertEqual(self.semantic(json.loads(self.command("parse", rewritten).stdout)), self.semantic(parsed))
+
+        source = self.package(xml)
+        with zipfile.ZipFile(source, "a") as archive:
+            archive.writestr(path, state)
+        loaded = json.loads(self.command("read", source).stdout)
+        self.assertEqual(loaded["tracks"][1]["plugins"][0]["state_size"], len(state))
+        output = self.root / "plugin-output.dawproject"
+        self.command("repack", source, output, self.root)
+        with zipfile.ZipFile(output) as archive:
+            self.assertEqual(archive.read(path), state)
+            self.assert_schema(self.root / "plugin.xml")
+
+        for bad in [state.replace(class_id.encode("ascii"), b"F" * 32), b"wrong" + state[5:],
+                    state[:-4] + struct.pack("<I", 1), state.replace(b"Comp", b"Prog"), state.replace(b"Comp", b"Info"),
+                    state[:48] + b"List" + struct.pack("<I", 0), state[:4] + struct.pack("<I", 2) + state[8:]]:
+            broken = self.root / "broken.dawproject"
+            with zipfile.ZipFile(broken, "w") as archive:
+                archive.writestr("project.xml", xml)
+                archive.writestr(path, bad)
+            self.command("read", broken, status=1)
+        missing = self.package(xml)
+        self.command("read", missing, status=1)
+        for changed in [xml.replace('<State path=', '<State external="true" path='),
+                        xml.replace('<Enabled value="false"/>', '<Parameters><RealParameter parameterID="1" unit="normalized" value="0.4"/></Parameters><Enabled value="false"/>')]:
+            self.assertTrue(any(item["disposition"] == 3 for item in self.parse(changed)["report"]))
+        self.parse(xml.replace(class_id.lower(), "invalid-id"), status=1)
 
     def test_reject_malformed_and_out_of_range_values(self):
         changes = [('version="1.0"', 'version="2.0"'), ('value="100"', 'value="NaN"'),

@@ -1593,9 +1593,9 @@ void*
 DummyAudioPort::get_buffer (pframes_t n_samples)
 {
 	if (is_input ()) {
-		const std::set<BackendPortPtr>& connections = get_connections ();
-		std::set<BackendPortPtr>::const_iterator it = connections.begin ();
-		if (it == connections.end ()) {
+		auto connections = get_connections ();
+		std::set<BackendPortPtr>::const_iterator it = connections->begin ();
+		if (it == connections->end ()) {
 			memset (_buffer, 0, n_samples * sizeof (Sample));
 		} else {
 			std::shared_ptr<DummyAudioPort> source = std::dynamic_pointer_cast<DummyAudioPort>(*it);
@@ -1604,7 +1604,7 @@ DummyAudioPort::get_buffer (pframes_t n_samples)
 				source->get_buffer(n_samples); // generate signal.
 			}
 			memcpy (_buffer, source->const_buffer (), n_samples * sizeof (Sample));
-			while (++it != connections.end ()) {
+			while (++it != connections->end ()) {
 				source = std::dynamic_pointer_cast<DummyAudioPort>(*it);
 				assert (source && source->is_output ());
 				Sample* dst = buffer ();
@@ -1871,9 +1871,9 @@ void* DummyMidiPort::get_buffer (pframes_t n_samples)
 {
 	if (is_input ()) {
 		_buffer.clear ();
-		const std::set<BackendPortPtr>& connections = get_connections ();
-		for (std::set<BackendPortPtr>::const_iterator i = connections.begin ();
-				i != connections.end ();
+		auto connections = get_connections ();
+		for (std::set<BackendPortPtr>::const_iterator i = connections->begin ();
+				i != connections->end ();
 				++i) {
 			std::shared_ptr<DummyMidiPort> source = std::dynamic_pointer_cast<DummyMidiPort>(*i);
 			if (source->is_physical() && source->is_terminal()) {

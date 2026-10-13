@@ -30,6 +30,7 @@
 #include "temporal/tempo.h"
 #include "evoral/Event.h"
 #include "ardour/audioengine.h"
+#include "ardour/amp.h"
 #include "ardour/audioregion.h"
 #include "ardour/audio_track.h"
 #include "ardour/audio_port.h"
@@ -49,6 +50,8 @@
 #include "ardour/pannable.h"
 #include "ardour/phase_control.h"
 #include "ardour/polarity_processor.h"
+#include "ardour/plugin_insert.h"
+#include "ardour/plugin_manager.h"
 #include "ardour/triggerbox.h"
 #include "ardour/velocity_control.h"
 #include "ardour/location.h"
@@ -64,6 +67,24 @@ namespace {
 void cancelled (const CancelCheck& check)
 {
 	if (check && check ()) { throw ArchiveCancelled (); }
+}
+
+bool default_plugin_mapping (const PluginInsert& insert)
+{
+	if (insert.get_count () != 1 || insert.has_sidechain () || insert.thru_map ().n_total ()) { return false; }
+	ChanMapping input;
+	auto plugin = insert.plugin (0);
+	for (DataType::iterator type = DataType::begin (); type != DataType::end (); ++type) {
+		uint32_t shift = 0, next = 0, count = insert.input_streams ().get (*type);
+		for (uint32_t pin = 0; pin < insert.natural_input_streams ().get (*type); ++pin) {
+			if (plugin->describe_io_port (*type, true, pin).is_sidechain) { ++shift; continue; }
+			if (insert.splitting ()) {
+				if (count) { input.set (*type, pin, next++ % count); }
+			} else if (pin - shift < count) { input.set (*type, pin, pin - shift); }
+		}
+	}
+	ChanMapping output (ChanCount::min (insert.natural_output_streams (), insert.output_streams ()));
+	return input == insert.input_map (0) && output == insert.output_map (0);
 }
 
 typedef std::unique_ptr<GFile, void (*) (gpointer)> FileObject;
@@ -428,6 +449,40 @@ void populate (Session& session, const Project& project, const std::map<std::str
 		if (auto pan = route->pan_azimuth_control ()) { pan->set_value (track.pan, PBD::Controllable::NoGroup); }
 		populate_automation (session, track.volume_automation, route->gain_control (), track.name + " volume", report);
 		populate_automation (session, track.pan_automation, route->pan_azimuth_control (), track.name + " pan", report);
+		for (auto const& device : track.plugins) {
+			cancelled (cancel);
+			validate_vst3_state (device.id, device.state);
+			PluginInfoPtr info;
+			for (auto const& candidate : PluginManager::instance ().vst3_plugin_info ()) {
+				if (canonical_vst3_id (candidate->unique_id) == device.id) { info = candidate; break; }
+			}
+			if (!info) { throw ExchangeError (track.name + ": VST3 plugin is not installed: " + device.name + " (" + device.id + "); provide a rendered track fallback"); }
+			if ((device.role == "instrument" && (!info->is_instrument () || track.kind != TrackKind::MIDI)) ||
+			    (device.role == "audioFX" && !info->is_effect ())) {
+				throw ExchangeError (track.name + ": VST3 role or track type differs from the installed plugin: " + device.name);
+			}
+			PluginPtr plugin = info->load (session);
+			if (!plugin) { throw ExchangeError (track.name + ": cannot load VST3 plugin " + device.name); }
+			auto insert = std::make_shared<PluginInsert> (session, session, plugin);
+			if (insert->has_sidechain () || route->add_processor (insert, PreFader)) {
+				throw ExchangeError (track.name + ": cannot route imported VST3 plugin " + device.name);
+			}
+			if (insert->get_count () != 1 || !default_plugin_mapping (*insert) || insert->output_streams ().n_audio () > 2) {
+				throw ExchangeError (track.name + ": VST3 plugin needs replicated instances or unsupported channel routing; provide a rendered fallback: " + device.name);
+			}
+			XMLNode state (plugin->state_node_name ());
+			XMLNode* chunk = new XMLNode ("chunk");
+			gchar* encoded = g_base64_encode (reinterpret_cast<const guchar*> (device.state.data ()), device.state.size ());
+			if (!encoded) { delete chunk; throw ExchangeError ("Cannot encode VST3 preset state"); }
+			chunk->add_content (encoded);
+			g_free (encoded);
+			state.add_child_nocopy (*chunk);
+			if (plugin->set_state (state, PBD::Stateful::current_state_version)) {
+				throw ExchangeError (track.name + ": cannot apply VST3 preset state for " + device.name);
+			}
+			if (!device.enabled) { insert->deactivate (); }
+			report.push_back ({Disposition::Preserved, device.name, "Matched VST3 class ID and restored embedded preset state"});
+		}
 	}
 
 	samplepos_t end = 0;
@@ -828,10 +883,13 @@ Project collect (Session& session, AudioAssets& assets, const CancelCheck& cance
 		} else if (!panner.empty () && panner != "http://ardour.org/plugin/panner_balance" && panner != "http://ardour.org/plugin/panner_1in2out") {
 			unsupported (project, track.name, "Unsupported panner");
 		}
+		bool after_fader = false, after_send = false;
 		route->foreach_processor ([&] (std::weak_ptr<Processor> weak) {
 			auto processor = weak.lock ();
 			if (!processor) { return; }
+			if (processor == route->amp ()) { after_fader = true; }
 			if (auto send = std::dynamic_pointer_cast<InternalSend> (processor)) {
+				after_send = true;
 				if (send->role () != Delivery::Aux || !send->target_route () || send->target_route ()->is_master () ||
 				    std::find (routes.begin (), routes.end (), send->target_route ()) == routes.end ()) {
 					unsupported (project, track.name, "Unsupported internal send destination or role");
@@ -859,6 +917,48 @@ Project collect (Session& session, AudioAssets& assets, const CancelCheck& cance
 			}
 			if (auto box = std::dynamic_pointer_cast<TriggerBox> (processor)) {
 				if (!box->empty ()) { unsupported (project, track.name, "Cue clips cannot yet be exchanged"); }
+				return;
+			}
+			if (auto insert = std::dynamic_pointer_cast<PluginInsert> (processor)) {
+				if (after_fader || after_send) {
+					unsupported (project, track.name, "VST3 plugins must precede the fader and sends; render processing first: " + processor->display_name ());
+					return;
+				}
+				auto plugin = insert->plugin (0);
+				auto info = plugin ? plugin->get_info () : PluginInfoPtr ();
+				if (!info || info->type != VST3 || insert->get_count () != 1 || insert->has_sidechain () || insert->custom_cfg () || insert->strict_io ()) {
+					unsupported (project, track.name, "Plugin configuration requires a compatible VST3 instance or rendered fallback: " + processor->display_name ());
+					return;
+				}
+				if (!default_plugin_mapping (*insert)) {
+					unsupported (project, track.name, "Custom VST3 pin routing requires a rendered fallback: " + processor->display_name ());
+					return;
+				}
+				for (auto const& control : insert->controls ()) {
+					check_control (project, processor->display_name (), std::dynamic_pointer_cast<AutomationControl> (control.second));
+				}
+				std::unique_ptr<XMLNode> state (&plugin->get_state ());
+				auto chunks = state->children ("chunk");
+				if (chunks.size () != 1 || chunks.front ()->children ().size () != 1 || !chunks.front ()->children ().front ()->is_content ()) {
+					unsupported (project, track.name, "VST3 plugin has no transferable preset state: " + processor->display_name ());
+					return;
+				}
+				std::string encoded = chunks.front ()->children ().front ()->content ();
+				if (encoded.size () > 90 * 1024 * 1024) { unsupported (project, track.name, "VST3 preset state exceeds the exchange size limit"); return; }
+				gsize size = 0;
+				guchar* decoded = g_base64_decode (encoded.c_str (), &size);
+				if (!decoded) { unsupported (project, track.name, "Cannot decode VST3 preset state"); return; }
+				PluginDevice device;
+				device.id = canonical_vst3_id (info->unique_id);
+				device.name = info->name;
+				device.role = track.kind == TrackKind::MIDI && info->is_instrument () ? "instrument" : "audioFX";
+				device.enabled = insert->active ();
+				device.state_path = "plugins/state-" + std::to_string (project.tracks.size ()) + "-" + std::to_string (track.plugins.size ()) + ".vstpreset";
+				device.state.assign (reinterpret_cast<const char*> (decoded), size);
+				g_free (decoded);
+				try { validate_vst3_state (device.id, device.state); }
+				catch (const ExchangeError& e) { unsupported (project, track.name, std::string ("VST3 preset needs a rendered fallback: ") + e.what ()); return; }
+				track.plugins.push_back (std::move (device));
 				return;
 			}
 			std::unique_ptr<XMLNode> state (&processor->get_state ());
@@ -1202,7 +1302,6 @@ SessionExchange::export_dawproject (Session& session, const std::string& destina
 	AudioAssets assets;
 	Project project = collect (session, assets, cancel);
 	report = project.report;
-	report = project.report;
 	for (auto const& item : project.report) {
 		if (item.disposition == Disposition::Unsupported) { throw ExchangeError (item.object + ": " + item.detail); }
 	}
@@ -1231,6 +1330,7 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 	for (auto const& track : project.tracks) { if (track.master) { master = track.id; } }
 	for (auto const& track : project.tracks) {
 		if (track.master) {
+			if (!track.plugins.empty ()) { unsupported (project, track.name, "AAF/MIDI cannot preserve master plugins; render processing first"); }
 			if (track.volume != 1 || track.mute || track.solo || track.pan != .5 || !track.volume_automation.points.empty () || !track.pan_automation.points.empty ()) {
 				unsupported (project, track.name, "Master mixing cannot yet be represented in AAF/MIDI");
 			}
@@ -1240,6 +1340,7 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 			unsupported (project, track.name, "AAF/MIDI export currently requires tracks connected directly to the master, without folders or buses");
 		}
 		if (!track.sends.empty ()) { unsupported (project, track.name, "AAF/MIDI export cannot preserve bus sends; render or remove them first"); }
+		if (!track.plugins.empty ()) { unsupported (project, track.name, "AAF/MIDI cannot preserve VST3 plugin state; render processing first"); }
 		if (track.solo) { unsupported (project, track.name, "Clear solo before AAF/MIDI export"); }
 		if (track.kind == TrackKind::Audio && track.channels == 2 && (track.pan != .5 || !track.pan_automation.points.empty ())) {
 			unsupported (project, track.name, "Stereo balance cannot yet be represented in AAF export");

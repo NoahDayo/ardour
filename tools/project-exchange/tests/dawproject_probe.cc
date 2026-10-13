@@ -84,6 +84,18 @@ static void dump (const Project& p)
 			          << ",\"pan\":" << send.pan << '}';
 		}
 		std::cout << ']';
+		std::cout << ",\"plugins\":[";
+		for (size_t i = 0; i < t.plugins.size (); ++i) {
+			if (i) { std::cout << ','; }
+			auto const& plugin = t.plugins[i];
+			std::cout << "{\"id\":"; quoted (plugin.id);
+			std::cout << ",\"name\":"; quoted (plugin.name);
+			std::cout << ",\"role\":"; quoted (plugin.role);
+			std::cout << ",\"state_path\":"; quoted (plugin.state_path);
+			std::cout << ",\"state_size\":" << plugin.state.size ()
+			          << ",\"enabled\":" << (plugin.enabled ? "true" : "false") << '}';
+		}
+		std::cout << ']';
 		std::cout << ",\"clips\":[";
 		bool first_clip = true;
 		for (auto const& c : t.clips) {
