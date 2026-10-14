@@ -161,8 +161,18 @@ Session::start_audio_export (samplepos_t position, bool realtime, bool region_ex
 	*/
 
 	{
-		PBD::Mutex::Lock lm (AudioEngine::instance()->process_lock ());
+		/* The butler may need the process lock to resize disk buffers. Do
+		 * not hold it while waiting for the butler. Block new process cycles
+		 * first, so they cannot restart disk work between the wait and seek.
+		 */
+		struct ProcessingBlock {
+			Session& session;
+			bool previously_blocked;
+			ProcessingBlock (Session& s) : session (s), previously_blocked (s.processing_blocked ()) { if (!previously_blocked) { s.block_processing (); } }
+			~ProcessingBlock () { if (!previously_blocked) { session.unblock_processing (); } }
+		} processing_block (*this);
 		_butler->wait_until_finished ();
+		PBD::Mutex::Lock lm (AudioEngine::instance()->process_lock ());
 
 		/* This method may be called from a thread start_timespan_bg(),
 		 * or from the GUI thread. We need to set/update the tempo-map

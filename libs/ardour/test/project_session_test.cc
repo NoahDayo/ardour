@@ -503,6 +503,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (region_fades_roundtrip);
 	CPPUNIT_TEST (render_mix_roundtrip);
 	CPPUNIT_TEST (render_mix_automation);
+	CPPUNIT_TEST (render_pending_buffering);
 	CPPUNIT_TEST (render_mix_cancel_and_guards);
 	CPPUNIT_TEST (render_stems_roundtrip);
 	CPPUNIT_TEST (render_stems_guards);
@@ -542,6 +543,7 @@ public:
 	void automation_collision ();
 	void render_mix_roundtrip ();
 	void render_mix_automation ();
+	void render_pending_buffering ();
 	void render_mix_cancel_and_guards ();
 	void render_stems_roundtrip ();
 	void render_stems_guards ();
@@ -996,6 +998,34 @@ void ProjectSessionTest::render_mix_roundtrip ()
 		AudioEngine::instance ()->remove_session (); fixture.session.reset ();
 	}
 	std::cout << "Rendered mix DAWproject and AAF/MIDI PCM round trips passed" << std::endl;
+}
+
+void ProjectSessionTest::render_pending_buffering ()
+{
+	Fixture fixture; make_render_fixture (fixture, true);
+	const unsigned rate = fixture.session->sample_rate ();
+	const samplecnt_t frames = fixture.session->current_end_sample ();
+	PX::SessionExchange::ExportOptions options; options.render_mix = true; options.render_tail_seconds = 0;
+	fixture.session->set_clean (); RenderSourceState original (fixture);
+	for (unsigned i = 0; i < 8; ++i) {
+		// Both requests require the process lock in the butler. Export must
+		// let that work finish before locking the audio graph for its seek.
+		fixture.session->adjust_playback_buffering ();
+		fixture.session->adjust_capture_buffering ();
+		options.render_mix = i % 2 == 0; options.render_stems = !options.render_mix;
+		auto destination = fixture.path ("buffering-" + std::to_string (i) + ".dawproject");
+		PX::SessionExchange::export_dawproject (*fixture.session, destination, fixture.report, options);
+		original.check (fixture);
+		auto output = PX::DawProject::read (destination); assert_render_model (output, frames, rate);
+	}
+	// Prove normal process callbacks resume, rather than inspecting a flag.
+	const samplepos_t before = fixture.session->transport_sample ();
+	fixture.session->request_roll ();
+	wait_render_state ([&] { return fixture.session->transport_sample () > before; });
+	fixture.session->request_stop ();
+	wait_render_state ([&] { return fixture.session->transport_stopped (); });
+	CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
+	std::cout << "Rendered export with pending playback/capture buffering and processing restoration passed" << std::endl;
 }
 
 void ProjectSessionTest::render_mix_automation ()
