@@ -26,6 +26,8 @@
 #include "pbd/controllable.h"
 #include "pbd/control_math.h"
 #include "evoral/Curve.h"
+#include "evoral/Control.h"
+#include "evoral/TypeMap.h"
 #include "pbd/scoped_file_descriptor.h"
 #include "pbd/xml++.h"
 #include "temporal/tempo.h"
@@ -937,6 +939,18 @@ std::map<std::string, std::string> render_audio (Session& session, OwnedDirector
 	return files;
 }
 
+/* Use the native playback iterator on independent controller lists, so export
+ * does not share or alter the live model's interpolation/search caches. */
+class ControllerSequence : public Evoral::Sequence<Temporal::Beats> {
+public:
+	explicit ControllerSequence (const Evoral::TypeMap& map) : Evoral::Sequence<Temporal::Beats> (map) {}
+	std::shared_ptr<Evoral::Control> control_factory (const Evoral::Parameter& parameter) override {
+		auto const& desc = type_map ().descriptor (parameter);
+		auto list = std::make_shared<Evoral::ControlList> (parameter, desc, Temporal::TimeDomainProvider (Temporal::BeatTime));
+		return std::make_shared<Evoral::Control> (parameter, desc, list);
+	}
+};
+
 Project collect (Session& session, AudioAssets& assets, const CancelCheck& cancel)
 {
 	Project project = collect_timing (session);
@@ -1151,18 +1165,53 @@ Project collect (Session& session, AudioAssets& assets, const CancelCheck& cance
 					if (!model->sysexes ().empty () || !model->patch_changes ().empty ()) {
 						unsupported (project, clip.name, "MIDI patch changes and system messages cannot yet be exchanged");
 					}
+					ControllerSequence sampled (model->type_map ());
+					using Target = std::tuple<unsigned, unsigned, unsigned>;
+					std::map<Target, size_t> sampled_lanes;
+					size_t source_points = 0, output_points = 0;
 					for (auto const& parameter : parameters) {
 						MidiControl control; control.type = parameter_midi_type (static_cast<AutomationType> (parameter.type ()));
 						control.channel = parameter.channel (); control.number = parameter.id ();
 						if (!supported_midi_control (control.type, control.number)) { unsupported (project, clip.name, "Ordered MIDI bank/data-entry/channel-mode commands cannot yet be exchanged"); continue; }
+						if (control.channel >= 16) { throw ExchangeError (clip.name + ": invalid MIDI controller channel"); }
 						if (midi->midi_source ()->automation_state_of (parameter) != Play) { unsupported (project, clip.name, "Disabled MIDI controller playback cannot yet be exchanged"); continue; }
 						auto native = model->control (parameter); auto list = native ? native->list () : nullptr;
 						if (!list || list->empty ()) { continue; }
-						if (list->interpolation () != Evoral::ControlList::Discrete && std::any_of (list->begin (), list->end (), [&] (Evoral::ControlEvent* p) { return p->value != (*list->begin ())->value; })) {
-							unsupported (project, clip.name, "Continuous MIDI controller curves require explicit sampling or rendering"); continue;
+						if (list->time_domain () != Temporal::BeatTime) { unsupported (project, clip.name, "MIDI controller source must use beat time"); continue; }
+						for (auto const& point : *list) {
+							cancelled (cancel);
+							if (++source_points > 100000 || point->when.beats ().to_ticks () < 0 || !std::isfinite (point->value) || point->value < 0 || point->value > (control.type == 0xe0 ? 16383 : 127)) {
+								throw ExchangeError (clip.name + ": invalid or excessive MIDI controller source data");
+							}
 						}
-						for (auto const& point : *list) { control.points.push_back ({beat_value (point->when.beats ()), point->value, false}); }
+						if (list->interpolation () != Evoral::ControlList::Discrete) {
+							sampled.add_control (std::make_shared<Evoral::Control> (parameter, model->type_map ().descriptor (parameter), std::make_shared<Evoral::ControlList> (*list)));
+							sampled_lanes.emplace (Target (control.type, control.channel, control.number), clip.midi_controls.size ());
+						} else {
+							for (auto const& point : *list) { control.points.push_back ({beat_value (point->when.beats ()), point->value, false}); ++output_points; }
+						}
 						clip.midi_controls.push_back (std::move (control));
+					}
+					if (!sampled_lanes.empty ()) {
+						const auto start = region->start ().beats ();
+						const auto end = start + region->length ().beats ();
+						for (auto it = sampled.begin (start); it != sampled.end () && it->time () < end; ++it) {
+							cancelled (cancel);
+							if (++output_points > 100000) { throw ExchangeError (clip.name + ": sampled MIDI controllers exceed the event limit; shorten the clip or render audio"); }
+							if (it->size () < 2) { throw ExchangeError ("Invalid sampled MIDI event"); }
+							const uint8_t* data = it->buffer ();
+							unsigned type = data[0] & 0xf0, channel = data[0] & 15;
+							if ((type != 0xb0 && type != 0xa0 && type != 0xd0 && type != 0xe0) || it->size () != (type == 0xd0 ? 2 : 3)) { throw ExchangeError ("Invalid sampled MIDI event"); }
+							unsigned number = type == 0xb0 || type == 0xa0 ? data[1] : 0;
+							unsigned value = type == 0xe0 ? data[1] | (unsigned (data[2]) << 7) : type == 0xd0 ? data[1] : data[2];
+							auto lane = sampled_lanes.find (Target (type, channel, number));
+							if (lane == sampled_lanes.end ()) { throw ExchangeError ("Unexpected sampled MIDI target"); }
+							auto& points = clip.midi_controls[lane->second].points;
+							double time = beat_value (it->time ());
+							if (it->time () < start || (!points.empty () && time <= points.back ().time)) { throw ExchangeError ("Non-increasing sampled MIDI timeline"); }
+							points.push_back ({time, double (value), false});
+						}
+						project.report.push_back ({Disposition::Transformed, clip.name, "Continuous MIDI curves converted to discrete events using Ardour playback timing and values; curve data outside the clip is omitted"});
 					}
 					for (auto const& event : model->notes ()) {
 						Note note;

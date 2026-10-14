@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
+#include <sstream>
 #include <limits>
 #include <map>
 #include <set>
@@ -25,6 +27,7 @@
 #include "ardour/automation_list.h"
 #include "pbd/control_math.h"
 #include "ardour/midi_model.h"
+#include "ardour/midi_source.h"
 #include "ardour/midi_region.h"
 #include "ardour/location.h"
 #include "ardour/logic_project.h"
@@ -472,6 +475,8 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (roundtrip);
 	CPPUNIT_TEST (midi_controller_roundtrip);
 	CPPUNIT_TEST (midi_ramp_roundtrip);
+	CPPUNIT_TEST (native_midi_curves_roundtrip);
+	CPPUNIT_TEST (native_midi_curves_limit);
 	CPPUNIT_TEST (vst3_plugin_exchange);
 	CPPUNIT_TEST (bad_media);
 	CPPUNIT_TEST (corrupt_media);
@@ -512,6 +517,8 @@ public:
 	void roundtrip ();
 	void midi_controller_roundtrip ();
 	void midi_ramp_roundtrip ();
+	void native_midi_curves_roundtrip ();
+	void native_midi_curves_limit ();
 	void vst3_plugin_exchange ();
 	void bad_media ();
 	void corrupt_media ();
@@ -550,6 +557,122 @@ public:
 };
 
 CPPUNIT_TEST_SUITE_REGISTRATION (ProjectSessionTest);
+
+void ProjectSessionTest::native_midi_curves_limit ()
+{
+	Fixture fixture; auto input = example (fixture);
+	input.tracks.erase (input.tracks.begin () + 1);
+	for (auto& track : input.tracks) { track.parent.clear (); track.pan = .5; if (!track.master) { track.destination = "master"; } }
+	auto& clip = input.tracks.back ().clips.front (); clip.offset.value = 0; clip.duration = 1400; clip.notes.clear ();
+	PX::MidiControl lane; lane.type = 0xe0; lane.channel = 2;
+	for (unsigned i = 0; i <= 14; ++i) { lane.points.push_back ({i * 100.0, i % 2 ? 16383.0 : 0.0, false}); }
+	clip.midi_controls.push_back (lane); package (fixture, input);
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"), fixture.path ("Limit"), "Limit", fixture.report);
+	{
+		auto track = std::dynamic_pointer_cast<ARDOUR::Track> (fixture.session->route_by_name ("Notes")); CPPUNIT_ASSERT (track);
+		auto regions = track->playlist ()->region_list ();
+		for (auto const& region : *regions) {
+			auto midi = std::dynamic_pointer_cast<MidiRegion> (region); CPPUNIT_ASSERT (midi);
+			for (auto const& control : midi->model ()->controls ()) {
+				midi->midi_source ()->set_interpolation_of (control.first, Evoral::ControlList::Linear);
+				CPPUNIT_ASSERT (control.second->list ()->set_interpolation (Evoral::ControlList::Linear));
+			}
+		}
+	}
+	for (bool logic : {false, true}) {
+		bool rejected = false; auto path = fixture.path (logic ? "OversizedLogic" : "oversized.dawproject");
+		try {
+			if (logic) { PX::SessionExchange::export_logic (*fixture.session, path, fixture.report); }
+			else { PX::SessionExchange::export_dawproject (*fixture.session, path, fixture.report); }
+		} catch (PX::ExchangeError const& e) {
+			rejected = true; CPPUNIT_ASSERT (std::string (e.what ()).find ("sampled MIDI controllers exceed") != std::string::npos);
+		}
+		CPPUNIT_ASSERT (rejected); CPPUNIT_ASSERT (!Glib::file_test (path, Glib::FILE_TEST_EXISTS));
+	}
+	CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
+	std::cout << "Native MIDI curve expansion limit rejects both editable export routes before publication" << std::endl;
+}
+
+void ProjectSessionTest::native_midi_curves_roundtrip ()
+{
+	Fixture fixture; auto input = example (fixture);
+	input.tracks.erase (input.tracks.begin () + 1);
+	for (auto& track : input.tracks) { track.parent.clear (); track.pan = .5; if (!track.master) { track.destination = "master"; } }
+	input.tempo = 120; input.tempos = {{PX::Time (5), 90, false}, {PX::Time (13), 150, false}};
+	auto& midi = input.tracks.back ();
+	for (unsigned type : {0xb0u, 0xe0u, 0xd0u, 0xa0u}) {
+		PX::MidiControl lane; lane.type = type; lane.channel = 2; lane.number = type == 0xb0 ? 1 : type == 0xa0 ? 60 : 0;
+		double maximum = type == 0xe0 ? 16383 : 127;
+		lane.points = {{0, 0, false}, {2, maximum, false}, {4, 0, false}, {6, maximum, false}};
+		midi.clips[0].midi_controls.push_back (lane);
+	}
+	PX::MidiControl hold; hold.number = 64; hold.channel = 2; hold.points = {{0, 127, false}, {3, 0, false}};
+	midi.clips[0].midi_controls.push_back (hold);
+	auto second = midi.clips[0]; second.position.value = 12; second.offset.value = .3; second.duration = 2; midi.clips.push_back (second);
+	package (fixture, input);
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"), fixture.path ("NativeCurves"), "NativeCurves", fixture.report);
+	{
+		auto track = std::dynamic_pointer_cast<ARDOUR::Track> (fixture.session->route_by_name ("Notes")); CPPUNIT_ASSERT (track);
+		auto regions = track->playlist ()->region_list ();
+		for (auto const& region : *regions) {
+			auto mr = std::dynamic_pointer_cast<MidiRegion> (region); CPPUNIT_ASSERT (mr);
+			for (auto const& entry : mr->model ()->controls ()) {
+				if (entry.first.type () == MidiCCAutomation && entry.first.id () == 64) { continue; }
+				mr->midi_source ()->set_interpolation_of (entry.first, Evoral::ControlList::Linear);
+				CPPUNIT_ASSERT (entry.second->list ()->set_interpolation (Evoral::ControlList::Linear));
+			}
+			mr->model ()->set_edited (true);
+		}
+	}
+	auto reopen = [&] (const std::string& name) {
+		CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+		AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+		fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path (name), name, nullptr, "", true));
+		AudioEngine::instance ()->set_session (fixture.session.get ());
+	};
+	reopen ("NativeCurves");
+	using Events = std::map<samplepos_t, std::multiset<std::vector<uint8_t>>>;
+	auto capture = [&] () {
+		struct Sink : Evoral::EventSink<samplepos_t> {
+			Events events;
+			uint32_t write (samplepos_t at, Evoral::EventType, uint32_t size, const uint8_t* data) override {
+				if ((data[0] & 0xf0) != 0x80 && (data[0] & 0xf0) != 0x90) { events[at].insert (std::vector<uint8_t> (data, data + size)); }
+				return size;
+			}
+		} sink;
+		std::ostringstream curves; curves << std::setprecision (17);
+		auto track = std::dynamic_pointer_cast<ARDOUR::Track> (fixture.session->route_by_name ("Notes")); CPPUNIT_ASSERT (track);
+		auto regions = track->playlist ()->region_list ();
+		for (auto const& region : *regions) {
+			auto mr = std::dynamic_pointer_cast<MidiRegion> (region); CPPUNIT_ASSERT (mr);
+			mr->render (sink, 0, Sustained, nullptr);
+			for (auto const& entry : mr->model ()->controls ()) {
+				curves << entry.first.type () << ':' << entry.first.channel () << ':' << entry.first.id () << ':' << entry.second->list ()->interpolation () << ';';
+				for (auto const& point : *entry.second->list ()) { curves << point->when.beats ().to_ticks () << ':' << point->value << ';'; }
+			}
+		}
+		return std::make_pair (sink.events, curves.str ());
+	};
+	const auto expected = capture (); CPPUNIT_ASSERT (expected.first.size () > 100);
+	const auto disk = Glib::file_get_contents (fixture.path ("NativeCurves/NativeCurves.ardour"));
+	unsigned calls = 0;
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("cancelled-curves.dawproject"), fixture.report, [&] { return ++calls > 250; }), PX::ArchiveCancelled);
+	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("cancelled-curves.dawproject"), Glib::FILE_TEST_EXISTS));
+	CPPUNIT_ASSERT (expected == capture ());
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("native-curves.dawproject"), fixture.report);
+	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& d) { return d.disposition == PX::Disposition::Transformed && d.detail.find ("Ardour playback timing") != std::string::npos; }));
+	PX::SessionExchange::export_logic (*fixture.session, fixture.path ("NativeCurveLogic"), fixture.report);
+	CPPUNIT_ASSERT (expected == capture ());
+	CPPUNIT_ASSERT_EQUAL (disk, Glib::file_get_contents (fixture.path ("NativeCurves/NativeCurves.ardour")));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("native-curves.dawproject"), fixture.path ("ReturnedCurves"), "ReturnedCurves", fixture.report);
+	reopen ("ReturnedCurves"); CPPUNIT_ASSERT (expected.first == capture ().first);
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("NativeCurveLogic/Project.aaf"), fixture.path ("NativeCurveLogic/Project.mid"), fixture.path ("LogicCurves"), "LogicCurves", fixture.report);
+	reopen ("LogicCurves"); CPPUNIT_ASSERT (expected.first == capture ().first);
+	CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
+	std::cout << "Native MIDI controller curves preserve saved playback through DAWproject and AAF/SMF; cancellation and source state passed" << std::endl;
+}
 
 void ProjectSessionTest::midi_ramp_roundtrip ()
 {
