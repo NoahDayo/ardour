@@ -93,13 +93,15 @@ export ARDOUR_SURFACES_PATH="$profile/no-surfaces"
 export VAMP_PATH="$profile/no-vamp"
 
 library_path=""
+# The exchange helper has its own Python runtime. Its DLLs (notably libffi)
+# must not shadow the native libraries used to build Ardour and GLib.
 while IFS= read -r -d '' library; do
     directory=${library%/*}
     case ":$library_path:" in
         *":$directory:"*) ;;
         *) library_path+="${library_path:+:}${directory}" ;;
     esac
-done < <(find "$libs" -type f \( -name '*.dll' -o -name '*.so' -o -name '*.so.*' -o -name '*.dylib' \) -print0)
+done < <(find "$libs" -path "$libs/project-exchange" -prune -o -type f \( -name '*.dll' -o -name '*.so' -o -name '*.so.*' -o -name '*.dylib' \) -print0)
 
 case "$(uname -s)" in
     MINGW*|MSYS*)
