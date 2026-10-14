@@ -18,7 +18,7 @@ namespace {
 typedef xmlNode* Node;
 typedef std::unique_ptr<xmlDoc, void (*) (xmlDoc*)> Document;
 
-bool is (Node node, const char* name) { return xmlStrEqual (node->name, BAD_CAST name); }
+bool is (Node node, const char* name) { return node && xmlStrEqual (node->name, BAD_CAST name); }
 bool has (Node node, const char* name) { return xmlHasProp (node, BAD_CAST name) != NULL; }
 
 std::string attr (Node node, const char* name, const std::string& fallback = "")
@@ -187,26 +187,46 @@ struct Parser {
 		if (type == 0xb0 || type == 0xa0) { control.number = integer (target, type == 0xb0 ? "controller" : "key", 0, true); }
 		if (control.channel > 15 || control.number > 127 || !children (target).empty ()) { throw ExchangeError ("Invalid MIDI expression target"); }
 		if (!supported_midi_control (type, control.number)) { diagnostic (node, "Ordered MIDI bank/data-entry/channel-mode commands require explicit conversion"); return true; }
-		unsigned targets = 0; double previous = -1; bool prior_linear = false;
+		unsigned targets = 0; double previous = -1, previous_raw = 0; bool prior_linear = false, sampled = false;
+		auto append = [&] (double at, double value) {
+			if (!control.points.empty () && at == control.points.back ().time && value == control.points.back ().value) { return; }
+			if (!control.points.empty () && at <= control.points.back ().time) { throw ExchangeError ("MIDI ramp exceeds floating-point time resolution"); }
+			if (control.points.size () >= 100000) { throw ExchangeError ("MIDI ramp exceeds the controller event limit"); }
+			expansion (); control.points.push_back ({at, value, false});
+		};
 		for (Node point : children (node)) {
 			if (is (point, "Target")) { ++targets; continue; }
-			expansion (); attributes (point, {"time", "value", "interpolation"});
+			attributes (point, {"time", "value", "interpolation"});
 			if ((!is (point, "IntegerPoint") && !is (point, "RealPoint")) || !children (point).empty ()) { throw ExchangeError ("Invalid MIDI controller point"); }
 			double at = number (point, "time", 0, true), raw = number (point, "value", 0, true);
 			if (at < 0 || at <= previous) { throw ExchangeError ("Unordered MIDI controller points"); }
 			double maximum = type == 0xe0 ? 16383 : 127;
 			if (is (point, "RealPoint")) {
 				if (attr (node, "unit") != "normalized" || raw < 0 || raw > 1) { throw ExchangeError ("MIDI real points require normalized values"); }
-				raw = std::round (raw * maximum);
+				raw *= maximum;
 			} else if (has (node, "unit") || raw < 0 || raw > maximum || raw != std::floor (raw)) { throw ExchangeError ("MIDI integer points require raw MIDI values without a unit"); }
 			std::string mode = attr (point, "interpolation", "hold");
 			if (mode != "hold" && mode != "linear") { throw ExchangeError ("Invalid MIDI interpolation"); }
-			if (prior_linear && control.points.back ().value != raw) { diagnostic (node, "Continuous MIDI controller ramps require explicit sampling or rendering"); return true; }
-			control.points.push_back ({at, raw, false}); previous = at; prior_linear = mode == "linear";
+			if (prior_linear && previous_raw != raw) {
+				// Quantize the unrounded curve at every half-integer crossing,
+				// in the curve's own time unit (before tempo conversion).
+				int step = raw > previous_raw ? 1 : -1;
+				int first = std::lround (previous_raw), last = std::lround (raw);
+				for (int value = first + step; step > 0 ? value <= last : value >= last; value += step) {
+					double crossing = previous + (at - previous) * ((value - step * .5 - previous_raw) / (raw - previous_raw));
+					// At a descending half-integer start both integers meet
+					// the error bound. Use the following interval's value.
+					if (value - step * .5 == previous_raw) { control.points.back ().value = value; continue; }
+					append (crossing, value);
+				}
+				sampled = true;
+			}
+			append (at, std::round (raw)); previous = at; previous_raw = raw; prior_linear = mode == "linear";
 		}
 		if (targets != 1) { throw ExchangeError ("MIDI expression requires exactly one target"); }
 		if (!control.points.empty ()) { controls.emplace_back (std::move (control), unit); }
 		if (attr (node, "unit") == "normalized") { diagnostic (node, "Normalized MIDI values rounded to their 7-bit or 14-bit wire resolution", Disposition::Transformed); }
+		if (sampled) { diagnostic (node, "Linear MIDI ramps converted to discrete events at half-integer crossings (maximum half a MIDI unit error before destination timing rounding)", Disposition::Transformed); }
 		return true;
 	}
 

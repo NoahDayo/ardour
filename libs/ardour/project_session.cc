@@ -302,18 +302,21 @@ SourceList midi_source (Session& session, const Clip& clip, const TimeMap& timin
 			points.insert (boundary, {clip.offset.value, std::prev (boundary)->value, false});
 			report.push_back ({Disposition::Transformed, clip.name, "MIDI controller state before the source offset copied to the clip start"});
 		}
-		Temporal::Beats previous; bool first = true;
+		Temporal::Beats previous; bool first = true, merged = false;
 		for (auto const& point : points) {
 			cancelled (cancel);
 			double at = timing.content (Time (point.time, clip.offset.unit), clip.position, clip.offset, TimeUnit::Beats);
 			auto when = beats (at);
-			if (!first && when <= previous) { throw ExchangeError ("MIDI controller points collide at Ardour's timing resolution"); }
-			previous = when; first = false;
+			if (!first && when < previous) { throw ExchangeError ("MIDI controller timeline is reversed after timing conversion"); }
 			unsigned value = point.value;
 			uint8_t a = control.type == 0xd0 ? value : control.type == 0xe0 ? value & 127 : control.number;
 			uint8_t b = control.type == 0xe0 ? value >> 7 : control.type == 0xd0 ? 0 : value;
-			events.push_back ({when, {{static_cast<uint8_t> (control.type | control.channel), a, b}}}); end = std::max (end, at);
+			Event event = {when, {{static_cast<uint8_t> (control.type | control.channel), a, b}}};
+			if (!first && when == previous) { events.back () = event; merged = true; }
+			else { events.push_back (event); }
+			previous = when; first = false; end = std::max (end, at);
 		}
+		if (merged) { report.push_back ({Disposition::Transformed, clip.name, "MIDI controller events rounded to the same Ardour tick merged using the last source value for each controller and channel"}); }
 	}
 	std::stable_sort (events.begin (), events.end (), [] (const Event& a, const Event& b) {
 		auto order = [] (uint8_t status) { return (status & 0xf0) == 0x80 ? 0 : (status & 0xf0) == 0x90 ? 2 : 1; };

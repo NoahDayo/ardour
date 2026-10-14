@@ -471,6 +471,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST_SUITE (ProjectSessionTest);
 	CPPUNIT_TEST (roundtrip);
 	CPPUNIT_TEST (midi_controller_roundtrip);
+	CPPUNIT_TEST (midi_ramp_roundtrip);
 	CPPUNIT_TEST (vst3_plugin_exchange);
 	CPPUNIT_TEST (bad_media);
 	CPPUNIT_TEST (corrupt_media);
@@ -509,6 +510,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 public:
 	void roundtrip ();
 	void midi_controller_roundtrip ();
+	void midi_ramp_roundtrip ();
 	void vst3_plugin_exchange ();
 	void bad_media ();
 	void corrupt_media ();
@@ -546,6 +548,79 @@ public:
 };
 
 CPPUNIT_TEST_SUITE_REGISTRATION (ProjectSessionTest);
+
+void ProjectSessionTest::midi_ramp_roundtrip ()
+{
+	Fixture fixture;
+	{
+		PX::ProjectArchiveWriter archive (fixture.path ("ramps.dawproject"));
+		archive.add_text ("project.xml", R"(<Project version="1.0">
+<Application name="Independent MIDI ramp fixture" version="1"/>
+<Transport><Tempo value="120" unit="bpm"/><TimeSignature numerator="4" denominator="4"/></Transport>
+<Structure><Track id="notes" name="Ramps" contentType="notes"><Channel id="midi" audioChannels="2" destination="master"/></Track>
+<Channel id="master" name="Master" role="master" audioChannels="2"/></Structure>
+<Arrangement><Lanes><Lanes track="notes"><Clips><Clip name="Ramps" time="4" duration="2" playStart="1"><Lanes>
+<Points><Target expression="channelController" channel="1" controller="1"/><IntegerPoint time="0" value="0" interpolation="linear"/><IntegerPoint time="4" value="4"/></Points>
+<Points><Target expression="pitchBend" channel="2"/><IntegerPoint time="0" value="0" interpolation="linear"/><IntegerPoint time="4" value="16383"/></Points>
+<Points timeUnit="seconds"><Target expression="channelPressure" channel="3"/><IntegerPoint time="0" value="0" interpolation="linear"/><IntegerPoint time="2" value="4"/></Points>
+<Points><Target expression="polyPressure" channel="4" key="60"/><IntegerPoint time="0" value="4" interpolation="linear"/><IntegerPoint time="4" value="0"/></Points>
+</Lanes></Clip></Clips></Lanes></Lanes></Arrangement></Project>)");
+		archive.finish ();
+	}
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("ramps.dawproject"), fixture.path ("Ramps"), "Ramps", fixture.report);
+	for (std::string message : {"half a MIDI unit", "last source value", "clip start"}) {
+		CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [&] (const PX::Diagnostic& d) { return d.disposition == PX::Disposition::Transformed && d.detail.find (message) != std::string::npos; }));
+	}
+	using Events = std::map<samplepos_t, std::multiset<std::vector<uint8_t>>>;
+	Events expected;
+	auto add = [&] (double beat, const std::vector<uint8_t>& data) {
+		expected[Temporal::timepos_t (Temporal::Beats::from_double (beat)).samples ()].insert (data);
+	};
+	for (int i = 0; i < 3; ++i) {
+		double at = i == 0 ? 4 : 3.5 + i;
+		add (at, {0xb1, 1, uint8_t (1 + i)});
+		add (at, {0xd3, uint8_t (1 + i)});
+		add (at, {0xa4, 60, uint8_t (3 - i)});
+	}
+	// Independently evaluate the last value in each native tick's rounding
+	// interval. Dense 14-bit crossings merge; 7-bit lanes remain unaffected.
+	const int ppqn = Temporal::Beats::PPQN;
+	for (int tick = ppqn; tick < 3 * ppqn; ++tick) {
+		unsigned value = std::floor ((tick + .5) * 16383 / (4 * ppqn) + .5);
+		add (3 + double (tick) / ppqn, {0xe2, uint8_t (value & 127), uint8_t (value >> 7)});
+	}
+	auto check_reopened = [&] (const std::string& name) {
+		CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+		AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+		fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path (name), name, nullptr, "", true));
+		AudioEngine::instance ()->set_session (fixture.session.get ());
+		struct Sink : Evoral::EventSink<samplepos_t> {
+			Events events;
+			uint32_t write (samplepos_t at, Evoral::EventType, uint32_t size, const uint8_t* data) override {
+				events[at].insert (std::vector<uint8_t> (data, data + size)); return size;
+			}
+		} sink;
+		auto track = std::dynamic_pointer_cast<ARDOUR::Track> (fixture.session->route_by_name ("Ramps")); CPPUNIT_ASSERT (track);
+		auto regions = track->playlist ()->region_list ();
+		for (auto const& region : *regions) {
+			auto midi = std::dynamic_pointer_cast<MidiRegion> (region); CPPUNIT_ASSERT (midi);
+			midi->render (sink, 0, Sustained, nullptr);
+		}
+		CPPUNIT_ASSERT_EQUAL (expected.size (), sink.events.size ());
+		CPPUNIT_ASSERT (expected == sink.events);
+	};
+	check_reopened ("Ramps");
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("returned.dawproject"));
+	PX::SessionExchange::export_logic (*fixture.session, fixture.path ("RampLogic"), fixture.report);
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("returned.dawproject"), fixture.path ("ReturnedRamps"), "ReturnedRamps", fixture.report);
+	check_reopened ("ReturnedRamps");
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("RampLogic/Project.aaf"), fixture.path ("RampLogic/Project.mid"), fixture.path ("LogicRamps"), "LogicRamps", fixture.report);
+	check_reopened ("LogicRamps");
+	CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
+	std::cout << "MIDI ramp quantization, trim chase and saved playback across DAWproject and AAF/SMF passed" << std::endl;
+}
 
 void ProjectSessionTest::midi_controller_roundtrip ()
 {

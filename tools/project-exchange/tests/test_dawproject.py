@@ -131,13 +131,15 @@ class DawProjectTest(unittest.TestCase):
 
     def test_controller_only_clip(self):
         lanes = '<Points><Target expression="channelController" channel="1" controller="64"/><IntegerPoint time="0" value="127"/><IntegerPoint time="4" value="0"/></Points>'
-        parsed = self.parse(self.control_fixture(lanes))
-        xml = ET.fromstring(self.input.read_text())
-        notes = xml.find('.//Clip[@name="Notes"]/Lanes/Notes')
-        notes.clear()
-        parsed = self.parse(ET.tostring(xml, encoding='unicode'))
-        self.assertEqual(parsed['tracks'][2]['clips'][0]['notes'], [])
-        self.assertEqual(len(parsed['tracks'][2]['clips'][0]['midi_controls']), 1)
+        for wrapper in ('<Lanes><Notes/>{}</Lanes>', '<Lanes>{}</Lanes>', '{}'):
+            with self.subTest(wrapper=wrapper):
+                xml = ET.fromstring(PROJECT)
+                clip = xml.find('.//Clip[@name="Notes"]')
+                clip.remove(clip.find('Notes'))
+                clip.append(ET.fromstring(wrapper.format(lanes)))
+                parsed = self.parse(ET.tostring(xml, encoding='unicode'))
+                self.assertEqual(parsed['tracks'][2]['clips'][0]['notes'], [])
+                self.assertEqual(len(parsed['tracks'][2]['clips'][0]['midi_controls']), 1)
 
     def test_midi_controller_validation_and_explicit_limits(self):
         valid = '<Points><Target expression="channelController" channel="0" controller="64"/><IntegerPoint time="0" value="127"/><IntegerPoint time="1" value="0"/></Points>'
@@ -147,9 +149,66 @@ class DawProjectTest(unittest.TestCase):
         for number in (0, 6, 32, 38, 96, 101, 120, 127):
             parsed = self.parse(self.control_fixture(valid.replace('controller="64"', f'controller="{number}"')))
             self.assertTrue(any(d['disposition'] == 3 for d in parsed['report']))
-        curve = '<Points unit="normalized"><Target expression="pitchBend" channel="0"/><RealPoint time="0" value="0" interpolation="linear"/><RealPoint time="1" value="1"/></Points>'
-        parsed = self.parse(self.control_fixture(curve))
-        self.assertTrue(any(d['disposition'] == 3 for d in parsed['report']))
+
+    def test_midi_controller_linear_ramps(self):
+        for expression, extra, maximum in [('channelController', 'controller="1"', 127), ('pitchBend', '', 16383)]:
+            with self.subTest(expression=expression):
+                lane = f'<Points><Target expression="{expression}" channel="0" {extra}/><IntegerPoint time="0" value="0" interpolation="linear"/><IntegerPoint time="4" value="{maximum}" interpolation="linear"/><IntegerPoint time="8" value="0"/></Points>'
+                parsed = self.parse(self.control_fixture(lane))
+                points = parsed['tracks'][2]['clips'][0]['midi_controls'][0]['points']
+                self.assertEqual(len(points), 2 * maximum + 3)
+                self.assertEqual(points[0], [0, 0])
+                self.assertEqual(points[maximum + 1], [4, maximum])
+                self.assertEqual(points[-1], [8, 0])
+                for i in range(1, maximum + 1):
+                    self.assertAlmostEqual(points[i][0], 4 * (i - .5) / maximum)
+                    self.assertEqual(points[i][1], i)
+                    self.assertAlmostEqual(points[maximum + 1 + i][0], 4 + 4 * (i - .5) / maximum)
+                    self.assertEqual(points[maximum + 1 + i][1], maximum - i)
+                self.assertTrue(any(d['disposition'] == 1 and 'half a MIDI unit' in d['detail'] for d in parsed['report']))
+                self.assertFalse(any(d['disposition'] == 3 for d in parsed['report']))
+                output = self.root / 'ramps.xml'
+                self.command('rewrite', self.input, output)
+                self.assert_schema(output)
+                self.assertEqual(self.semantic(parsed), self.semantic(json.loads(self.command('parse', output).stdout)))
+
+    def test_normalized_ramp_rounding_phase_and_hold(self):
+        # Interpolate before rounding endpoints: these crossings are .01 and
+        # 1.01, not .5 and 1.5. Preserve a hold followed by a descending ramp.
+        lane = '<Points unit="normalized"><Target expression="polyPressure" channel="2" key="60"/>'
+        for at, raw, mode in [(0, .49, 'linear'), (2, 2.49, 'hold'), (3, 3.49, 'linear'), (6, .49, 'hold')]:
+            lane += f'<RealPoint time="{at}" value="{raw / 127:.17g}" interpolation="{mode}"/>'
+        parsed = self.parse(self.control_fixture(lane + '</Points>'))
+        points = parsed['tracks'][2]['clips'][0]['midi_controls'][0]['points']
+        expected = [[0, 0], [.01, 1], [1.01, 2], [2, 2], [3, 3], [3.99, 2], [4.99, 1], [5.99, 0], [6, 0]]
+        self.assertEqual(len(points), len(expected))
+        for actual, want in zip(points, expected):
+            self.assertAlmostEqual(actual[0], want[0])
+            self.assertEqual(actual[1], want[1])
+        # A descending half-integer start chooses the following value within the half-unit bound.
+        lane = '<Points unit="normalized"><Target expression="channelPressure" channel="2"/>'
+        lane += f'<RealPoint time="0" value="{1.5 / 127:.17g}" interpolation="linear"/><RealPoint time="1" value="0"/></Points>'
+        points = self.parse(self.control_fixture(lane))['tracks'][2]['clips'][0]['midi_controls'][0]['points']
+        self.assertEqual(points[0], [0, 1])
+        self.assertAlmostEqual(points[1][0], 2 / 3)
+        self.assertEqual(points[1][1], 0)
+
+    def test_midi_ramp_seconds_across_tempo_change(self):
+        lane = '<Points timeUnit="seconds"><Target expression="channelController" channel="0" controller="1"/><IntegerPoint time="0" value="0" interpolation="linear"/><IntegerPoint time="4" value="4"/></Points>'
+        xml = self.control_fixture(lane).replace('<Tempo unit="bpm" value="100"/>', '<Tempo id="tempo-map" unit="bpm" value="60"/>')
+        xml = xml.replace('time="4" duration="4" playStart="1" name="Notes"', 'time="0" duration="8" playStart="0" name="Notes"')
+        xml = xml.replace('</Arrangement>', '<TempoAutomation timeUnit="beats" unit="bpm"><Target parameter="tempo-map"/><RealPoint time="2" value="120"/></TempoAutomation></Arrangement>')
+        points = self.parse(xml)['tracks'][2]['clips'][0]['midi_controls'][0]['points']
+        self.assertEqual(points, [[0, 0], [.5, 1], [1.5, 2], [3, 3], [5, 4], [6, 4]])
+
+    def test_midi_ramp_expansion_limits(self):
+        lane = '<Points><Target expression="pitchBend" channel="0"/>'
+        lane += ''.join(f'<IntegerPoint time="{i}" value="{16383 if i % 2 else 0}" interpolation="linear"/>' for i in range(8))
+        failure = self.parse(self.control_fixture(lane + '</Points>'), status=1)
+        self.assertIn('controller event limit', failure.stderr)
+        lane = '<Points><Target expression="pitchBend" channel="0"/><IntegerPoint time="1000000000000000" value="0" interpolation="linear"/><IntegerPoint time="1000000000000001" value="16383"/></Points>'
+        failure = self.parse(self.control_fixture(lane), status=1)
+        self.assertIn('floating-point time resolution', failure.stderr)
 
     def test_midi_controller_nested_clip_trim(self):
         lanes = '<Points><Target expression="channelController" channel="0" controller="64"/><IntegerPoint time="0" value="127"/><IntegerPoint time="3" value="0"/></Points>'

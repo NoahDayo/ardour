@@ -110,6 +110,25 @@ class LogicWriterTest(unittest.TestCase):
         return subprocess.run([sys.executable, "-I", str(HELPER), str(manifest), str(self.output)],
                               capture_output=True, text=True, encoding="utf-8", timeout=30)
 
+    def test_midi_only_aaf_without_embedded_essence(self):
+        for child in list(self.root):
+            if child.tag in ('Media', 'AudioTrack'):
+                self.root.remove(child)
+        result = self.run_writer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with aaf2.open(str(self.output / "Project.aaf"), "r") as aaf:
+            self.assertNotIn("EssenceData", aaf.content)
+            self.assertTrue(aaf.content.classdef.get_propertydef_from_pid(0x1902).optional)
+        extracted = self.directory / 'extracted'
+        extracted.mkdir()
+        result = subprocess.run([self.probe, str(self.output / "Project.aaf"), str(extracted)],
+                                capture_output=True, text=True, encoding="utf-8", timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parsed = json.loads(result.stdout)
+        self.assertEqual(parsed["tracks"], [])
+        self.assertEqual(parsed["media"], [])
+        self.assertEqual(len(read_midi(self.output / "Project.mid")), 2)
+
     def test_embedded_audio_mixer_and_coordinated_midi(self):
         result = self.run_writer()
         self.assertEqual(result.returncode, 0, result.stderr)

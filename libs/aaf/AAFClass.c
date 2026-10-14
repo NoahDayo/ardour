@@ -237,7 +237,9 @@ aafclass_setDefaultClasses (AAF_Data* aafd)
 	}
 
 	attachNewProperty (aafd, Content, prop, PID_ContentStorage_Mobs, PROP_REQ);
-	attachNewProperty (aafd, Content, prop, PID_ContentStorage_EssenceData, PROP_REQ);
+	/* Files without embedded media (including MIDI-only exchanges) may omit
+	 * this optional set; an empty EssenceData list is valid. */
+	attachNewProperty (aafd, Content, prop, PID_ContentStorage_EssenceData, PROP_OPT);
 
 	aafClass* Mob = aafclass_defineNewClass (aafd, &AAFClassID_Mob, ABSTRACT, IOC);
 
