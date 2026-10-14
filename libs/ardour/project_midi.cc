@@ -63,6 +63,7 @@ void read_project_midi (const std::string& path, Project& project, double origin
 		Track track; track.kind = TrackKind::MIDI; track.id = "midi-" + std::to_string (index);
 		track.name = "MIDI " + std::to_string (index + 1);
 		Clip clip; clip.kind = ClipKind::MIDI;
+		std::map<unsigned, size_t> controls;
 		std::map<unsigned, std::pair<uint64_t, unsigned>> sounding;
 		uint64_t tick = 0; unsigned running = 0; bool ended = false, named = false, descriptive = false;
 		while (input.pos != input.end) {
@@ -133,17 +134,34 @@ void read_project_midi (const std::string& path, Project& project, double origin
 				Note value; value.time = double (note->second.first) / ppqn; value.duration = double (tick - note->second.first) / ppqn;
 				value.channel = status & 15; value.key = a; value.velocity = note->second.second / 127.0; value.release_velocity = (type == 0x90 ? 64 : b) / 127.0;
 				clip.notes.push_back (value); sounding.erase (note);
-			} else { throw ExchangeError ("MIDI controllers, program changes and expression need explicit conversion"); }
+			} else {
+				unsigned number = type == 0xb0 || type == 0xa0 ? a : 0;
+				require (supported_midi_control (type, number), "Ordered MIDI bank/data-entry/channel-mode commands and program changes need explicit conversion");
+				unsigned target = (status << 8) | number;
+				auto found = controls.find (target);
+				if (found == controls.end ()) {
+					MidiControl lane; lane.type = type; lane.channel = status & 15; lane.number = number;
+					found = controls.emplace (target, clip.midi_controls.size ()).first; clip.midi_controls.push_back (lane);
+				}
+				auto& points = clip.midi_controls.at (found->second).points;
+				double at = double (tick) / ppqn, value = type == 0xe0 ? a + (b << 7) : type == 0xd0 ? a : b;
+				if (!points.empty () && points.back ().time == at) {
+					require (points.back ().value == value, "Conflicting MIDI controller events at the same tick");
+				} else { points.push_back ({at, value, false}); }
+			}
 		}
 		require (ended && sounding.empty (), "MIDI track is truncated or has unterminated notes");
-		if (!clip.notes.empty ()) {
+		if (!clip.notes.empty () || !clip.midi_controls.empty ()) {
 			std::stable_sort (clip.notes.begin (), clip.notes.end (), [] (const Note& a, const Note& b) { return a.time < b.time; });
-			clip.name = track.name; clip.duration = double (tick) / ppqn;
+			clip.name = track.name; clip.duration = double (std::max (tick, uint64_t (1))) / ppqn;
+			for (auto const& control : clip.midi_controls) {
+				clip.duration = std::max (clip.duration, control.points.back ().time + 1.0 / ppqn);
+			}
 			track.clips.push_back (clip);
 		}
 		/* Type-1 track zero may contain only global timing. Preserve other
 		 * named/empty tracks, including a completely empty type-0 project. */
-		if (!clip.notes.empty () || index != 0 || format == 0) { tracks.push_back (track); }
+		if (!clip.notes.empty () || !clip.midi_controls.empty () || index != 0 || format == 0) { tracks.push_back (track); }
 	}
 	require (file.pos == file.end, "Unexpected data after MIDI tracks");
 	if (transport.offset_set) { require (std::fabs (transport.offset - origin) <= 0.001, "AAF and MIDI timeline origins do not match"); }
@@ -160,6 +178,6 @@ void read_project_midi (const std::string& path, Project& project, double origin
 	if (!transport.tempo_set || !transport.meter_set) { project.report.push_back ({Disposition::Transformed, "MIDI transport", "Absent tempo or meter uses the MIDI defaults (120 BPM, 4/4)"}); }
 	project.tracks.insert (project.tracks.end (), tracks.begin (), tracks.end ());
 	project.markers.insert (project.markers.end (), markers.begin (), markers.end ());
-	project.report.push_back ({Disposition::Transformed, "MIDI clips", "Each MIDI note track becomes one clip starting at beat zero; instrument sounds are not included in SMF"});
+	project.report.push_back ({Disposition::Transformed, "MIDI clips", "Each MIDI track becomes one clip starting at beat zero; instrument sounds are not included in SMF"});
 }
 } }

@@ -174,6 +174,7 @@ std::vector<Diagnostic> StudioOneSong::export_report (const Project& project)
 		if (!track.volume_automation.points.empty () || !track.pan_automation.points.empty ()) { unsupported (track.name, "Native mixer automation requires the rendered mix option"); }
 		if (track.kind == TrackKind::MIDI && (track.volume != 1 || track.pan != .5)) { unsupported (track.name, "Native MIDI mixer gain and pan require instrument rendering"); }
 		for (auto const& clip : track.clips) {
+			if (!clip.midi_controls.empty ()) { unsupported (clip.name, "Native MIDI controller mapping has not been verified; use DAWproject, AAF/MIDI or rendered audio"); }
 			double in, out, gain; if (!fades (clip, project, timing, in, out, gain)) { unsupported (clip.name, "Native export supports ordinary linear fade lengths; other clip envelopes require rendering"); }
 			else if (!clip.envelope.points.empty ()) { report.push_back ({Disposition::Transformed, clip.name, "Linear clip envelopes become native gain and fade lengths at audio sample resolution"}); }
 			for (auto const& note : clip.notes) {

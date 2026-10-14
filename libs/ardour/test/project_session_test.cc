@@ -468,6 +468,7 @@ void assert_graph_pcm (const std::vector<float>& pcm, unsigned rate, double tole
 class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST_SUITE (ProjectSessionTest);
 	CPPUNIT_TEST (roundtrip);
+	CPPUNIT_TEST (midi_controller_roundtrip);
 	CPPUNIT_TEST (vst3_plugin_exchange);
 	CPPUNIT_TEST (bad_media);
 	CPPUNIT_TEST (corrupt_media);
@@ -503,6 +504,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST_SUITE_END ();
 public:
 	void roundtrip ();
+	void midi_controller_roundtrip ();
 	void vst3_plugin_exchange ();
 	void bad_media ();
 	void corrupt_media ();
@@ -538,6 +540,92 @@ public:
 };
 
 CPPUNIT_TEST_SUITE_REGISTRATION (ProjectSessionTest);
+
+void ProjectSessionTest::midi_controller_roundtrip ()
+{
+	Fixture fixture; auto input = example (fixture);
+	input.tracks.erase (input.tracks.begin () + 1);
+	for (auto& track : input.tracks) { track.parent.clear (); track.pan = .5; if (!track.master) { track.destination = "master"; } }
+	auto& midi = input.tracks.back ();
+	for (unsigned type : {0xb0u, 0xe0u, 0xd0u, 0xa0u}) {
+		PX::MidiControl lane; lane.type = type; lane.channel = 2; lane.number = type == 0xb0 ? 64 : type == 0xa0 ? 60 : 0;
+		lane.points = {{.25, type == 0xe0 ? 8192.0 : 127.0, false}, {1.25, 0, false}, {3.5, type == 0xe0 ? 16383.0 : 100.0, false}, {5, 0, false}};
+		midi.clips[0].midi_controls.push_back (lane);
+	}
+	PX::Clip controls; controls.kind = PX::ClipKind::MIDI; controls.name = "Expression only"; controls.position = PX::Time (8); controls.duration = 2;
+	PX::MidiControl lane; lane.channel = 3; lane.number = 11; lane.points = {{0, 30, false}, {1, 90, false}};
+	controls.midi_controls.push_back (lane); midi.clips.push_back (controls);
+	package (fixture, input);
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"), fixture.path ("Controllers"), "Controllers", fixture.report);
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("Controllers"), "Controllers", nullptr, "", true));
+	AudioEngine::instance ()->set_session (fixture.session.get ());
+	{
+		struct Sink : Evoral::EventSink<samplepos_t> {
+			std::vector<std::pair<samplepos_t, std::vector<uint8_t>>> events;
+			uint32_t write (samplepos_t at, Evoral::EventType, uint32_t size, const uint8_t* data) override {
+				if ((data[0] & 0xf0) != 0x80 && (data[0] & 0xf0) != 0x90) { events.push_back ({at, std::vector<uint8_t> (data, data + size)}); }
+				return size;
+			}
+		} sink;
+		auto track = std::dynamic_pointer_cast<ARDOUR::Track> (fixture.session->route_by_name ("Notes")); CPPUNIT_ASSERT (track);
+		auto regions = track->playlist ()->region_list ();
+		for (auto const& region : *regions) {
+			auto midi_region = std::dynamic_pointer_cast<MidiRegion> (region); CPPUNIT_ASSERT (midi_region);
+			if (region->position ().beats () == Temporal::Beats (4, 0)) { midi_region->render (sink, 0, Sustained, nullptr); }
+		}
+		CPPUNIT_ASSERT_EQUAL (size_t (12), sink.events.size ());
+		const samplepos_t at = Temporal::timepos_t (Temporal::Beats (4, 0)).samples ();
+		std::set<std::vector<uint8_t>> initial;
+		for (auto const& event : sink.events) { if (event.first == at) { initial.insert (event.second); } }
+		const std::set<std::vector<uint8_t>> expected = {{0xb2, 64, 127}, {0xe2, 0, 64}, {0xd2, 127}, {0xa2, 60, 127}};
+		CPPUNIT_ASSERT (initial == expected);
+	}
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("controllers.dawproject"));
+	auto exported = PX::DawProject::read (fixture.path ("controllers.dawproject"));
+	auto const& actual = track_named (exported, "Notes");
+	CPPUNIT_ASSERT_EQUAL (size_t (2), actual.clips.size ());
+	for (size_t c = 0; c < midi.clips.size (); ++c) {
+		CPPUNIT_ASSERT_EQUAL (midi.clips[c].midi_controls.size (), actual.clips[c].midi_controls.size ());
+		for (auto const& expected : midi.clips[c].midi_controls) {
+			auto found = std::find_if (actual.clips[c].midi_controls.begin (), actual.clips[c].midi_controls.end (), [&] (const PX::MidiControl& p) { return p.type == expected.type && p.channel == expected.channel && p.number == expected.number; });
+			CPPUNIT_ASSERT (found != actual.clips[c].midi_controls.end ());
+			auto points = expected.points;
+			if (c == 0) { points.insert (points.begin () + 1, {1, points.front ().value, false}); }
+			CPPUNIT_ASSERT_EQUAL (points.size (), found->points.size ());
+			for (size_t i = 0; i < points.size (); ++i) {
+				CPPUNIT_ASSERT_DOUBLES_EQUAL (points[i].time, found->points[i].time, 1e-6);
+				CPPUNIT_ASSERT_EQUAL (points[i].value, found->points[i].value); CPPUNIT_ASSERT (!found->points[i].linear);
+			}
+		}
+	}
+	PX::SessionExchange::ExportOptions options;
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("UnverifiedNative"), fixture.report, options), PX::ExchangeError);
+	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("UnverifiedNative"), Glib::FILE_TEST_EXISTS));
+	PX::SessionExchange::export_logic (*fixture.session, fixture.path ("ControllerLogic"), fixture.report);
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("ControllerLogic/Project.aaf"), fixture.path ("ControllerLogic/Project.mid"), fixture.path ("ReturnedControls"), "ReturnedControls", fixture.report);
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("ReturnedControls"), "ReturnedControls", nullptr, "", true));
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("returned-controls.dawproject"));
+	auto returned = PX::DawProject::read (fixture.path ("returned-controls.dawproject"));
+	auto const& flat = track_named (returned, "Notes"); CPPUNIT_ASSERT_EQUAL (size_t (1), flat.clips.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (5), flat.clips[0].midi_controls.size ());
+	for (auto const& control : flat.clips[0].midi_controls) {
+		if (control.channel == 3) {
+			CPPUNIT_ASSERT_EQUAL (size_t (2), control.points.size ()); CPPUNIT_ASSERT_DOUBLES_EQUAL (8, control.points[0].time, 1e-6); CPPUNIT_ASSERT_EQUAL (30.0, control.points[0].value);
+			CPPUNIT_ASSERT_DOUBLES_EQUAL (9, control.points[1].time, 1e-6); CPPUNIT_ASSERT_EQUAL (90.0, control.points[1].value); continue;
+		}
+		CPPUNIT_ASSERT_EQUAL (size_t (3), control.points.size ());
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (4, control.points[0].time, 1e-6); CPPUNIT_ASSERT_EQUAL (control.type == 0xe0 ? 8192.0 : 127.0, control.points[0].value);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (4.25, control.points[1].time, 1e-6); CPPUNIT_ASSERT_EQUAL (0.0, control.points[1].value);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (6.5, control.points[2].time, 1e-6); CPPUNIT_ASSERT_EQUAL (control.type == 0xe0 ? 16383.0 : 100.0, control.points[2].value);
+	}
+	CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
+	std::cout << "MIDI controller DAWproject and AAF/SMF trim, chase, save/reopen round trips passed" << std::endl;
+}
 
 void ProjectSessionTest::native_song_export_roundtrip ()
 {

@@ -48,6 +48,7 @@
 #include "ardour/midi_track.h"
 #include "ardour/playlist.h"
 #include "ardour/panner_shell.h"
+#include "ardour/parameter_types.h"
 #include "ardour/pannable.h"
 #include "ardour/phase_control.h"
 #include "ardour/polarity_processor.h"
@@ -267,7 +268,7 @@ void populate_tempo (const Project& project, std::vector<Diagnostic>& report)
 	if (partial_bar) { report.push_back ({Disposition::Transformed, "Meter", "A meter change inside a measure starts a new bar at the original musical position"}); }
 }
 
-SourceList midi_source (Session& session, const Clip& clip, const TimeMap& timing, const CancelCheck& cancel)
+SourceList midi_source (Session& session, const Clip& clip, const TimeMap& timing, std::vector<Diagnostic>& report, const CancelCheck& cancel)
 {
 	std::string path = session.new_midi_source_path (clip.name.empty () ? "MIDI" : clip.name);
 	std::shared_ptr<MidiSource> source = std::dynamic_pointer_cast<MidiSource> (
@@ -293,25 +294,51 @@ SourceList midi_source (Session& session, const Clip& clip, const TimeMap& timin
 		events.push_back ({off, {{static_cast<uint8_t> (0x80 | note.channel), static_cast<uint8_t> (note.key), release}}});
 		end = std::max (end, stop);
 	}
+	for (auto const& control : clip.midi_controls) {
+		auto points = control.points;
+		auto boundary = std::lower_bound (points.begin (), points.end (), clip.offset.value,
+		                                 [] (const AutomationPoint& p, double t) { return p.time < t; });
+		if (boundary != points.begin () && (boundary == points.end () || boundary->time != clip.offset.value)) {
+			points.insert (boundary, {clip.offset.value, std::prev (boundary)->value, false});
+			report.push_back ({Disposition::Transformed, clip.name, "MIDI controller state before the source offset copied to the clip start"});
+		}
+		Temporal::Beats previous; bool first = true;
+		for (auto const& point : points) {
+			cancelled (cancel);
+			double at = timing.content (Time (point.time, clip.offset.unit), clip.position, clip.offset, TimeUnit::Beats);
+			auto when = beats (at);
+			if (!first && when <= previous) { throw ExchangeError ("MIDI controller points collide at Ardour's timing resolution"); }
+			previous = when; first = false;
+			unsigned value = point.value;
+			uint8_t a = control.type == 0xd0 ? value : control.type == 0xe0 ? value & 127 : control.number;
+			uint8_t b = control.type == 0xe0 ? value >> 7 : control.type == 0xd0 ? 0 : value;
+			events.push_back ({when, {{static_cast<uint8_t> (control.type | control.channel), a, b}}}); end = std::max (end, at);
+		}
+	}
 	std::stable_sort (events.begin (), events.end (), [] (const Event& a, const Event& b) {
-		return a.time != b.time ? a.time < b.time : a.data[0] < b.data[0];
+		auto order = [] (uint8_t status) { return (status & 0xf0) == 0x80 ? 0 : (status & 0xf0) == 0x90 ? 2 : 1; };
+		return a.time != b.time ? a.time < b.time : order (a.data[0]) < order (b.data[0]);
 	});
 	std::set<std::pair<uint8_t, uint8_t>> sounding;
 	for (auto const& event : events) {
 		auto key = std::make_pair (uint8_t (event.data[0] & 15), event.data[1]);
 		if ((event.data[0] & 0xf0) == 0x90) {
 			if (!sounding.insert (key).second) { throw ExchangeError ("Overlapping notes with the same pitch and channel cannot be preserved in SMF"); }
-		} else { sounding.erase (key); }
+		} else if ((event.data[0] & 0xf0) == 0x80) { sounding.erase (key); }
 	}
 	Source::WriterLock lock (source->mutex ());
 	source->mark_streaming_write_started (lock);
 	source->drop_model (lock);
 	for (auto const& event : events) {
 		cancelled (cancel);
-		source->append_event_beats (lock, Evoral::Event<Temporal::Beats> (Evoral::MIDI_EVENT, event.time, 3, event.data.data ()));
+		source->append_event_beats (lock, Evoral::Event<Temporal::Beats> (Evoral::MIDI_EVENT, event.time, (event.data[0] & 0xf0) == 0xd0 ? 2 : 3, event.data.data ()));
 	}
 	source->mark_streaming_write_completed (lock, Temporal::timecnt_t (beats (end)));
 	source->load_model (lock, true);
+	for (auto const& item : source->model ()->controls ()) {
+		source->set_interpolation_of (item.first, Evoral::ControlList::Discrete);
+		if (item.second->list ()) { item.second->list ()->set_interpolation (Evoral::ControlList::Discrete); }
+	}
 	return SourceList (1, source);
 }
 
@@ -551,7 +578,7 @@ void populate (Session& session, const Project& project, const std::map<std::str
 			properties.add (Properties::name, clip.name.empty () ? track.name : clip.name);
 			properties.add (Properties::whole_file, false);
 			properties.add (Properties::opaque, false);
-			SourceList source = midi ? midi_source (session, clip, timing, cancel) : sources.at (clip.media);
+			SourceList source = midi ? midi_source (session, clip, timing, report, cancel) : sources.at (clip.media);
 			auto region = RegionFactory::create (source, properties);
 			if (!region) { throw ExchangeError ("Cannot create imported region"); }
 			region->set_muted (!clip.enabled);
@@ -1099,8 +1126,21 @@ Project collect (Session& session, AudioAssets& assets, const CancelCheck& cance
 					auto lock = model->read_lock ();
 					std::set<Evoral::Parameter> parameters;
 					model->what_has_data (parameters);
-					if (!parameters.empty () || !model->sysexes ().empty () || !model->patch_changes ().empty ()) {
-						unsupported (project, clip.name, "MIDI controllers, patch changes, and system messages cannot yet be exchanged");
+					if (!model->sysexes ().empty () || !model->patch_changes ().empty ()) {
+						unsupported (project, clip.name, "MIDI patch changes and system messages cannot yet be exchanged");
+					}
+					for (auto const& parameter : parameters) {
+						MidiControl control; control.type = parameter_midi_type (static_cast<AutomationType> (parameter.type ()));
+						control.channel = parameter.channel (); control.number = parameter.id ();
+						if (!supported_midi_control (control.type, control.number)) { unsupported (project, clip.name, "Ordered MIDI bank/data-entry/channel-mode commands cannot yet be exchanged"); continue; }
+						if (midi->midi_source ()->automation_state_of (parameter) != Play) { unsupported (project, clip.name, "Disabled MIDI controller playback cannot yet be exchanged"); continue; }
+						auto native = model->control (parameter); auto list = native ? native->list () : nullptr;
+						if (!list || list->empty ()) { continue; }
+						if (list->interpolation () != Evoral::ControlList::Discrete && std::any_of (list->begin (), list->end (), [&] (Evoral::ControlEvent* p) { return p->value != (*list->begin ())->value; })) {
+							unsupported (project, clip.name, "Continuous MIDI controller curves require explicit sampling or rendering"); continue;
+						}
+						for (auto const& point : *list) { control.points.push_back ({beat_value (point->when.beats ()), point->value, false}); }
+						clip.midi_controls.push_back (std::move (control));
 					}
 					for (auto const& event : model->notes ()) {
 						Note note;
@@ -1479,7 +1519,7 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 	if (g_mkdir (output.c_str (), 0700)) { throw ExchangeError ("Cannot create AAF/MIDI export staging directory"); }
 	XMLTree manifest;
 	XMLNode& root = *manifest.set_root (new XMLNode ("LogicExchange"));
-	root.set_property ("version", 1);
+	root.set_property ("version", 2);
 	root.set_property ("name", session.name ());
 	root.set_property ("rate", session.sample_rate ());
 	root.set_property ("tempo", project.tempo);
@@ -1575,6 +1615,15 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 					event.set_property ("velocity", int (std::max (1.0, std::round (note.velocity * 127))));
 					event.set_property ("release", int (std::round (note.release_velocity * 127)));
 				}
+				for (auto const& control : clip.midi_controls) {
+					XMLNode& lane = *item.add_child ("MidiControl");
+					lane.set_property ("type", control.type); lane.set_property ("channel", control.channel); lane.set_property ("number", control.number);
+					for (auto const& point : control.points) {
+						XMLNode& event = *lane.add_child ("Point");
+						event.set_property ("time", timing.content (Time (point.time, clip.offset.unit), clip.position, clip.offset, TimeUnit::Beats));
+						event.set_property ("value", int (point.value));
+					}
+				}
 			}
 		}
 	}
@@ -1590,7 +1639,7 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 	if (!manifest.write (path)) { throw ExchangeError ("Cannot write AAF/MIDI export manifest"); }
 	run_logic_writer (path, output, cancel);
 	report.push_back ({Disposition::Transformed, "Audio", "Embedded 24-bit PCM; floating-point sources are quantized to 24 bits"});
-	if (!options.render_mix) { report.push_back ({Disposition::Transformed, "MIDI", "Clips merged per track; notes trimmed to clip boundaries and rounded to 1/19200 beat; notes crossing the left edge are retriggered"}); }
+	if (!options.render_mix) { report.push_back ({Disposition::Transformed, "MIDI", "Clips merged per track and events rounded to 1/19200 beat; notes trimmed and retriggered at the left edge; held MIDI controller values copied to the clip start"}); }
 	if (!options.render_mix) { report.push_back ({Disposition::Transformed, "Metadata", "Original clip structure and colors retained in Metadata.xml; target applications may not display this metadata"}); }
 	report.push_back ({Disposition::Transformed, "Timeline", "AAF and MIDI start at zero, with 25 fps zero timecode; load both files at that origin"});
 	report.push_back ({Disposition::Transformed, "Mixing", "Gain and pan use AAF rational values; target panning laws can differ"});

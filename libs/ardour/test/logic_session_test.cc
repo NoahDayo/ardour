@@ -392,7 +392,14 @@ void LogicSessionTest::midi_validation ()
 	auto broken = valid; broken.pop_back (); write (broken);
 	CPPUNIT_ASSERT_THROW (PX::read_project_midi (path, project, 0), PX::ExchangeError);
 	broken = valid; broken.insert (broken.end () - 4, {0, 0xb2, 64, 127}); write (broken);
-	CPPUNIT_ASSERT_THROW (PX::read_project_midi (path, project, 0), PX::ExchangeError);
+	PX::Project controller; PX::read_project_midi (path, controller, 0);
+	CPPUNIT_ASSERT_EQUAL (size_t (1), controller.tracks[0].clips[0].midi_controls.size ());
+	CPPUNIT_ASSERT_EQUAL (127.0, controller.tracks[0].clips[0].midi_controls[0].points[0].value);
+	CPPUNIT_ASSERT (controller.tracks[0].clips[0].duration > .5); // Keep a controller at the end-of-track tick audible.
+	for (auto extra : std::vector<std::vector<unsigned char>> {{0, 0xb2, 101, 0}, {0, 0xc2, 5}, {0, 0xb2, 64, 127, 0, 64, 0}, {0, 0xe2, 128, 64}}) {
+		broken = valid; broken.insert (broken.end () - 4, extra.begin (), extra.end ()); write (broken);
+		CPPUNIT_ASSERT_THROW (PX::read_project_midi (path, project, 0), PX::ExchangeError);
+	}
 	broken = valid; broken.insert (broken.end () - 4, {0, 0xff, 0x51, 3, 7, 0xa1, 0x20}); write (broken);
 	PX::read_project_midi (path, project, 0);
 	CPPUNIT_ASSERT_EQUAL (size_t (2), project.tempos.size ());

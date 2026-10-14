@@ -54,9 +54,10 @@ def read_midi(path):
                 position += size
                 events.append((tick, status, meta, payload))
             else:
-                assert status & 0xF0 in (0x80, 0x90)
-                events.append((tick, status, *data[position:position + 2]))
-                position += 2
+                assert status & 0xF0 in (0x80, 0x90, 0xA0, 0xB0, 0xD0, 0xE0)
+                size = 1 if status & 0xF0 == 0xD0 else 2
+                events.append((tick, status, *data[position:position + size]))
+                position += size
         assert position == end and events[-1][1:] == (255, 47, b"")
         tracks.append(events)
     assert position == len(data)
@@ -303,6 +304,45 @@ class LogicWriterTest(unittest.TestCase):
                                 text=True, encoding="utf-8", timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["tracks"][1]["gain_curve"], [[0, .25], [1, .75]])
+
+    def test_midi_controller_bytes_trim_and_chase(self):
+        self.root.set('version', '2')
+        clip = self.root.find('MidiTrack/Clip')
+        for kind, number_, values in [(0xB0, 64, [127, 0, 127]), (0xE0, 0, [8192, 16383, 0]), (0xD0, 0, [15, 99, 0]), (0xA0, 60, [31, 100, 0])]:
+            lane = ET.SubElement(clip, 'MidiControl', type=str(kind), channel='2', number=str(number_))
+            for at, value in zip([1, 3, 6], values):
+                ET.SubElement(lane, 'Point', time=str(at), value=str(value))
+        result = self.run_writer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = read_midi(self.output / 'Project.mid')[1]
+        controls = [e for e in events if e[1] != 255 and e[1] & 0xF0 not in (0x80, 0x90)]
+        self.assertEqual(controls, [(8*PPQN, 0xB2, 64, 127), (8*PPQN, 0xE2, 0, 64), (8*PPQN, 0xD2, 15), (8*PPQN, 0xA2, 60, 31),
+                                    (9*PPQN, 0xB2, 64, 0), (9*PPQN, 0xE2, 127, 127), (9*PPQN, 0xD2, 99), (9*PPQN, 0xA2, 60, 100)])
+        at_start = [e for e in events if e[0] == 8*PPQN]
+        self.assertEqual(at_start[-1][1] & 0xF0, 0x90)
+
+    def test_rejects_controller_collisions_and_ordered_commands(self):
+        clip = self.root.find('MidiTrack/Clip')
+        lane = ET.SubElement(clip, 'MidiControl', type='176', channel='2', number='64')
+        ET.SubElement(lane, 'Point', time='3', value='127')
+        point = ET.SubElement(lane, 'Point', time='3.000001', value='0')
+        result = self.run_writer()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('tick resolution', result.stderr)
+        point.set('time', '4')
+        lane.set('number', '101')
+        result = self.run_writer()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Unsupported MIDI controller target', result.stderr)
+
+    def test_rejects_chased_controller_tick_collision(self):
+        clip = self.root.find('MidiTrack/Clip')
+        lane = ET.SubElement(clip, 'MidiControl', type='176', channel='2', number='64')
+        ET.SubElement(lane, 'Point', time='1', value='127')
+        ET.SubElement(lane, 'Point', time='2.000001', value='0')
+        result = self.run_writer()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('tick resolution', result.stderr)
 
     def test_rejects_ambiguous_overlapping_notes(self):
         clip = self.root.find("MidiTrack/Clip")

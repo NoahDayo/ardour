@@ -84,6 +84,11 @@ export ARDOUR_TEST_PATH="$profile/test-data"
 export PBD_TEST_PATH="$root/libs/pbd/test"
 export EVORAL_TEST_PATH="$root/libs/evoral/test/testdata"
 export MIDIPP_TEST_PATH="$root/share/patchfiles"
+# Exercise the helper from this checkout, not a stale installed copy.
+case "$(uname -s)" in
+    MINGW*|MSYS*) export ARDOUR_LOGIC_HELPER="${ARDOUR_LOGIC_HELPER:-$(cygpath -m "$root/share/project-exchange/aaf_writer.py")}" ;;
+    *) export ARDOUR_LOGIC_HELPER="${ARDOUR_LOGIC_HELPER:-$root/share/project-exchange/aaf_writer.py}" ;;
+esac
 export ARDOUR_SURFACES_PATH="$profile/no-surfaces"
 export VAMP_PATH="$profile/no-vamp"
 

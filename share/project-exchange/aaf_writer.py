@@ -121,6 +121,7 @@ def write_midi(root, destination):
     for track in root.findall("MidiTrack"):
         output = [(0, -1, meta(3, track.attrib["name"].encode("utf-8")))]
         intervals = {}
+        control_intervals, control_values = {}, {}
         for clip in track.findall("Clip"):
             require(clip.attrib.get("enabled") == "true", "Muted MIDI clips are not supported")
             position, length, offset = (number(clip, key) for key in ("time", "length", "offset"))
@@ -137,12 +138,48 @@ def write_midi(root, destination):
                 channel, key, velocity, release = (integer(note, field) for field in ("channel", "key", "velocity", "release"))
                 require(channel < 16 and key < 128 and 1 <= velocity <= 127 and release < 128, "Invalid MIDI note")
                 intervals.setdefault((channel, key), []).append((on, off))
-                output.append((on, 1, bytes([0x90 | channel, key, velocity])))
+                output.append((on, 2, bytes([0x90 | channel, key, velocity])))
                 output.append((off, 0, bytes([0x80 | channel, key, release])))
+            seen_targets = set()
+            for lane in clip.findall("MidiControl"):
+                kind, channel, number_ = (integer(lane, field) for field in ("type", "channel", "number"))
+                supported = ((kind == 0xB0 and 0 < number_ < 96 and number_ not in (6, 32, 38)) or
+                             (kind == 0xA0 and number_ < 128) or (kind in (0xD0, 0xE0) and number_ == 0))
+                require(supported and channel < 16, "Unsupported MIDI controller target")
+                target = (kind, channel, number_)
+                require(target not in seen_targets, "Duplicate MIDI controller lane")
+                seen_targets.add(target)
+                previous, carry, points, at_boundary = -1, None, [], False
+                for point in lane.findall("Point"):
+                    at, value = number(point, "time"), integer(point, "value")
+                    require(at >= 0 and at > previous and value <= (16383 if kind == 0xE0 else 127), "Invalid MIDI controller point")
+                    previous = at
+                    if at < offset:
+                        carry = value
+                    elif at < offset + length:
+                        at_boundary |= at == offset
+                        points.append((ticks(position + at - offset), value))
+                if carry is not None and not at_boundary:
+                    points.insert(0, (ticks(position), carry))
+                if points:
+                    control_intervals.setdefault(target, []).append((ticks(position), ticks(position + length)))
+                for at, value in points:
+                    address = (*target, at)
+                    require(address not in control_values or control_values[address] == value,
+                            "MIDI controllers conflict at output tick resolution")
+                    control_values[address] = value
         for spans in intervals.values():
             spans.sort()
             require(all(a[1] <= b[0] for a, b in zip(spans, spans[1:])),
                     "Overlapping notes with the same channel and pitch cannot be represented faithfully")
+        for spans in control_intervals.values():
+            spans.sort()
+            require(all(a[1] <= b[0] for a, b in zip(spans, spans[1:])),
+                    "Overlapping MIDI controller clips need explicit consolidation")
+        for (kind, channel, number_, at), value in control_values.items():
+            data = bytes([kind | channel, value]) if kind == 0xD0 else bytes(
+                [kind | channel, value & 127, value >> 7]) if kind == 0xE0 else bytes([kind | channel, number_, value])
+            output.append((at, 1, data))
         tracks.append(output)
     require(len(tracks) < 65535, "Too many MIDI tracks")
     with destination.open("xb") as output:
@@ -317,7 +354,7 @@ def run(manifest, destination):
     data = manifest.read_bytes()
     require(len(data) <= 32 * 1024 * 1024 and b"<!" not in data, "Invalid exchange manifest")
     root = ET.fromstring(data)
-    require(root.tag == "LogicExchange" and root.attrib.get("version") == "1", "Unknown exchange manifest")
+    require(root.tag == "LogicExchange" and root.attrib.get("version") in ("1", "2"), "Unknown exchange manifest")
     write_midi(root, destination / "Project.mid")
     write_aaf(root, destination / "Project.aaf")
     # Keep source structure and appearance recoverable without leaking local

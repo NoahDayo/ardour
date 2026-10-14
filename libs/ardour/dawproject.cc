@@ -172,6 +172,44 @@ struct Parser {
 		return value;
 	}
 
+	bool midi_points (Node node, TimeUnit unit, std::vector<std::pair<MidiControl, TimeUnit>>& controls)
+	{
+		Node target = child (node, "Target");
+		if (!target || has (target, "parameter")) { return false; }
+		std::string expression = attr (target, "expression");
+		unsigned type = expression == "channelController" ? 0xb0 : expression == "polyPressure" ? 0xa0 :
+		                expression == "channelPressure" ? 0xd0 : expression == "pitchBend" ? 0xe0 : 0;
+		if (!type) { return false; }
+		attributes (node, {"id", "name", "color", "timeUnit", "unit"});
+		attributes (target, {"expression", "channel", type == 0xb0 ? "controller" : type == 0xa0 ? "key" : "channel"});
+		if (!has (target, "channel")) { diagnostic (node, "MIDI controller expression needs an explicit channel"); return true; }
+		MidiControl control; control.type = type; control.channel = integer (target, "channel", 0, true);
+		if (type == 0xb0 || type == 0xa0) { control.number = integer (target, type == 0xb0 ? "controller" : "key", 0, true); }
+		if (control.channel > 15 || control.number > 127 || !children (target).empty ()) { throw ExchangeError ("Invalid MIDI expression target"); }
+		if (!supported_midi_control (type, control.number)) { diagnostic (node, "Ordered MIDI bank/data-entry/channel-mode commands require explicit conversion"); return true; }
+		unsigned targets = 0; double previous = -1; bool prior_linear = false;
+		for (Node point : children (node)) {
+			if (is (point, "Target")) { ++targets; continue; }
+			expansion (); attributes (point, {"time", "value", "interpolation"});
+			if ((!is (point, "IntegerPoint") && !is (point, "RealPoint")) || !children (point).empty ()) { throw ExchangeError ("Invalid MIDI controller point"); }
+			double at = number (point, "time", 0, true), raw = number (point, "value", 0, true);
+			if (at < 0 || at <= previous) { throw ExchangeError ("Unordered MIDI controller points"); }
+			double maximum = type == 0xe0 ? 16383 : 127;
+			if (is (point, "RealPoint")) {
+				if (attr (node, "unit") != "normalized" || raw < 0 || raw > 1) { throw ExchangeError ("MIDI real points require normalized values"); }
+				raw = std::round (raw * maximum);
+			} else if (has (node, "unit") || raw < 0 || raw > maximum || raw != std::floor (raw)) { throw ExchangeError ("MIDI integer points require raw MIDI values without a unit"); }
+			std::string mode = attr (point, "interpolation", "hold");
+			if (mode != "hold" && mode != "linear") { throw ExchangeError ("Invalid MIDI interpolation"); }
+			if (prior_linear && control.points.back ().value != raw) { diagnostic (node, "Continuous MIDI controller ramps require explicit sampling or rendering"); return true; }
+			control.points.push_back ({at, raw, false}); previous = at; prior_linear = mode == "linear";
+		}
+		if (targets != 1) { throw ExchangeError ("MIDI expression requires exactly one target"); }
+		if (!control.points.empty ()) { controls.emplace_back (std::move (control), unit); }
+		if (attr (node, "unit") == "normalized") { diagnostic (node, "Normalized MIDI values rounded to their 7-bit or 14-bit wire resolution", Disposition::Transformed); }
+		return true;
+	}
+
 	void points (Node node, TimeUnit unit, bool arrangement = true, Automation* expression = nullptr)
 	{
 		attributes (node, {"id", "name", "color", "timeUnit", "unit"});
@@ -492,6 +530,7 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active, Time orig
 	double clip_start = timing->convert (outer.position, TimeUnit::Seconds);
 	double clip_length = timing->duration (Time (outer.duration, parent_unit), outer.position, TimeUnit::Seconds);
 	Automation expression;
+	std::vector<std::pair<MidiControl, TimeUnit>> controls;
 	std::vector<Node> contents = children (node);
 	Node content = NULL;
 	if (has (node, "reference")) {
@@ -510,25 +549,34 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active, Time orig
 		content_unit = time_unit (content, "timeUnit", content_unit);
 		Node playable = NULL;
 		for (Node item : children (content)) {
-			if (is (item, "Points")) { points (item, time_unit (item, "timeUnit", content_unit), false, &expression); continue; }
+			if (is (item, "Points")) {
+				TimeUnit unit = time_unit (item, "timeUnit", content_unit);
+				if (!midi_points (item, unit, controls)) { points (item, unit, false, &expression); }
+				continue;
+			}
 			if (playable) { throw ExchangeError ("Parallel clip content lanes are not yet supported"); }
 			playable = item;
 		}
-		if (!playable) { throw ExchangeError ("Clip lanes contain no playable content"); }
+		if (!playable && controls.empty ()) { throw ExchangeError ("Clip lanes contain no playable content"); }
 		content = playable;
 	}
+	if (is (content, "Points") && midi_points (content, time_unit (content, "timeUnit", content_unit), controls)) { content = nullptr; }
 	std::vector<Clip> result;
 	if (is (content, "Audio")) {
 		outer.kind = ClipKind::Audio;
 		outer.media = audio (content);
 		outer.offset = Time (timing->content (outer.offset, outer.position, outer.offset, TimeUnit::Seconds), TimeUnit::Seconds);
 		result.push_back (outer);
-	} else if (is (content, "Notes")) {
-		attributes (content, {"id", "timeUnit"});
+	} else if (is (content, "Notes") || (!content && !controls.empty ())) {
+		if (content) { attributes (content, {"id", "timeUnit"}); }
 		outer.kind = ClipKind::MIDI;
-		TimeUnit unit = time_unit (content, "timeUnit", content_unit);
+		TimeUnit unit = content ? time_unit (content, "timeUnit", content_unit) : content_unit;
 		outer.offset = Time (timing->content (outer.offset, outer.position, outer.offset, unit), unit);
-		for (Node item : children (content)) {
+		for (auto& control : controls) {
+			for (auto& point : control.first.points) { point.time = timing->content (Time (point.time, control.second), outer.position, source_offset, unit); }
+			outer.midi_controls.push_back (std::move (control.first));
+		}
+		for (Node item : content ? children (content) : std::vector<Node> ()) {
 			if (!is (item, "Note")) { diagnostic (item, "Unknown notes element"); continue; }
 			expansion ();
 			attributes (item, {"time", "duration", "channel", "key", "vel", "rel"});
@@ -547,6 +595,7 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active, Time orig
 		}
 		result.push_back (outer);
 	} else if (is (content, "Clips")) {
+		if (!controls.empty ()) { diagnostic (node, "MIDI expression around nested clips is not yet converted"); }
 		attributes (content, {"id", "timeUnit"});
 		TimeUnit unit = time_unit (content, "timeUnit", content_unit);
 		double start = timing->convert (outer.position, TimeUnit::Seconds);
@@ -572,8 +621,9 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active, Time orig
 		}
 		diagnostic (node, "Flattened nested clips while preserving audible ranges and source offsets", Disposition::Transformed);
 	} else {
-		throw ExchangeError ("Unsupported clip content: " + std::string (reinterpret_cast<const char*> (content->name)));
+		throw ExchangeError ("Unsupported clip content");
 	}
+	if (!controls.empty () && !result.empty () && result.front ().kind != ClipKind::MIDI) { diagnostic (node, "MIDI expression on audio content cannot be converted"); }
 	Automation envelope; envelope.unit = TimeUnit::Seconds;
 	if (!expression.points.empty ()) {
 		Time origin (timing->convert (outer.position, source_offset.unit) - source_offset.value, source_offset.unit);
@@ -884,7 +934,20 @@ struct Writer {
 			property (file, "path", source->path);
 			property (file, "external", "false");
 		} else {
-			Node notes = element (output, "Notes");
+			Node content = output;
+			if (!clip.midi_controls.empty ()) {
+				content = element (output, "Lanes"); property (content, "timeUnit", unit_name (clip.offset.unit));
+				for (auto const& control : clip.midi_controls) {
+					Node points = element (content, "Points"), target = element (points, "Target");
+					property (target, "expression", control.type == 0xb0 ? "channelController" : control.type == 0xa0 ? "polyPressure" : control.type == 0xd0 ? "channelPressure" : "pitchBend");
+					property (target, "channel", control.channel);
+					if (control.type == 0xb0 || control.type == 0xa0) { property (target, control.type == 0xb0 ? "controller" : "key", control.number); }
+					for (auto const& point : control.points) {
+						Node p = element (points, "IntegerPoint"); property (p, "time", point.time); property (p, "value", int (point.value));
+					}
+				}
+			}
+			Node notes = element (content, "Notes");
 			property (notes, "timeUnit", unit_name (clip.offset.unit));
 			for (auto const& note : clip.notes) {
 				Node n = element (notes, "Note");

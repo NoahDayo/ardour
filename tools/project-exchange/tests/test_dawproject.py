@@ -106,6 +106,72 @@ class DawProjectTest(unittest.TestCase):
         del result["report"]
         return result
 
+    def control_fixture(self, points):
+        return PROJECT.replace('<Notes>', '<Lanes>' + points + '<Notes>').replace('</Notes>', '</Notes></Lanes>')
+
+    def test_midi_controller_lanes_schema_roundtrip(self):
+        lanes = ''
+        for expression, extra, maximum in [('channelController', 'controller="64"', 127), ('pitchBend', '', 16383), ('channelPressure', '', 127), ('polyPressure', 'key="60"', 127)]:
+            lanes += f'<Points><Target expression="{expression}" channel="3" {extra}/><IntegerPoint time="0" value="0"/><IntegerPoint time="1.25" value="{maximum}"/><IntegerPoint time="3" value="0"/></Points>'
+        original = self.parse(self.control_fixture(lanes))
+        self.assertEqual(original['report'], [])
+        controls = original['tracks'][2]['clips'][0]['midi_controls']
+        self.assertEqual([c['type'] for c in controls], [176, 224, 208, 160])
+        self.assertEqual(controls[1]['points'], [[0, 0], [1.25, 16383], [3, 0]])
+        output = self.root / 'controllers.xml'
+        self.command('rewrite', self.input, output)
+        self.assert_schema(output)
+        self.assertEqual(self.semantic(original), self.semantic(json.loads(self.command('parse', output).stdout)))
+
+    def test_normalized_midi_and_mixed_time_units(self):
+        lanes = '<Points timeUnit="seconds" unit="normalized"><Target expression="channelController" channel="0" controller="1"/><RealPoint time="0.6" value="0.5" interpolation="hold"/><RealPoint time="1.2" value="1"/></Points>'
+        parsed = self.parse(self.control_fixture(lanes))
+        self.assertEqual(parsed['tracks'][2]['clips'][0]['midi_controls'][0]['points'], [[1, 64], [2, 127]])
+        self.assertTrue(all(d['disposition'] != 3 for d in parsed['report']))
+
+    def test_controller_only_clip(self):
+        lanes = '<Points><Target expression="channelController" channel="1" controller="64"/><IntegerPoint time="0" value="127"/><IntegerPoint time="4" value="0"/></Points>'
+        parsed = self.parse(self.control_fixture(lanes))
+        xml = ET.fromstring(self.input.read_text())
+        notes = xml.find('.//Clip[@name="Notes"]/Lanes/Notes')
+        notes.clear()
+        parsed = self.parse(ET.tostring(xml, encoding='unicode'))
+        self.assertEqual(parsed['tracks'][2]['clips'][0]['notes'], [])
+        self.assertEqual(len(parsed['tracks'][2]['clips'][0]['midi_controls']), 1)
+
+    def test_midi_controller_validation_and_explicit_limits(self):
+        valid = '<Points><Target expression="channelController" channel="0" controller="64"/><IntegerPoint time="0" value="127"/><IntegerPoint time="1" value="0"/></Points>'
+        for before, after in [('channel="0"', 'channel="16"'), ('value="127"', 'value="128"'), ('time="1"', 'time="0"')]:
+            self.parse(self.control_fixture(valid.replace(before, after)), status=1)
+        self.parse(self.control_fixture(valid + valid), status=1)
+        for number in (0, 6, 32, 38, 96, 101, 120, 127):
+            parsed = self.parse(self.control_fixture(valid.replace('controller="64"', f'controller="{number}"')))
+            self.assertTrue(any(d['disposition'] == 3 for d in parsed['report']))
+        curve = '<Points unit="normalized"><Target expression="pitchBend" channel="0"/><RealPoint time="0" value="0" interpolation="linear"/><RealPoint time="1" value="1"/></Points>'
+        parsed = self.parse(self.control_fixture(curve))
+        self.assertTrue(any(d['disposition'] == 3 for d in parsed['report']))
+
+    def test_midi_controller_nested_clip_trim(self):
+        lanes = '<Points><Target expression="channelController" channel="0" controller="64"/><IntegerPoint time="0" value="127"/><IntegerPoint time="3" value="0"/></Points>'
+        xml = ET.fromstring(self.control_fixture(lanes))
+        parent = xml.find('.//Clip[@name="Notes"]/..')
+        inner = parent.find('Clip[@name="Notes"]')
+        parent.remove(inner)
+        outer = ET.SubElement(parent, 'Clip', time='10', duration='2', playStart='5')
+        content = ET.SubElement(outer, 'Clips')
+        content.append(inner)
+        parsed = self.parse(ET.tostring(xml, encoding='unicode'))
+        clip = parsed['tracks'][2]['clips'][0]
+        self.assertEqual(clip['position'], [10, 'beats'])
+        self.assertAlmostEqual(clip['duration'], 2)
+        self.assertEqual(clip['offset'][1], 'beats')
+        self.assertAlmostEqual(clip['offset'][0], 2)
+        self.assertEqual(clip['midi_controls'][0]['points'], [[0, 127], [3, 0]])
+        output = self.root / 'nested-controls.xml'
+        self.command('rewrite', self.input, output)
+        self.assert_schema(output)
+        self.assertEqual(self.semantic(parsed), self.semantic(json.loads(self.command('parse', output).stdout)))
+
     def test_independent_audio_midi_timing_and_mixer_fixture(self):
         project = self.parse()
         self.assertEqual(project["tempo"], 100)

@@ -117,6 +117,13 @@ static void dump (const Project& p)
 				if (!first_note) { std::cout << ','; } first_note = false;
 				std::cout << '[' << n.time << ',' << n.duration << ',' << n.key << ',' << n.channel << ',' << n.velocity << ',' << n.release_velocity << ']';
 			}
+			std::cout << "],\"midi_controls\":[";
+			for (size_t i = 0; i < c.midi_controls.size (); ++i) {
+				if (i) { std::cout << ','; } auto const& lane = c.midi_controls[i];
+				std::cout << "{\"type\":" << lane.type << ",\"channel\":" << lane.channel << ",\"number\":" << lane.number << ",\"points\":[";
+				for (size_t j = 0; j < lane.points.size (); ++j) { if (j) { std::cout << ','; } std::cout << '[' << lane.points[j].time << ',' << lane.points[j].value << ']'; }
+				std::cout << "]}";
+			}
 			std::cout << "]}";
 		}
 		std::cout << "]}";

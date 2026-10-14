@@ -56,6 +56,16 @@ struct Automation {
 	std::vector<AutomationPoint> points;
 };
 
+/* Discrete MIDI channel data. Times use the owning clip's source time unit;
+ * values are raw MIDI integers (pitch bend 0..16383, otherwise 0..127). */
+struct MidiControl {
+	unsigned type = 0xb0; // CC, poly pressure (0xa0), channel pressure (0xd0), bend (0xe0).
+	unsigned channel = 0;
+	unsigned number = 0; // Controller number or poly-pressure key; zero otherwise.
+	std::vector<AutomationPoint> points;
+};
+LIBARDOUR_API bool supported_midi_control (unsigned type, unsigned number);
+
 enum class ClipKind { Audio, MIDI };
 struct Clip {
 	std::string name;
@@ -69,6 +79,7 @@ struct Clip {
 	Automation envelope {TimeUnit::Seconds, {}}; // Linear amplitude, seconds from the audible clip start.
 	std::string media; // Audio source ID.
 	std::vector<Note> notes; // Note times use offset.unit, relative to the source.
+	std::vector<MidiControl> midi_controls;
 };
 
 enum class TrackKind { Audio, MIDI, Folder, Bus };

@@ -7,6 +7,7 @@
 #include <map>
 #include <limits>
 #include <set>
+#include <tuple>
 #include <glib.h>
 
 namespace ARDOUR { namespace ProjectExchange {
@@ -368,6 +369,17 @@ validate_vst3_state (const std::string& id, const std::string& state)
 	require (transferable, "VST3 preset has no component or controller state");
 }
 
+bool
+supported_midi_control (unsigned type, unsigned number)
+{
+	if (type == 0xb0) {
+		/* Bank selection, data entry/RPN/NRPN and channel-mode commands depend
+		 * on cross-controller event order and must not become independent lanes. */
+		return number < 96 && number != 0 && number != 32 && number != 6 && number != 38;
+	}
+	return (type == 0xa0 && number < 128) || ((type == 0xd0 || type == 0xe0) && number == 0);
+}
+
 void
 validate_project (const Project& project)
 {
@@ -451,7 +463,7 @@ validate_project (const Project& project)
 				previous_envelope = point.time;
 			}
 			if (clip.kind == ClipKind::Audio) {
-				require (track.kind == TrackKind::Audio && clip.notes.empty (), "Audio clip on incompatible track");
+				require (track.kind == TrackKind::Audio && clip.notes.empty () && clip.midi_controls.empty (), "Audio clip on incompatible track");
 				auto source = media.find (clip.media);
 				require (source != media.end (), "Unknown audio source: " + clip.media);
 				require (clip.offset.unit == TimeUnit::Seconds, "Audio source offset must use seconds");
@@ -464,6 +476,18 @@ validate_project (const Project& project)
 					         std::isfinite (note.time + note.duration), "Invalid MIDI note range");
 					require (note.key >= 0 && note.key <= 127 && note.channel >= 0 && note.channel <= 15 &&
 					         normalized (note.velocity) && normalized (note.release_velocity), "Invalid MIDI note data");
+				}
+				std::set<std::tuple<unsigned, unsigned, unsigned>> targets;
+				size_t control_events = 0;
+				for (auto const& control : clip.midi_controls) {
+					require (supported_midi_control (control.type, control.number) && control.channel < 16, "Unsupported MIDI controller target");
+					require (targets.emplace (control.type, control.channel, control.number).second, "Duplicate MIDI controller lane");
+					double previous = -1;
+					for (auto const& point : control.points) {
+						require (++control_events <= 100000 && nonnegative (point.time) && point.time > previous, "Invalid or excessive MIDI controller timeline");
+						require (!point.linear && nonnegative (point.value) && point.value == std::floor (point.value) && point.value <= (control.type == 0xe0 ? 16383 : 127), "MIDI controllers require discrete integer values");
+						previous = point.time;
+					}
 				}
 			}
 		}
