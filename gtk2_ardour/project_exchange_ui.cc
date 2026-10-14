@@ -8,6 +8,7 @@
 #include <glibmm/miscutils.h>
 #include <ytkmm/entry.h>
 #include <ytkmm/checkbutton.h>
+#include <ytkmm/comboboxtext.h>
 #include <ytkmm/actiongroup.h>
 #include <ytkmm/filechooserbutton.h>
 #include <ytkmm/filechooserdialog.h>
@@ -353,8 +354,12 @@ static void export_project (Gtk::Window* parent, ExportKind kind)
 	native_hint.set_line_wrap (true);
 	native_hint.set_alignment (0, 0.5);
 	if (native) { options_box.pack_start (native_hint, false, false); }
-	Gtk::CheckButton render_mix (_("Render current mix as one stereo audio track"));
-	Gtk::Label render_hint (_("Includes instruments, effects, automation, routing, mute and solo. Individual tracks and MIDI notes become audio. Renders from timeline zero through session end, plus the extra time below. Content within that extra time is included too."));
+	Gtk::ComboBoxText render_mode;
+	render_mode.append_text (_("Editable project"));
+	render_mode.append_text (_("Render current mix as one stereo audio track"));
+	render_mode.append_text (_("Render tracks and buses feeding the master as separate stems"));
+	render_mode.set_active (0);
+	Gtk::Label render_hint (_("Rendered audio includes instruments, effects, automation, mute and solo. Separate stems combine upstream tracks within each bus and require a neutral master without effects or active automation. Rendering starts at timeline zero and includes all content through session end plus the extra time below."));
 	render_hint.set_line_wrap (true);
 	render_hint.set_alignment (0, 0.5);
 	Gtk::HBox tail_row (false, 8);
@@ -367,8 +372,8 @@ static void export_project (Gtk::Window* parent, ExportKind kind)
 	tail_row.pack_start (tail_label, false, false);
 	tail_row.pack_start (tail, false, false);
 	tail_row.set_sensitive (false);
-	render_mix.signal_toggled ().connect ([&] { tail_row.set_sensitive (render_mix.get_active ()); });
-	options_box.pack_start (render_mix, false, false);
+	render_mode.signal_changed ().connect ([&] { tail_row.set_sensitive (render_mode.get_active_row_number () != 0); });
+	options_box.pack_start (render_mode, false, false);
 	options_box.pack_start (render_hint, false, false);
 	options_box.pack_start (tail_row, false, false);
 	options_box.show_all ();
@@ -376,18 +381,19 @@ static void export_project (Gtk::Window* parent, ExportKind kind)
 	if (dialog.run () != Gtk::RESPONSE_ACCEPT) { return; }
 	std::string destination = dialog.get_filename ();
 	PX::SessionExchange::ExportOptions options;
-	options.render_mix = render_mix.get_active ();
+	options.render_mix = render_mode.get_active_row_number () == 1;
+	options.render_stems = render_mode.get_active_row_number () == 2;
 	options.render_tail_seconds = tail.get_value ();
 	dialog.hide ();
 	if (dawproject && (destination.size () < 11 || g_ascii_strcasecmp (destination.c_str () + destination.size () - 11, ".dawproject"))) { destination += ".dawproject"; }
 	std::vector<PX::Diagnostic> report;
 	try {
-		ExchangeProgress progress (*parent, native ? _("Exporting Studio One song") : dawproject ? _("Exporting DAWproject") : _("Exporting AAF + MIDI"), options.render_mix);
+		ExchangeProgress progress (*parent, native ? _("Exporting Studio One song") : dawproject ? _("Exporting DAWproject") : _("Exporting AAF + MIDI"), options.rendered ());
 		if (ui.the_session () != session) { throw PX::ExchangeError (_("The session changed. Choose the project to export again.")); }
 		auto check = [&] {
 			bool cancelled = progress.check ();
 			if (ui.the_session () != session || session->actively_recording () ||
-			    (session->transport_rolling () && !(options.render_mix && session->exporting ()))) {
+			    (session->transport_rolling () && !(options.rendered () && session->exporting ()))) {
 				throw PX::ExchangeError (_("The session changed during export. Stop playback and try again."));
 			}
 			return cancelled;

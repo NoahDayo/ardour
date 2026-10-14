@@ -7,6 +7,7 @@
 #include <exception>
 #include <fcntl.h>
 #include <memory>
+#include <set>
 #include <vector>
 
 #include <glib.h>
@@ -20,6 +21,7 @@
 #include "pbd/mutex.h"
 #include "pbd/scoped_file_descriptor.h"
 #include "pbd/signals.h"
+#include "pbd/xml++.h"
 
 #include "ardour/audioengine.h"
 #include "ardour/audio_port.h"
@@ -35,6 +37,11 @@
 #include "ardour/export_status.h"
 #include "ardour/export_timespan.h"
 #include "ardour/io.h"
+#include "ardour/internal_send.h"
+#include "ardour/gain_control.h"
+#include "ardour/panner_shell.h"
+#include "ardour/phase_control.h"
+#include "ardour/polarity_processor.h"
 #include "ardour/plugin_insert.h"
 #include "ardour/port.h"
 #include "ardour/port_insert.h"
@@ -250,8 +257,75 @@ void preflight (Session& session, samplecnt_t length)
 
 } // namespace
 
-RenderedMix
-render_session_mix (Session& session, const std::string& stage_directory, samplecnt_t length, const CancelCheck& cancel)
+std::vector<std::shared_ptr<Route>>
+master_stem_routes (Session& session)
+{
+	auto master = session.master_out ();
+	if (!master || !master->active () || master->input ()->n_ports ().n_audio () != 2 || master->input ()->n_ports ().n_total () != 2 ||
+	    master->gain_control ()->get_value () != 1 || master->trim_control ()->get_value () != 1 ||
+	    master->muted_by_self () || master->polarity ()->phase_control ()->any ()) {
+		throw ExchangeError ("Separate stems require a neutral stereo master; use the stereo mix option to include master processing");
+	}
+	if ((master->pan_azimuth_control () && master->pan_azimuth_control ()->get_value () != .5) ||
+	    (master->pan_width_control () && master->pan_width_control ()->get_value () != 1)) {
+		throw ExchangeError ("Center master pan and width before exporting separate stems, or use the stereo mix option");
+	}
+	std::string panner = master->panner_shell ()->current_panner_uri ();
+	if (!master->panner_shell ()->bypassed () && !panner.empty () && panner != "http://ardour.org/plugin/panner_2in2out" && panner != "http://ardour.org/plugin/panner_balance") {
+		throw ExchangeError ("Separate stems require a neutral stereo master panner");
+	}
+	PBD::ControllableSet controls;
+	master->automatables (controls);
+	for (auto const& item : controls) {
+		auto control = std::dynamic_pointer_cast<AutomationControl> (item);
+		if (control && control->alist () && !control->alist ()->empty () && control->automation_state () != Off) {
+			throw ExchangeError ("Use the stereo mix option to include master automation");
+		}
+	}
+	master->foreach_processor ([&] (std::weak_ptr<Processor> weak) {
+		auto processor = weak.lock (); if (!processor) { return; }
+		std::unique_ptr<XMLNode> state (&processor->get_state ()); std::string type; state->get_property ("type", type);
+		static const std::set<std::string> allowed = {"amp", "trim", "meter", "polarity", "main-outs", "intreturn", "delay"};
+		if (!allowed.count (type)) { throw ExchangeError ("Use the stereo mix option to include master processors: " + processor->display_name ()); }
+	});
+	std::vector<std::shared_ptr<Route>> result;
+	std::set<std::string> assigned[2];
+	for (auto const& route : *session.get_routes ()) {
+		if (route == master || route->is_auditioner () || route->is_monitor ()) { continue; }
+		route->foreach_processor ([&] (std::weak_ptr<Processor> weak) {
+			auto send = std::dynamic_pointer_cast<InternalSend> (weak.lock ());
+			if (send && send->target_route () == master) { throw ExchangeError ("Route master sends through an auxiliary bus before exporting separate stems: " + route->name ()); }
+		});
+		if (!route->output ()->connected_to (master->input ())) { continue; }
+		if (!route->active () || route->output ()->n_ports ().n_audio () != 2) {
+			throw ExchangeError ("Separate stems require active stereo routes feeding the master: " + route->name ());
+		}
+		for (unsigned c = 0; c < 2; ++c) {
+			auto out = route->output ()->audio (c);
+			if (!out->connected_to (master->input ()->audio (c).get ()) || out->connected_to (master->input ()->audio (1 - c).get ())) {
+				throw ExchangeError ("Separate stems require ordinary left/right connections to the master: " + route->name ());
+			}
+			assigned[c].insert (session.engine ().make_port_name_non_relative (out->name ()));
+		}
+		result.push_back (route);
+	}
+	for (unsigned c = 0; c < 2; ++c) {
+		std::vector<std::string> connections; master->input ()->audio (c)->get_connections (connections);
+		for (auto const& connection : connections) {
+			if (!assigned[c].count (session.engine ().make_port_name_non_relative (connection))) {
+				throw ExchangeError ("Separate stems cannot capture this master input connection; route it through a stereo bus: " + connection);
+			}
+		}
+	}
+	if (result.empty () || result.size () > 256) { throw ExchangeError ("Separate stem export requires between one and 256 routes feeding the master"); }
+	std::sort (result.begin (), result.end (), [] (const std::shared_ptr<Route>& a, const std::shared_ptr<Route>& b) {
+		return a->presentation_info ().order () < b->presentation_info ().order ();
+	});
+	return result;
+}
+
+static std::vector<RenderedMix>
+render_routes (Session& session, const std::vector<std::shared_ptr<Route>>& routes, bool stems, const std::string& stage_directory, samplecnt_t length, const CancelCheck& cancel)
 {
 	preflight (session, length);
 	if (!Glib::path_is_absolute (stage_directory) || !Glib::file_test (stage_directory, Glib::FILE_TEST_IS_DIR)) {
@@ -259,13 +333,16 @@ render_session_mix (Session& session, const std::string& stage_directory, sample
 	}
 	check_cancel (cancel);
 	SourceState source (session);
-	RenderedMix result;
-	result.path = Glib::build_filename (stage_directory, "master-render.wav");
-	result.channels = 2;
-	result.frames = length;
-	result.sample_rate = session.nominal_sample_rate ();
-	if (Glib::file_test (result.path, Glib::FILE_TEST_EXISTS)) { throw ExchangeError ("Rendered mix destination already exists"); }
-	RenderedFile output_file (result.path);
+	std::vector<RenderedMix> results;
+	std::vector<std::unique_ptr<RenderedFile>> output_files;
+	for (size_t i = 0; i < routes.size (); ++i) {
+		RenderedMix result;
+		result.path = Glib::build_filename (stage_directory, stems ? "stem-" + std::to_string (i + 1) + ".wav" : "master-render.wav");
+		result.route_id = routes[i]->id ().to_s ();
+		result.channels = 2; result.frames = length; result.sample_rate = session.nominal_sample_rate ();
+		if (Glib::file_test (result.path, Glib::FILE_TEST_EXISTS)) { throw ExchangeError ("Rendered audio destination already exists"); }
+		output_files.emplace_back (new RenderedFile (result.path)); results.push_back (result);
+	}
 
 	auto handler = session.get_export_handler ();
 	auto status = session.get_export_status ();
@@ -278,60 +355,64 @@ render_session_mix (Session& session, const std::string& stage_directory, sample
 		span->set_range (0, length);
 		span->set_realtime (false);
 		span->set_vapor ("");
-		auto channels = handler->add_channel_config ();
-		channels->clear_channels ();
-		channels->set_name ("Master mix");
-		channels->set_split (false);
-		channels->set_region_processing_type (RegionExportChannelFactory::None);
-		for (uint32_t channel = 0; channel < result.channels; ++channel) {
-			ComparableSharedPtr<PortExportChannel> tap (new PortExportChannel);
-			tap->add_port (session.master_out ()->output ()->audio (channel));
-			channels->register_channel (tap);
+		for (size_t i = 0; i < routes.size (); ++i) {
+			auto const& result = results[i];
+			auto channels = handler->add_channel_config ();
+			channels->clear_channels ();
+			channels->set_name (stems ? "stem-" + std::to_string (i + 1) : "Master mix");
+			channels->set_split (false);
+			channels->set_region_processing_type (RegionExportChannelFactory::None);
+			for (uint32_t channel = 0; channel < result.channels; ++channel) {
+				ComparableSharedPtr<PortExportChannel> tap (new PortExportChannel);
+				tap->add_port (routes[i]->output ()->audio (channel));
+				channels->register_channel (tap);
+			}
+			auto format = handler->add_format ();
+			auto wav = std::make_shared<ExportFormatLinear> ("WAV", ExportFormatBase::F_WAV);
+			wav->add_sample_format (ExportFormatBase::SF_Float);
+			wav->set_extension ("wav");
+			format->set_format (wav);
+			format->set_name ("Exchange float WAV");
+			format->set_sample_format (ExportFormatBase::SF_Float);
+			format->set_sample_rate (static_cast<ExportFormatBase::SampleRate> (result.sample_rate));
+			format->set_endianness (ExportFormatBase::E_FileDefault);
+			format->set_quality (ExportFormatBase::Q_LosslessLinear);
+			format->set_dither_type (ExportFormatBase::D_None);
+			format->set_src_quality (ExportFormatBase::SRC_SincBest);
+			format->set_trim_beginning (false);
+			format->set_trim_end (false);
+			format->set_silence_beginning (AnyTime ());
+			format->set_silence_end (AnyTime ());
+			format->set_normalize (false);
+			format->set_normalize_loudness (false);
+			format->set_use_tp_limiter (false);
+			format->set_tag (false);
+			format->set_with_cue (false);
+			format->set_with_toc (false);
+			format->set_with_mp4chaps (false);
+			format->set_soundcloud_upload (false);
+			format->set_command ("");
+			format->set_analyse (false);
+			format->set_reimport (false);
+			format->set_demo_noise_duration (0);
+			format->set_demo_noise_interval (0);
+			auto filename = handler->add_filename ();
+			filename->include_label = !stems;
+			filename->include_session = filename->use_session_snapshot_name = filename->include_revision = false;
+			filename->include_channel_config = stems;
+			filename->include_format_name = filename->include_channel = false;
+			filename->include_timespan = filename->include_time = filename->include_date = false;
+			filename->set_date_format (ExportFilename::D_None);
+			filename->set_time_format (ExportFilename::T_None);
+			filename->set_label ("master-render");
+			filename->include_label = !stems;
+			filename->set_timespan (span);
+			filename->set_channel_config (channels);
+			if (!filename->set_folder (stage_directory) || filename->get_path (format) != result.path || !format->is_complete ()) {
+				throw ExchangeError ("Cannot configure the rendered mix output");
+			}
+			handler->add_export_config (span, channels, format, filename, BroadcastInfoPtr ());
 		}
-		auto format = handler->add_format ();
-		auto wav = std::make_shared<ExportFormatLinear> ("WAV", ExportFormatBase::F_WAV);
-		wav->add_sample_format (ExportFormatBase::SF_Float);
-		wav->set_extension ("wav");
-		format->set_format (wav);
-		format->set_name ("Exchange float WAV");
-		format->set_sample_format (ExportFormatBase::SF_Float);
-		format->set_sample_rate (static_cast<ExportFormatBase::SampleRate> (result.sample_rate));
-		format->set_endianness (ExportFormatBase::E_FileDefault);
-		format->set_quality (ExportFormatBase::Q_LosslessLinear);
-		format->set_dither_type (ExportFormatBase::D_None);
-		format->set_src_quality (ExportFormatBase::SRC_SincBest);
-		format->set_trim_beginning (false);
-		format->set_trim_end (false);
-		format->set_silence_beginning (AnyTime ());
-		format->set_silence_end (AnyTime ());
-		format->set_normalize (false);
-		format->set_normalize_loudness (false);
-		format->set_use_tp_limiter (false);
-		format->set_tag (false);
-		format->set_with_cue (false);
-		format->set_with_toc (false);
-		format->set_with_mp4chaps (false);
-		format->set_soundcloud_upload (false);
-		format->set_command ("");
-		format->set_analyse (false);
-		format->set_reimport (false);
-		format->set_demo_noise_duration (0);
-		format->set_demo_noise_interval (0);
-		auto filename = handler->add_filename ();
-		filename->include_label = true;
-		filename->include_session = filename->use_session_snapshot_name = filename->include_revision = false;
-		filename->include_channel_config = filename->include_format_name = filename->include_channel = false;
-		filename->include_timespan = filename->include_time = filename->include_date = false;
-		filename->set_date_format (ExportFilename::D_None);
-		filename->set_time_format (ExportFilename::T_None);
-		filename->set_label ("master-render");
-		filename->include_label = true;
-		filename->set_timespan (span);
-		filename->set_channel_config (channels);
-		if (!filename->set_folder (stage_directory) || filename->get_path (format) != result.path || !format->is_complete ()) {
-			throw ExchangeError ("Cannot configure the rendered mix output");
-		}
-		handler->add_export_config (span, channels, format, filename, BroadcastInfoPtr ());
 		check_cancel (cancel);
 		protected_source = true;
 		source.protect ();
@@ -391,7 +472,7 @@ render_session_mix (Session& session, const std::string& stage_directory, sample
 		cleaned = true;
 	} catch (...) { failure = std::current_exception (); }
 	if (!cleaned) {
-		output_file.keep = true;
+		for (auto& file : output_files) { file->keep = true; }
 		throw RenderShutdownFailed ("Mix cleanup could not finish. Restart Ardour before editing this session. Temporary audio is kept at: " + stage_directory);
 	}
 	if (protected_source) {
@@ -400,31 +481,45 @@ render_session_mix (Session& session, const std::string& stage_directory, sample
 	}
 	if (failure) { std::rethrow_exception (failure); }
 
-	SF_INFO info = {};
-	PBD::ScopedFileDescriptor fd (g_open (result.path.c_str (), O_RDONLY
+	for (auto const& result : results) {
+		SF_INFO info = {};
+		PBD::ScopedFileDescriptor fd (g_open (result.path.c_str (), O_RDONLY
 #ifdef O_BINARY
-	                                    | O_BINARY
+		                                    | O_BINARY
 #endif
-	                                    , 0));
-	std::unique_ptr<SNDFILE, int (*) (SNDFILE*)> file (fd < 0 ? nullptr : sf_open_fd (fd, SFM_READ, &info, SF_FALSE), sf_close);
-	if (!file || info.channels != int (result.channels) || info.frames != length ||
-	    info.samplerate != result.sample_rate || (info.format & SF_FORMAT_SUBMASK) != SF_FORMAT_FLOAT) {
-		throw ExchangeError ("Rendered mix length, channels or sample rate do not match the requested range");
-	}
-	std::vector<float> pcm (8192 * result.channels);
-	for (samplecnt_t frame = 0; frame < length;) {
-		check_cancel (cancel);
-		sf_count_t count = std::min (samplecnt_t (8192), length - frame);
-		if (sf_readf_float (file.get (), pcm.data (), count) != count) { throw ExchangeError ("Rendered mix audio is incomplete"); }
-		for (size_t sample = 0; sample < size_t (count) * result.channels; ++sample) {
-			if (!std::isfinite (pcm[sample])) { throw ExchangeError ("Rendered mix contains non-finite audio samples"); }
+		                                    , 0));
+		std::unique_ptr<SNDFILE, int (*) (SNDFILE*)> file (fd < 0 ? nullptr : sf_open_fd (fd, SFM_READ, &info, SF_FALSE), sf_close);
+		if (!file || info.channels != int (result.channels) || info.frames != length ||
+		    info.samplerate != result.sample_rate || (info.format & SF_FORMAT_SUBMASK) != SF_FORMAT_FLOAT) {
+			throw ExchangeError ("Rendered mix length, channels or sample rate do not match the requested range");
 		}
-		frame += count;
+		std::vector<float> pcm (8192 * result.channels);
+		for (samplecnt_t frame = 0; frame < length;) {
+			check_cancel (cancel);
+			sf_count_t count = std::min (samplecnt_t (8192), length - frame);
+			if (sf_readf_float (file.get (), pcm.data (), count) != count) { throw ExchangeError ("Rendered mix audio is incomplete"); }
+			for (size_t sample = 0; sample < size_t (count) * result.channels; ++sample) {
+				if (!std::isfinite (pcm[sample])) { throw ExchangeError ("Rendered mix contains non-finite audio samples"); }
+			}
+			frame += count;
+		}
+		if (sf_error (file.get ()) != SF_ERR_NO_ERROR) { throw ExchangeError ("Cannot verify the rendered mix audio"); }
+		check_cancel (cancel);
 	}
-	if (sf_error (file.get ()) != SF_ERR_NO_ERROR) { throw ExchangeError ("Cannot verify the rendered mix audio"); }
-	check_cancel (cancel);
-	output_file.keep = true;
-	return result;
+	for (auto& file : output_files) { file->keep = true; }
+	return results;
+}
+
+RenderedMix
+render_session_mix (Session& session, const std::string& stage_directory, samplecnt_t length, const CancelCheck& cancel)
+{
+	return render_routes (session, {session.master_out ()}, false, stage_directory, length, cancel).front ();
+}
+
+std::vector<RenderedMix>
+render_session_stems (Session& session, const std::string& stage_directory, samplecnt_t length, const CancelCheck& cancel)
+{
+	return render_routes (session, master_stem_routes (session), true, stage_directory, length, cancel);
 }
 
 } }

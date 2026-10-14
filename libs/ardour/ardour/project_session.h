@@ -16,7 +16,9 @@ class LIBARDOUR_API SessionExchange {
 public:
 	struct ExportOptions {
 		bool render_mix = false;
+		bool render_stems = false;
 		double render_tail_seconds = 2.0;
+		bool rendered () const { return render_mix || render_stems; }
 	};
 	/* Requires a running engine with no session attached. Builds in a private
 	 * sibling directory, saves, then moves and reopens the completed session.
@@ -40,7 +42,8 @@ public:
 	                               std::vector<Diagnostic>& report, CancelCheck = CancelCheck ());
 	/* Explicit fallback: render the current stereo master mix from zero to
 	 * session end plus tail (0..600 seconds). Tracks, MIDI and processing become
-	 * one audio clip; tempo, meter and ordinary markers remain editable. */
+	 * audio; tempo, meter and ordinary markers remain editable. The stem option
+	 * prints stereo routes feeding a neutral master, with shared buses grouped. */
 	static void export_dawproject (Session&, const std::string& destination,
 	                               std::vector<Diagnostic>& report, const ExportOptions&, CancelCheck = CancelCheck ());
 	/* Publish an AAF with embedded audio and a coordinated type-1 MIDI file

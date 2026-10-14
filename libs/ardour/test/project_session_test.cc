@@ -16,6 +16,8 @@
 #include <sndfile.h>
 
 #include "ardour/audioengine.h"
+#include "ardour/audio_port.h"
+#include "ardour/io.h"
 #include "ardour/audioregion.h"
 #include "ardour/gain_control.h"
 #include "ardour/export_status.h"
@@ -501,6 +503,8 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (render_mix_roundtrip);
 	CPPUNIT_TEST (render_mix_automation);
 	CPPUNIT_TEST (render_mix_cancel_and_guards);
+	CPPUNIT_TEST (render_stems_roundtrip);
+	CPPUNIT_TEST (render_stems_guards);
 	CPPUNIT_TEST_SUITE_END ();
 public:
 	void roundtrip ();
@@ -537,6 +541,8 @@ public:
 	void render_mix_roundtrip ();
 	void render_mix_automation ();
 	void render_mix_cancel_and_guards ();
+	void render_stems_roundtrip ();
+	void render_stems_guards ();
 };
 
 CPPUNIT_TEST_SUITE_REGISTRATION (ProjectSessionTest);
@@ -734,6 +740,131 @@ void ProjectSessionTest::native_song_render_export ()
 	std::cout << "Native song rendered master graph PCM and source restoration passed" << std::endl;
 }
 
+void ProjectSessionTest::render_stems_roundtrip ()
+{
+	Fixture fixture; make_render_fixture (fixture);
+	fixture.session->master_out ()->gain_control ()->set_value (1, PBD::Controllable::NoGroup);
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	const unsigned rate = fixture.session->sample_rate ();
+	const samplecnt_t frames = fixture.session->current_end_sample () + 1024;
+	PX::SessionExchange::ExportOptions options; options.render_stems = true; options.render_tail_seconds = 1024.0 / rate;
+	RenderSourceState original (fixture);
+	auto verify_pcm = [&] (const std::string& name, const std::vector<float>& pcm, double tolerance) {
+		CPPUNIT_ASSERT (name == "Program" || name == "Room" || name == "MIDI gate");
+		for (samplecnt_t i = 0; i < frames; ++i) {
+			for (unsigned c = 0; c < 2; ++c) {
+				double input = c ? .25 : .125;
+				double dry = i >= std::llround (1.25 * rate) && i < std::llround (1.5 * rate) ? input * .5 : 0;
+				double echo = i >= std::llround (1.25 * rate) + 257 && i < std::llround (1.5 * rate) + 257 ? input * .5 : 0;
+				double gate = i >= std::llround (.75 * rate) && i < std::llround (.875 * rate) ? (c ? .125 : .0625) : 0;
+				double expected = name == "MIDI gate" ? gate : (2 * dry + .5 * echo) * (name == "Program" ? .5 : .25 * .25);
+				CPPUNIT_ASSERT_DOUBLES_EQUAL_MESSAGE (name + " frame " + std::to_string (i), expected, pcm[size_t (i) * 2 + c], tolerance);
+			}
+		}
+	};
+	for (unsigned kind = 0; kind < 3; ++kind) {
+		const std::string destination = fixture.path (kind == 0 ? "stems.dawproject" : kind == 1 ? "StemLogic" : "StemNative");
+		if (kind == 0) { PX::SessionExchange::export_dawproject (*fixture.session, destination, fixture.report, options); }
+		else if (kind == 1) { PX::SessionExchange::export_logic (*fixture.session, destination, fixture.report, options); }
+		else { PX::SessionExchange::export_studio_one (*fixture.session, destination, fixture.report, options); }
+		original.check (fixture);
+		PX::Project model; std::map<std::string, std::string> files;
+		if (kind == 0) {
+			model = PX::DawProject::read (destination);
+			for (auto const& media : model.media) { files[media.id] = fixture.path ("daw-" + media.id + ".wav"); PX::ProjectArchive (destination).copy_file (media.path, files[media.id]); }
+		} else if (kind == 1) {
+			PX::LogicProject project (Glib::build_filename (destination, "Project.aaf"), Glib::build_filename (destination, "Project.mid")); model = project.project ();
+			for (auto const& media : model.media) { files[media.id] = fixture.path ("logic-" + media.id + ".wav"); project.copy_media (media, files[media.id]); }
+		} else {
+			auto song = PX::StudioOneSong::read (Glib::build_filename (destination, "Project.song")); model = song.project; files = song.audio_files;
+		}
+		CPPUNIT_ASSERT_EQUAL (size_t (4), model.tracks.size ()); CPPUNIT_ASSERT_EQUAL (size_t (3), model.media.size ());
+		std::vector<float> sum (size_t (frames) * 2, 0);
+		for (auto const& track : model.tracks) {
+			if (track.master) { continue; }
+			CPPUNIT_ASSERT (track.kind == PX::TrackKind::Audio && track.plugins.empty () && track.sends.empty ());
+			CPPUNIT_ASSERT_EQUAL (1.0, track.volume); CPPUNIT_ASSERT_EQUAL (.5, track.pan);
+			CPPUNIT_ASSERT_EQUAL (size_t (1), track.clips.size ());
+			CPPUNIT_ASSERT_EQUAL (0.0, track.clips.front ().position.value);
+			auto pcm = read_rendered_pcm (files.at (track.clips.front ().media), frames, rate);
+			verify_pcm (track.name, pcm, 2e-6);
+			for (size_t i = 0; i < sum.size (); ++i) { sum[i] += pcm[i] * .5; }
+		}
+		assert_graph_pcm (sum, rate, 3e-6);
+	}
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	for (unsigned kind = 0; kind < 3; ++kind) {
+		const std::string name = "StemReturn" + std::to_string (kind);
+		if (kind == 0) { fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("stems.dawproject"), fixture.path (name), name, fixture.report); }
+		else if (kind == 1) { fixture.session = PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("StemLogic/Project.aaf"), fixture.path ("StemLogic/Project.mid"), fixture.path (name), name, fixture.report); }
+		else { fixture.session = PX::SessionExchange::import_studio_one (*AudioEngine::instance (), fixture.path ("StemNative/Project.song"), fixture.path (name), name, fixture.report); }
+		CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+		AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+		fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path (name), name, nullptr, "", true));
+		unsigned count = 0;
+		for (auto const& route : *fixture.session->get_routes ()) {
+			auto track = std::dynamic_pointer_cast<ARDOUR::Track> (route); if (!track || route->is_auditioner ()) { continue; } ++count;
+			auto regions = track->playlist ()->region_list (); CPPUNIT_ASSERT_EQUAL (size_t (1), regions->size ());
+			auto region = std::dynamic_pointer_cast<AudioRegion> (regions->front ()); CPPUNIT_ASSERT (region);
+			std::vector<float> pcm (size_t (frames) * 2), channel (frames), mix (frames), gain (frames);
+			for (unsigned c = 0; c < 2; ++c) {
+				std::fill (channel.begin (), channel.end (), 0);
+				CPPUNIT_ASSERT_EQUAL (frames, region->read_at (channel.data (), mix.data (), gain.data (), 0, frames, c));
+				for (samplecnt_t i = 0; i < frames; ++i) { pcm[size_t (i) * 2 + c] = channel[i]; }
+			}
+			verify_pcm (route->name (), pcm, 2e-6);
+		}
+		CPPUNIT_ASSERT_EQUAL (3u, count); AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	}
+	std::cout << "Separate stems DAWproject, AAF and native song PCM save/reopen round trips passed" << std::endl;
+}
+
+void ProjectSessionTest::render_stems_guards ()
+{
+	Fixture fixture; make_render_fixture (fixture);
+	PX::SessionExchange::ExportOptions options; options.render_stems = true; options.render_tail_seconds = 0;
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("master-gain.dawproject"), fixture.report, options), PX::ExchangeError);
+	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("master-gain.dawproject"), Glib::FILE_TEST_EXISTS));
+	fixture.session->master_out ()->gain_control ()->set_value (1, PBD::Controllable::NoGroup);
+	options.render_mix = true;
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_logic (*fixture.session, fixture.path ("both-modes"), fixture.report, options), PX::ExchangeError);
+	options.render_mix = false;
+	{
+		auto output = fixture.session->route_by_name ("Program")->output ();
+		auto port = output->audio (0);
+		auto master = fixture.session->master_out ()->input ();
+		CPPUNIT_ASSERT_EQUAL (0, output->disconnect (port, master->audio (0)->name ()));
+		CPPUNIT_ASSERT_EQUAL (0, output->connect (port, master->audio (1)->name ()));
+		CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("crosswired.dawproject"), fixture.report, options), PX::ExchangeError);
+		CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("crosswired.dawproject"), Glib::FILE_TEST_EXISTS));
+		CPPUNIT_ASSERT_EQUAL (0, output->disconnect (port, master->audio (1)->name ()));
+		CPPUNIT_ASSERT_EQUAL (0, output->connect (port, master->audio (0)->name ()));
+	}
+	{
+		auto control = fixture.session->master_out ()->gain_control ();
+		control->alist ()->add (Temporal::timepos_t (samplepos_t (0)), 1, false, false);
+		control->set_automation_state (Play);
+		CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("master-automation"), fixture.report, options), PX::ExchangeError);
+		control->set_automation_state (Off); control->alist ()->clear ();
+	}
+	fixture.session->set_session_extents (Temporal::timepos_t (samplepos_t (0)), Temporal::timepos_t (samplepos_t (120 * fixture.session->sample_rate ())));
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state ("")); RenderSourceState original (fixture);
+	for (unsigned kind = 0; kind < 3; ++kind) {
+		bool during = false; auto status = fixture.session->get_export_status ();
+		auto cancel = [&] {
+			PBD::Mutex::Lock lock (status->lock ());
+			if (fixture.session->exporting () && status->processed_samples > 512 && status->processed_samples < status->total_samples) { during = true; }
+			return during;
+		};
+		std::string destination = fixture.path ("cancel-stems-" + std::to_string (kind));
+		if (kind == 0) { CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_dawproject (*fixture.session, destination, fixture.report, options, cancel), PX::ArchiveCancelled); }
+		else if (kind == 1) { CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_logic (*fixture.session, destination, fixture.report, options, cancel), PX::ArchiveCancelled); }
+		else { CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_studio_one (*fixture.session, destination, fixture.report, options, cancel), PX::ArchiveCancelled); }
+		CPPUNIT_ASSERT (during); CPPUNIT_ASSERT (!Glib::file_test (destination, Glib::FILE_TEST_EXISTS)); status.reset (); original.check (fixture);
+	}
+	std::cout << "Separate stem cancellation, neutral master and mode guards passed" << std::endl;
+}
+
 void ProjectSessionTest::render_mix_roundtrip ()
 {
 	Fixture fixture; make_render_fixture (fixture);
@@ -799,31 +930,35 @@ void ProjectSessionTest::render_mix_automation ()
 	const samplecnt_t frames = fixture.session->current_end_sample ();
 	PX::SessionExchange::ExportOptions options; options.render_mix = true; options.render_tail_seconds = 0;
 	fixture.session->set_clean (); RenderSourceState original (fixture);
-	for (bool logic : {false, true}) {
-		const std::string destination = fixture.path (logic ? "AutomationLogic" : "automation-render.dawproject");
-		if (logic) { PX::SessionExchange::export_logic (*fixture.session, destination, fixture.report, options); }
-		else { PX::SessionExchange::export_dawproject (*fixture.session, destination, fixture.report, options); }
-		original.check (fixture);
-		const std::string audio = fixture.path (logic ? "automation-logic.wav" : "automation-daw.wav");
-		if (logic) {
-			PX::LogicProject project (Glib::build_filename (destination, "Project.aaf"), Glib::build_filename (destination, "Project.mid"));
-			assert_render_model (project.project (), frames, rate); project.copy_media (project.project ().media.front (), audio);
-		} else {
-			auto project = PX::DawProject::read (destination); assert_render_model (project, frames, rate);
-			PX::ProjectArchive (destination).copy_file (project.media.front ().path, audio);
-		}
-		auto pcm = read_rendered_pcm (audio, frames, rate);
-		/* The native 25 Hz gain smoother uses float state. Its rounding error
-		 * is bounded by epsilon / pole coefficient, plus 24-bit quantization. */
-		const double gain_error = .25 * std::numeric_limits<float>::epsilon () * rate / 156.0 + 1.0 / 8388608;
-		for (auto const& window : std::vector<std::tuple<double, double, double>> {{.25, 0, 0}, {1.15, .125 * .25, 0}, {1.8, 0, .25 * .75}}) {
-			samplepos_t at = std::llround (std::get<0> (window) * rate);
-			for (samplepos_t i = at; i < at + 128; ++i) {
-				CPPUNIT_ASSERT_DOUBLES_EQUAL (std::get<1> (window), pcm[size_t (i) * 2], std::get<1> (window) == 0 ? 1e-7 : gain_error);
-				CPPUNIT_ASSERT_DOUBLES_EQUAL (std::get<2> (window), pcm[size_t (i) * 2 + 1], std::get<2> (window) == 0 ? 1e-7 : gain_error);
+	for (bool stems : {false, true}) {
+		options.render_mix = !stems; options.render_stems = stems;
+		for (bool logic : {false, true}) {
+			const std::string destination = fixture.path ((stems ? "stem-" : "mix-") + std::string (logic ? "AutomationLogic" : "automation-render.dawproject"));
+			if (logic) { PX::SessionExchange::export_logic (*fixture.session, destination, fixture.report, options); }
+			else { PX::SessionExchange::export_dawproject (*fixture.session, destination, fixture.report, options); }
+			original.check (fixture);
+			const std::string audio = fixture.path ((stems ? "stem-" : "mix-") + std::string (logic ? "automation-logic.wav" : "automation-daw.wav"));
+			if (logic) {
+				PX::LogicProject project (Glib::build_filename (destination, "Project.aaf"), Glib::build_filename (destination, "Project.mid"));
+				assert_render_model (project.project (), frames, rate); project.copy_media (project.project ().media.front (), audio);
+			} else {
+				auto project = PX::DawProject::read (destination); assert_render_model (project, frames, rate);
+				PX::ProjectArchive (destination).copy_file (project.media.front ().path, audio);
+			}
+			auto pcm = read_rendered_pcm (audio, frames, rate);
+			/* The native 25 Hz gain smoother uses float state. Its rounding error
+			 * is bounded by epsilon / pole coefficient, plus 24-bit quantization. */
+			const double gain_error = .25 * std::numeric_limits<float>::epsilon () * rate / 156.0 + 1.0 / 8388608;
+			for (auto const& window : std::vector<std::tuple<double, double, double>> {{.25, 0, 0}, {1.15, .125 * .25, 0}, {1.8, 0, .25 * .75}}) {
+				samplepos_t at = std::llround (std::get<0> (window) * rate);
+				for (samplepos_t i = at; i < at + 128; ++i) {
+					CPPUNIT_ASSERT_DOUBLES_EQUAL (std::get<1> (window), pcm[size_t (i) * 2], std::get<1> (window) == 0 ? 1e-7 : gain_error);
+					CPPUNIT_ASSERT_DOUBLES_EQUAL (std::get<2> (window), pcm[size_t (i) * 2 + 1], std::get<2> (window) == 0 ? 1e-7 : gain_error);
+				}
 			}
 		}
 	}
+
 	std::cout << "Rendered gain/pan automation PCM and source restoration passed" << std::endl;
 }
 
