@@ -7,6 +7,10 @@ import sys
 import wave
 import xml.etree.ElementTree as ET
 
+# The embedded interpreter keeps pyaaf2 outside its isolated standard library.
+vendor = Path(sys.executable).resolve().parent.parent / "vendor"
+if vendor.is_dir():
+    sys.path.insert(0, str(vendor))
 import aaf2
 
 
