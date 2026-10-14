@@ -255,6 +255,9 @@ def write_aaf(root, destination):
         pan = output.create.ParameterDef("e4962322-2267-11d3-8a4c-0050040ef7d2", "Pan", typedef="Rational")
         output.dictionary.register_def(amplitude)
         output.dictionary.register_def(pan)
+        level = output.create.ParameterDef("e4962320-2267-11d3-8a4c-0050040ef7d2", "Level", typedef="Rational")
+        output.dictionary.register_def(level)
+        dissolve = operation(output, "0c3bea41-fc05-11d2-8a29-0050040ef7d2", "MonoAudioDissolve", 2, level)
         mono_gain = operation(output, "9d2ea894-0968-11d3-8a38-0050040ef7d2", "MonoAudioGain", 1, amplitude)
         stereo_gain = operation(output, "9d2ea895-0968-11d3-8a38-0050040ef7d2", "StereoAudioGain", 1, amplitude)
         mono_pan = operation(output, "9d2ea893-0968-11d3-8a38-0050040ef7d2", "MonoAudioPan", 1, pan)
@@ -292,11 +295,27 @@ def write_aaf(root, destination):
             slot.name = track.attrib["name"]
             sequence = output.create.Sequence("sound")
             end = 0
+            previous_position, preceding_end = -1, 0
             for clip in sorted(track.findall("Clip"), key=lambda c: integer(c, "time")):
                 position, length, offset = (integer(clip, key) for key in ("time", "length", "offset"))
-                require(position >= end and length > 0, "Overlapping or empty audio clips")
+                require(length > 0, "Empty audio clip")
                 master, slots, frames = media[clip.attrib["media"]]
                 require(len(slots) == channels and offset + length <= frames, "Invalid audio clip source range")
+                if position < end:
+                    require(channels == 1 and position > previous_position and position + length > end and position >= preceding_end,
+                            "Overlapping audio requires mono clips with pairwise, non-nested overlaps")
+                    overlap = end - position
+                    transition = output.create.Transition("sound", overlap)
+                    transition.cutpoint = overlap // 2
+                    group = output.create.OperationGroup(dissolve, overlap, media_kind="sound")
+                    # AS-01 12.19: Level(t)*B + Level(1-t)*A. Unity Level
+                    # sums the overlap; each clip keeps its own gain envelope.
+                    curve = output.create.VaryingValue(level, "Linear")
+                    curve.add_keyframe(0, "1")
+                    curve.add_keyframe(1, "1")
+                    group.parameters.append(curve)
+                    transition["OperationGroup"].value = group
+                    sequence.components.append(transition)
                 if position > end:
                     sequence.components.append(output.create.Filler("sound", position - end))
                 references = [master.create_source_clip(s.slot_id, start=offset, length=length, media_kind="sound") for s in slots]
@@ -319,7 +338,7 @@ def write_aaf(root, destination):
                     if clip.attrib.get(field):
                         segment["UserComments"].append(output.create.TaggedValue("Ardour." + field, clip.attrib[field]))
                 sequence.components.append(segment)
-                end = position + length
+                previous_position, preceding_end, end = position, end, position + length
             gain_points = automation_points(track.find("GainAutomation"), rate)
             pan_points = automation_points(track.find("PanAutomation"), rate, pan=True)
             automation_end = max([end, 1] + [p[0] for p in gain_points + pan_points])

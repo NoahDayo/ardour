@@ -78,6 +78,49 @@ struct LogicProject::Impl {
 		}
 		return curve.points.front ().value;
 	}
+	void transition (Clip& clip, const aafiTransition* fade, bool incoming, const aafRational_t* rate, double quantum) {
+		require (fade && fade->len > 0 && fade->cut_pt >= 0 && fade->cut_pt <= fade->len, "Invalid AAF transition length or cut point");
+		if ((fade->flags & AAFI_TRANS_CURVE_COUNT_MASK) != AAFI_TRANS_SINGLE_CURVE ||
+		    ((fade->flags & AAFI_INTERPOL_MASK) != AAFI_INTERPOL_LINEAR && (fade->flags & AAFI_INTERPOL_MASK) != AAFI_INTERPOL_CONSTANT)) {
+			project.report.push_back ({Disposition::Unsupported, clip.name, "AAF dissolve curve type requires explicit conversion"}); return;
+		}
+		require (fade->pts_cnt_a >= 2 && fade->pts_cnt_a <= 100000 && fade->time_a && fade->value_a, "Invalid AAF dissolve points");
+		double duration = seconds (fade->len, rate);
+		require (duration <= clip.duration, "AAF transition exceeds its audio clip");
+		Automation curve {TimeUnit::Seconds, {}};
+		double previous = -1;
+		for (int i = 0; i < fade->pts_cnt_a; ++i) {
+			check ();
+			double t = rational (&fade->time_a[i]), v = rational (&fade->value_a[i]);
+			require (t >= 0 && t <= 1 && t > previous && v >= 0 && v <= 1, "Invalid AAF dissolve timeline or level");
+			curve.points.push_back ({t * duration, v, bool (fade->flags & AAFI_INTERPOL_LINEAR)}); previous = t;
+		}
+		require (curve.points.front ().time == 0 && previous == 1, "AAF dissolve must define both endpoints");
+		// Linearize holds before reversing: Level(1-t) is left-continuous at
+		// its jumps. AS-01 12.19 specifies time reversal, not 1-Level(t).
+		curve = linearize_automation (curve, quantum);
+		duration = curve.points.back ().time;
+		double end = std::round (clip.duration / quantum) * quantum;
+		require (duration > 0 && end >= duration, "AAF transition is shorter than the audio resolution");
+		if (!incoming) {
+			std::reverse (curve.points.begin (), curve.points.end ());
+			for (auto& point : curve.points) { point.time = duration - point.time; }
+		}
+		double start = incoming ? 0 : end - duration;
+		std::map<double, double> points;
+		for (auto const& point : curve.points) { points[start + point.time] = point.value; }
+		if (start > 0) { points[0] = 1; points[std::max (0.0, start - quantum)] = 1; }
+		if (incoming && duration < end) {
+			// The transition is half-open. Return to unity on its first
+			// excluded sample even when a custom endpoint is below unity.
+			points[duration - quantum] = automation_value (curve, duration - quantum);
+			points[duration] = 1; points[end] = 1;
+		}
+		curve.points.clear ();
+		for (auto const& point : points) { curve.points.push_back ({point.first, point.second, true}); }
+		clip.envelope = multiply_automation (clip.envelope, curve, quantum);
+		project.report.push_back ({Disposition::Transformed, clip.name, "AAF dissolve converted to an editable clip envelope; outgoing curve mirrored in time, edges and hold steps rounded to audio samples"});
+	}
 	std::string media (aafiAudioClip* clip) {
 		std::vector<Channel> selected;
 		for (auto ptr = clip->essencePointerList; ptr; ptr = ptr->next) {
@@ -157,10 +200,16 @@ LogicProject::LogicProject (const std::string& path, const std::string& midi, Ca
 		output.mute = track->mute; output.solo = track->solo;
 		if (output.channels == 2 && (output.pan != .5 || !output.pan_automation.points.empty ())) { project.report.push_back ({Disposition::Unsupported, output.name, "AAF stereo panning semantics require explicit conversion"}); }
 		aafiTimelineItem* item; unsigned clip_number = 0;
+		std::map<aafiAudioClip*, size_t> clip_indices;
+		std::vector<aafiTransition*> transitions;
 		AAFI_foreachTrackItem (track, item) {
 			self.check ();
+			if (item->type == AAFI_TRANS) {
+				require (transitions.size () < 100000 && item->data, "Invalid or excessive AAF transitions");
+				transitions.push_back (static_cast<aafiTransition*> (item->data)); continue;
+			}
 			auto clip = aafi_timelineItemToAudioClip (item);
-			if (!clip) { project.report.push_back ({Disposition::Unsupported, output.name, "AAF fades/transitions are not yet supported by project import"}); continue; }
+			if (!clip) { project.report.push_back ({Disposition::Unsupported, output.name, "Unknown AAF audio timeline item"}); continue; }
 			require (++clip_number <= 100000, "AAF exceeds the clip limit");
 			Clip value; value.media = self.media (clip);
 			value.name = name (clip->subClipName, name (clip->essencePointerList->essenceFile->name, "Audio"));
@@ -181,7 +230,28 @@ LogicProject::LogicProject (const std::string& path, const std::string& midi, Ca
 					project.report.push_back ({Disposition::Unsupported, value.name, "AAF clip envelope spans a different operation range; explicit trimming is required"});
 				}
 			}
-			output.clips.push_back (value);
+			clip_indices[clip] = output.clips.size (); output.clips.push_back (value);
+		}
+		for (auto fade : transitions) {
+			self.check ();
+			auto item = fade->timelineItem;
+			require (item, "AAF transition has no timeline item");
+			auto before = aafi_timelineItemToAudioClip (item->prev), after = aafi_timelineItemToAudioClip (item->next);
+			unsigned kind = fade->flags & AAFI_TRANS_FADE_MASK;
+			require (kind == AAFI_TRANS_FADE_IN || kind == AAFI_TRANS_FADE_OUT || kind == AAFI_TRANS_XFADE, "Invalid AAF transition type");
+			if (output.channels != 1) { project.report.push_back ({Disposition::Unsupported, output.name, "Mono AAF dissolve cannot be applied to a multichannel clip"}); continue; }
+			if (kind == AAFI_TRANS_XFADE) {
+				require (before && after && fade->len > 0 && before->len >= fade->len && after->len >= fade->len &&
+				         after->pos - before->pos == before->len - fade->len, "Inconsistent AAF crossfade overlap");
+			}
+			for (bool incoming : {false, true}) {
+				if ((incoming && kind == AAFI_TRANS_FADE_OUT) || (!incoming && kind == AAFI_TRANS_FADE_IN)) { continue; }
+				auto target = clip_indices.find (incoming ? after : before);
+				require (target != clip_indices.end (), "AAF transition references a missing audio clip");
+				auto& clip = output.clips[target->second];
+				auto media = std::find_if (project.media.begin (), project.media.end (), [&] (const Media& m) { return m.id == clip.media; });
+				self.transition (clip, fade, incoming, track->edit_rate, 1.0 / media->sample_rate);
+			}
 		}
 		project.tracks.push_back (output);
 	}

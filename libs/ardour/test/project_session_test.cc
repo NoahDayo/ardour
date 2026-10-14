@@ -1515,12 +1515,12 @@ void ProjectSessionTest::region_fades_roundtrip ()
 	package (fixture, input);
 	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"), fixture.path ("Fades"), "Fades", fixture.report);
 	const samplecnt_t rate = fixture.session->sample_rate ();
-	auto render = [&] (std::shared_ptr<AudioRegion> audio) {
+	auto render = [&] (std::shared_ptr<AudioRegion> audio, samplecnt_t block_size = 256) {
 		std::vector<float> output (audio->length_samples () * 2, 0);
-		std::vector<float> mix (256), gain (256);
+		std::vector<float> mix (block_size), gain (block_size);
 		for (unsigned channel = 0; channel < 2; ++channel) {
-			for (samplecnt_t at = 0; at < audio->length_samples (); at += 256) {
-				auto count = std::min (samplecnt_t (256), audio->length_samples () - at);
+			for (samplecnt_t at = 0; at < audio->length_samples (); at += block_size) {
+				auto count = std::min (block_size, audio->length_samples () - at);
 				CPPUNIT_ASSERT_EQUAL (count, audio->read_at (output.data () + channel * audio->length_samples () + at, mix.data (), gain.data (), audio->position_sample () + at, count, channel));
 			}
 		}
@@ -1545,7 +1545,10 @@ void ProjectSessionTest::region_fades_roundtrip ()
 				}
 				envelope->thaw (); audio->set_envelope_active (true);
 			}
-			expected[audio->name ()] = render (audio); ++i;
+			auto first = render (audio), second = render (audio, 73);
+			CPPUNIT_ASSERT_EQUAL (first.size (), second.size ());
+			for (size_t frame = 0; frame < first.size (); ++frame) { CPPUNIT_ASSERT_DOUBLES_EQUAL_MESSAGE ("Fade block-size invariance " + std::to_string (i) + " frame " + std::to_string (frame), first[frame], second[frame], 1e-6); }
+			expected[audio->name ()] = std::move (first); ++i;
 		}
 	}
 	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
@@ -1586,6 +1589,7 @@ void ProjectSessionTest::region_fades_roundtrip ()
 		}
 		AudioEngine::instance ()->remove_session (); fixture.session.reset ();
 	}
+	std::cout << "Native fade and envelope playback is block-size independent across saved exchange returns" << std::endl;
 }
 
 void ProjectSessionTest::mixer_automation_roundtrip ()

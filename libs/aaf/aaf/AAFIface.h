@@ -75,6 +75,7 @@ typedef enum aafiTransition_e {
 	AAFI_TRANS_FADE_IN  = 1 << 6,
 	AAFI_TRANS_FADE_OUT = 1 << 7,
 	AAFI_TRANS_XFADE    = 1 << 8,
+	AAFI_TRANS_CUSTOM_CURVE = 1 << 9, /* Explicit single-parameter Level curve. */
 
 } aafiTransition_e;
 

@@ -655,34 +655,19 @@ parse_Transition (AAF_Iface* aafi, aafObject* Transition, td* __ptd)
 	TRACE_OBJ (aafi, Transition, &__td);
 
 	aafiTransition* Trans = aafi_newTransition (aafi, aafi->ctx.current_track);
+	if (!Trans) { return -1; }
 
 	Trans->len    = *length;
 	Trans->flags  = fadeType;
 	Trans->cut_pt = (cutPoint) ? *cutPoint : (Trans->len / 2);
 
-	/*
-	 * OperationGroup *might* contain a Parameter (ParameterDef_Level) specifying
-	 * the fade curve. However, this parameter is optional regarding AAF_EditProtocol
-	 * and there is most likely no implementation that exports custom fade curves.
-	 * Thus, we only retrieve ParameterDef_Level to possibly set interpolation, and we
-	 * always set the fade as defined in AAF_EditProtocol, with only two points :
-	 *
-	 * « ParameterDef_Level (optional; default is a VaryingValue object
-	 * with two control points: Value 0 at time 0, and value 1 at time 1) »
-	 */
-
-	if (fadeType & AAFI_TRANS_FADE_IN ||
-	    fadeType & AAFI_TRANS_XFADE) {
-		Trans->value_a[0].numerator   = 0;
-		Trans->value_a[0].denominator = 0;
-		Trans->value_a[1].numerator   = 1;
-		Trans->value_a[1].denominator = 1;
-	} else if (fadeType & AAFI_TRANS_FADE_OUT) {
-		Trans->value_a[0].numerator   = 1;
-		Trans->value_a[0].denominator = 1;
-		Trans->value_a[1].numerator   = 0;
-		Trans->value_a[1].denominator = 0;
-	}
+	/* AS-01 12.19: Level describes the incoming curve; the outgoing
+	 * contribution uses Level(1-t), including a fade to Filler. */
+	Trans->pts_cnt_a = 2;
+	Trans->time_a[0] = (aafRational_t) {0, 1};
+	Trans->time_a[1] = (aafRational_t) {1, 1};
+	Trans->value_a[0] = (aafRational_t) {0, 1};
+	Trans->value_a[1] = (aafRational_t) {1, 1};
 
 	aafi->ctx.current_transition = Trans;
 
@@ -2169,6 +2154,9 @@ parse_VaryingValue (AAF_Iface* aafi, aafObject* VaryingValue, td* __ptd)
 	aafUID_t*           InterpolationIdentification = aaf_get_InterpolationIdentificationByWeakRef (aafi->aafd, InterpolationDefWeakRef);
 
 	if (!InterpolationIdentification) {
+		if (aafUIDCmp (OperationIdentification, &AAFOperationDef_MonoAudioDissolve)) {
+			TRACE_OBJ_ERROR (aafi, VaryingValue, &__td, "Missing dissolve interpolation definition"); return -1;
+		}
 		TRACE_OBJ_WARNING (aafi, VaryingValue, &__td, "Could not retrieve InterpolationIdentification: Falling back to Linear");
 		interpolation = AAFI_INTERPOL_LINEAR;
 	} else if (aafUIDCmp (InterpolationIdentification, &AAFInterpolationDef_None)) {
@@ -2185,12 +2173,18 @@ parse_VaryingValue (AAF_Iface* aafi, aafObject* VaryingValue, td* __ptd)
 		interpolation = AAFI_INTERPOL_LOG;
 	} else {
 		TRACE_OBJ_WARNING (aafi, VaryingValue, &__td, "Unknown InterpolationIdentification value: Falling back to Linear");
+		if (aafUIDCmp (OperationIdentification, &AAFOperationDef_MonoAudioDissolve)) {
+			TRACE_OBJ_ERROR (aafi, VaryingValue, &__td, "Unknown dissolve interpolation definition"); return -1;
+		}
 		interpolation = AAFI_INTERPOL_LINEAR;
 	}
 
 	aafObject* Points = aaf_get_propertyValue (VaryingValue, PID_VaryingValue_PointList, &AAFTypeID_ControlPointStrongReferenceVector);
 
 	if (!Points) {
+		if (aafUIDCmp (OperationIdentification, &AAFOperationDef_MonoAudioDissolve)) {
+			TRACE_OBJ_ERROR (aafi, VaryingValue, &__td, "Missing dissolve PointList"); return -1;
+		}
 		/*
 		 * Some AAF files from ProTools and LogicPro break standard by having no
 		 * PointList entry for AAFOperationDef_MonoAudioGain.
@@ -2208,18 +2202,22 @@ parse_VaryingValue (AAF_Iface* aafi, aafObject* VaryingValue, td* __ptd)
 			return -1;
 		}
 
-		Trans->flags |= interpolation;
-
-		/*
-		 * OperationGroup *might* contain a Parameter (ParameterDef_Level) specifying
-		 * the fade curve. However, this parameter is optional regarding AAF_EditProtocol
-		 * and there is most likely no implementation that exports custom fade curves.
-		 * Thus, we only retrieve ParameterDef_Level to set interpolation, and we
-		 * always set the fade as defined in AAF_EditProtocol, with only two points :
-		 *
-		 * « ParameterDef_Level (optional; default is a VaryingValue object
-		 * with two control points: Value 0 at time 0, and value 1 at time 1) »
-		 */
+		if ((Trans->flags & AAFI_TRANS_CUSTOM_CURVE) || !Points->Header ||
+		    Points->Header->_entryCount < 2 || Points->Header->_entryCount > 100000) {
+			TRACE_OBJ_ERROR (aafi, VaryingValue, &__td, "Duplicate or excessive dissolve Level curve");
+			return -1;
+		}
+		aafRational_t* times = NULL;
+		aafRational_t* values = NULL;
+		int count = retrieve_ControlPoints (aafi, Points, &times, &values);
+		if (count < 2) {
+			free (times); free (values);
+			TRACE_OBJ_ERROR (aafi, VaryingValue, &__td, "Invalid dissolve ControlPoints");
+			return -1;
+		}
+		free (Trans->time_a); free (Trans->value_a);
+		Trans->time_a = times; Trans->value_a = values; Trans->pts_cnt_a = count;
+		Trans->flags = (Trans->flags & ~AAFI_INTERPOL_MASK) | interpolation | AAFI_TRANS_CUSTOM_CURVE;
 
 		TRACE_OBJ (aafi, VaryingValue, &__td);
 	} else if ((aafUIDCmp (OperationIdentification, &AAFOperationDef_MonoAudioGain) ||

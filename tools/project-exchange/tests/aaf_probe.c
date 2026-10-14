@@ -98,7 +98,21 @@ main (int argc, char** argv)
 			}
 			putchar ('}');
 		}
-		printf ("]}");
+		putchar (']');
+		unsigned transitions = 0;
+		AAFI_foreachTrackItem (track, item) {
+			if (item->type != AAFI_TRANS) { continue; }
+			aafiTransition* fade = item->data;
+			if (!transitions++) { printf (",\"transitions\":["); } else { putchar (','); }
+			printf ("{\"length\":%" PRId64 ",\"cut\":%" PRId64 ",\"flags\":%u,\"points\":[", fade->len, fade->cut_pt, fade->flags);
+			for (int i = 0; i < fade->pts_cnt_a; ++i) {
+				if (i) { putchar (','); }
+				printf ("[%.12g,%.12g]", aafRationalToDouble (fade->time_a[i]), aafRationalToDouble (fade->value_a[i]));
+			}
+			printf ("]}");
+		}
+		if (transitions) { putchar (']'); }
+		putchar ('}');
 	}
 	printf ("],\"media\":[");
 	count = 0;

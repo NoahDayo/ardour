@@ -782,8 +782,9 @@ AudioRegion::read_at (Sample*     buf,
 			}
 
 			/* APPLY REGULAR GAIN CURVES AND SCALING TO mixdown_buffer */
-			if (envelope_active())  {
-				_envelope->curve().get_vector (timepos_t (offset), timepos_t (offset + n_read), gain_buffer, n_read);
+			if (envelope_active() && n_read > 0) {
+				/* Curve::get_vector includes both endpoints. */
+				_envelope->curve().get_vector (timepos_t (offset), timepos_t (offset + n_read - 1), gain_buffer, n_read);
 
 				if (_scale_amplitude != 1.0f) {
 					for (samplecnt_t n = 0; n < n_read; ++n) {
@@ -857,8 +858,8 @@ AudioRegion::read_at (Sample*     buf,
 			}
 
 			/* APPLY REGULAR GAIN CURVES AND SCALING TO mixdown_buffer */
-			if (envelope_active())  {
-				_envelope->curve().get_vector (timepos_t (offset), timepos_t (offset + n_read), gain_buffer, n_read);
+			if (envelope_active() && n_read > 0) {
+				_envelope->curve().get_vector (timepos_t (offset), timepos_t (offset + n_read - 1), gain_buffer, n_read);
 
 				if (_scale_amplitude != 1.0f) {
 					for (samplecnt_t n = 0; n < n_read; ++n) {
@@ -886,7 +887,7 @@ AudioRegion::read_at (Sample*     buf,
 
 					//fade_in_limit = min (fade_in_limit, n_read);
 					assert (fade_in_limit <= n_read);
-					_fade_in->curve().get_vector (timepos_t (offset), timepos_t (offset + fade_in_limit), gain_buffer, fade_in_limit);
+					_fade_in->curve().get_vector (timepos_t (offset), timepos_t (offset + fade_in_limit - 1), gain_buffer, fade_in_limit);
 					for (samplecnt_t n = 0; n < fade_in_limit; ++n) {
 						mixdown_buffer[n] *= gain_buffer[n];
 					}
@@ -909,7 +910,7 @@ AudioRegion::read_at (Sample*     buf,
 
 					/* apply fade out */
 					samplecnt_t const curve_offset = fade_interval_start - _fade_out->when(false).distance (len_as_tpos ()).samples();
-					_fade_out->curve().get_vector (timepos_t (curve_offset), timepos_t (curve_offset + fade_out_limit), gain_buffer, fade_out_limit);
+					_fade_out->curve().get_vector (timepos_t (curve_offset), timepos_t (curve_offset + fade_out_limit - 1), gain_buffer, fade_out_limit);
 					for (samplecnt_t n = 0, m = fade_out_offset; n < fade_out_limit; ++n, ++m) {
 						mixdown_buffer[m] *= gain_buffer[n];
 					}
@@ -981,7 +982,7 @@ endread:
 				 * power), so we have to fetch it.
 				 */
 
-				_inverse_fade_in->curve().get_vector (timepos_t (internal_offset), timepos_t (internal_offset + fade_in_limit), gain_buffer, fade_in_limit);
+				_inverse_fade_in->curve().get_vector (timepos_t (internal_offset), timepos_t (internal_offset + fade_in_limit - 1), gain_buffer, fade_in_limit);
 
 				/* Fade the data from lower layers out */
 				for (samplecnt_t n = 0; n < fade_in_limit; ++n) {
@@ -990,7 +991,7 @@ endread:
 
 				/* refill gain buffer with the fade in */
 
-				_fade_in->curve().get_vector (timepos_t (internal_offset), timepos_t (internal_offset + fade_in_limit), gain_buffer, fade_in_limit);
+				_fade_in->curve().get_vector (timepos_t (internal_offset), timepos_t (internal_offset + fade_in_limit - 1), gain_buffer, fade_in_limit);
 
 			} else {
 
@@ -998,14 +999,14 @@ endread:
 				 * in) for the fade out of lower layers
 				 */
 
-				_fade_in->curve().get_vector (timepos_t (internal_offset), timepos_t (internal_offset + fade_in_limit), gain_buffer, fade_in_limit);
+				_fade_in->curve().get_vector (timepos_t (internal_offset), timepos_t (internal_offset + fade_in_limit - 1), gain_buffer, fade_in_limit);
 
 				for (samplecnt_t n = 0; n < fade_in_limit; ++n) {
 					buf[n] *= 1 - gain_buffer[n];
 				}
 			}
 		} else {
-			_fade_in->curve().get_vector (timepos_t (internal_offset), timepos_t (internal_offset + fade_in_limit), gain_buffer, fade_in_limit);
+			_fade_in->curve().get_vector (timepos_t (internal_offset), timepos_t (internal_offset + fade_in_limit - 1), gain_buffer, fade_in_limit);
 		}
 
 		if (!_fade_before_fx || nofx) {
@@ -1025,7 +1026,7 @@ endread:
 		if (is_opaque) {
 			if (_inverse_fade_out) {
 
-				_inverse_fade_out->curve().get_vector (timepos_t (curve_offset), timepos_t (curve_offset + fade_out_limit), gain_buffer, fade_out_limit);
+				_inverse_fade_out->curve().get_vector (timepos_t (curve_offset), timepos_t (curve_offset + fade_out_limit - 1), gain_buffer, fade_out_limit);
 
 				/* Fade the data from lower levels in */
 				for (samplecnt_t n = 0, m = fade_out_offset; n < fade_out_limit; ++n, ++m) {
@@ -1034,7 +1035,7 @@ endread:
 
 				/* fetch the actual fade out */
 
-				_fade_out->curve().get_vector (timepos_t (curve_offset), timepos_t (curve_offset + fade_out_limit), gain_buffer, fade_out_limit);
+				_fade_out->curve().get_vector (timepos_t (curve_offset), timepos_t (curve_offset + fade_out_limit - 1), gain_buffer, fade_out_limit);
 
 			} else {
 
@@ -1043,14 +1044,14 @@ endread:
 				 * out) for the fade in of lower layers
 				 */
 
-				_fade_out->curve().get_vector (timepos_t (curve_offset), timepos_t (curve_offset + fade_out_limit), gain_buffer, fade_out_limit);
+				_fade_out->curve().get_vector (timepos_t (curve_offset), timepos_t (curve_offset + fade_out_limit - 1), gain_buffer, fade_out_limit);
 
 				for (samplecnt_t n = 0, m = fade_out_offset; n < fade_out_limit; ++n, ++m) {
 					buf[m] *= 1 - gain_buffer[n];
 				}
 			}
 		} else {
-			_fade_out->curve().get_vector (timepos_t (curve_offset), timepos_t (curve_offset + fade_out_limit), gain_buffer, fade_out_limit);
+			_fade_out->curve().get_vector (timepos_t (curve_offset), timepos_t (curve_offset + fade_out_limit - 1), gain_buffer, fade_out_limit);
 		}
 
 		if (!_fade_before_fx || nofx) {

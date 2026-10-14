@@ -13,8 +13,13 @@ import subprocess
 import tempfile
 import unittest
 import wave
+import importlib.util
 
 import aaf2
+
+fixture_spec = importlib.util.spec_from_file_location("aaf_transitions", Path(__file__).resolve().parents[3] / "libs/ardour/test/data/aaf_transitions.py")
+transition_fixtures = importlib.util.module_from_spec(fixture_spec)
+fixture_spec.loader.exec_module(transition_fixtures)
 
 
 def pcm_wave(path, channels, frames=96000, rate=48000):
@@ -81,6 +86,30 @@ def make_fixture(directory):
 
 class AafWriterTest(unittest.TestCase):
     probe = None
+
+    def test_dissolve_default_and_explicit_points(self):
+        for mode in ("default", "custom", "hold"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(prefix="ardour-aaf-fades-") as work:
+                directory = Path(work)
+                transition_fixtures.make_transition_fixture(directory / "fades.aaf", mode=mode)
+                result = subprocess.run([self.probe, str(directory / "fades.aaf"), str(directory)], capture_output=True, text=True, encoding="utf-8", timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                track = json.loads(result.stdout)["tracks"][0]
+                self.assertEqual([(c["position"], c["length"], c["offset"]) for c in track["clips"]], [(24000, 96000, 6000), (96000, 96000, 18000)])
+                self.assertEqual([t["length"] for t in track["transitions"]], [12000, 24000, 24000])
+                expected = [[0, 0], [1, 1]] if mode == "default" else [[0, 0], [.25, .8], [.75, .9], [1, 1]]
+                for index, transition in enumerate(track["transitions"]):
+                    self.assertEqual(transition["points"], expected)
+                    self.assertTrue(transition["flags"] & (1 << (13 if mode == "hold" else 11)))
+                    self.assertTrue(transition["flags"] & (1 << [6, 8, 7][index]))
+
+    def test_incomplete_dissolve_level_rejected(self):
+        with tempfile.TemporaryDirectory(prefix="ardour-aaf-fades-") as work:
+            directory = Path(work)
+            transition_fixtures.make_transition_fixture(directory / "fades.aaf", mode="one-point")
+            result = subprocess.run([self.probe, str(directory / "fades.aaf"), str(directory)], capture_output=True, text=True, encoding="utf-8", timeout=30)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("dissolve Level curve", result.stderr)
 
     def test_embedded_audio_timeline(self):
         with tempfile.TemporaryDirectory(prefix="ardour-aaf-") as work:
