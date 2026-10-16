@@ -1,7 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstdlib>
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <iomanip>
@@ -10,6 +12,11 @@
 #include <map>
 #include <set>
 #include <tuple>
+#include <thread>
+#ifdef PLATFORM_WINDOWS
+#include <winsock2.h>
+#include <windows.h>
+#endif
 #include <glib.h>
 #include <glib/gstdio.h>
 #include <glibmm/fileutils.h>
@@ -481,6 +488,9 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (bad_media);
 	CPPUNIT_TEST (corrupt_media);
 	CPPUNIT_TEST (existing_destination);
+#ifdef PLATFORM_WINDOWS
+	CPPUNIT_TEST (retry_locked_publish);
+#endif
 	CPPUNIT_TEST (cancel_import);
 	CPPUNIT_TEST (cancel_populated_import);
 	CPPUNIT_TEST (cancel_reopened_import);
@@ -523,6 +533,9 @@ public:
 	void bad_media ();
 	void corrupt_media ();
 	void existing_destination ();
+#ifdef PLATFORM_WINDOWS
+	void retry_locked_publish ();
+#endif
 	void cancel_import ();
 	void cancel_populated_import ();
 	void cancel_reopened_import ();
@@ -2298,6 +2311,47 @@ void ProjectSessionTest::existing_destination ()
 	CPPUNIT_ASSERT_EQUAL (std::string ("keep"), Glib::file_get_contents (fixture.path ("Session/keep.txt")));
 	CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
 }
+
+#ifdef PLATFORM_WINDOWS
+void ProjectSessionTest::retry_locked_publish ()
+{
+	Fixture fixture;
+	package (fixture, example (fixture));
+	bool acquired = false;
+	gint64 locked_at = 0;
+	std::thread release;
+	auto cancel = [&] {
+		if (acquired || AudioEngine::instance ()->session ()) { return false; }
+		for (auto const& name : Glib::Dir (fixture.root)) {
+			if (name.find (".ardour-exchange-") != 0) { continue; }
+			std::string session = fixture.path (name + "/session");
+			if (!Glib::file_test (Glib::build_filename (session, "Exchange.ardour"), Glib::FILE_TEST_IS_REGULAR)) { continue; }
+			gunichar2* wide = g_utf8_to_utf16 (session.c_str (), -1, NULL, NULL, NULL);
+			CPPUNIT_ASSERT (wide);
+			HANDLE held = CreateFileW (reinterpret_cast<LPCWSTR> (wide), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
+			                           NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+			g_free (wide);
+			CPPUNIT_ASSERT (held != INVALID_HANDLE_VALUE);
+			acquired = true;
+			locked_at = g_get_monotonic_time ();
+			release = std::thread ([held] { std::this_thread::sleep_for (std::chrono::milliseconds (400)); CloseHandle (held); });
+			break;
+		}
+		return false;
+	};
+	std::exception_ptr failure;
+	try {
+		fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"),
+		                                                             fixture.path ("Session"), "Exchange", fixture.report, cancel);
+	} catch (...) { failure = std::current_exception (); }
+	if (release.joinable ()) { release.join (); }
+	if (failure) { std::rethrow_exception (failure); }
+	CPPUNIT_ASSERT (acquired);
+	CPPUNIT_ASSERT (g_get_monotonic_time () - locked_at >= 350000);
+	CPPUNIT_ASSERT (Glib::file_test (fixture.path ("Session/Exchange.ardour"), Glib::FILE_TEST_IS_REGULAR));
+	CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
+}
+#endif
 
 void ProjectSessionTest::corrupt_media ()
 {

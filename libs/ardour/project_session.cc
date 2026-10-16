@@ -132,11 +132,20 @@ struct OwnedDirectory {
 	{
 		FileObject from = file_object (Glib::build_filename (path, "session"));
 		FileObject to = file_object (destination);
-		GError* error = NULL;
-		if (!g_file_move (from.get (), to.get (), G_FILE_COPY_NO_FALLBACK_FOR_MOVE, NULL, NULL, NULL, &error)) {
+		for (unsigned attempt = 0;; ++attempt) {
+			GError* error = NULL;
+			if (g_file_move (from.get (), to.get (), G_FILE_COPY_NO_FALLBACK_FOR_MOVE, NULL, NULL, NULL, &error)) { break; }
+			bool retry = false;
+#ifdef PLATFORM_WINDOWS
+			/* A short-lived handle held by a scanner or the just-closed session
+			 * can deny a directory rename. Never retry an existing destination. */
+			retry = attempt < 40 && g_error_matches (error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED) &&
+			        g_file_query_exists (from.get (), NULL) && !g_file_query_exists (to.get (), NULL);
+#endif
 			std::string message = error ? error->message : "unknown error";
 			g_clear_error (&error);
-			throw ExchangeError ("Cannot publish project: " + message);
+			if (!retry) { throw ExchangeError ("Cannot publish project: " + message); }
+			g_usleep (50000);
 		}
 		published = destination;
 	}
