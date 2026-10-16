@@ -8,6 +8,7 @@
 #include <iomanip>
 #include <locale>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <type_traits>
 #include <gio/gio.h>
@@ -161,15 +162,21 @@ std::vector<Diagnostic> StudioOneSong::export_report (const Project& project)
 	validate_project (project); TimeMap timing (project); std::vector<Diagnostic> report = project.report;
 	auto unsupported = [&] (const std::string& name, const std::string& detail) { report.push_back ({Disposition::Unsupported, name, detail}); };
 	std::string master; for (auto const& track : project.tracks) { if (track.master) { master = track.id; } }
+	std::set<std::string> folders;
+	for (auto const& track : project.tracks) { if (track.kind == TrackKind::Folder) { folders.insert (track.id); } }
 	if (master.empty ()) { unsupported ("Master", "Native song export requires a stereo master output"); }
 	for (auto const& media : project.media) { if (media.channels > 2) { unsupported (media.id, "Native multichannel audio requires the stereo rendered mix option"); } }
 	for (auto const& track : project.tracks) {
 		if (track.channels > 2) { unsupported (track.name, "Native multichannel tracks require the stereo rendered mix option"); }
 		if (track.master) {
 			if (track.channels != 2 || track.pan != .5) { unsupported (track.name, "Native master export requires stereo with centered balance"); }
-		} else if (track.kind == TrackKind::Folder || track.kind == TrackKind::Bus || !track.parent.empty () || (!track.destination.empty () && track.destination != master)) {
-			unsupported (track.name, "Native folders and bus routing require the rendered mix option");
+		} else if (track.kind == TrackKind::Bus || (!track.parent.empty () && !folders.count (track.parent)) ||
+		           (!track.destination.empty () && track.destination != master)) {
+			unsupported (track.name, "Native bus routing requires the rendered mix option");
 		} else if (track.kind == TrackKind::Audio && track.destination.empty ()) { unsupported (track.name, "Connect the audio track to the master before native song export"); }
+		if (track.kind == TrackKind::Folder && (track.channels != 2 || track.volume != 1 || track.pan != .5 || track.mute || track.solo)) {
+			unsupported (track.name, "Native folder processing requires the rendered mix option");
+		}
 		if (!track.plugins.empty () || !track.sends.empty ()) { unsupported (track.name, "Native plugin state and sends require the rendered mix option"); }
 		if (!track.volume_automation.points.empty () || !track.pan_automation.points.empty ()) { unsupported (track.name, "Native mixer automation requires the rendered mix option"); }
 		if (track.kind == TrackKind::MIDI && (track.volume != 1 || track.pan != .5)) { unsupported (track.name, "Native MIDI mixer gain and pan require instrument rendering"); }
@@ -212,16 +219,22 @@ void StudioOneSong::write (const StudioOneSongData& song, const std::string& fil
 	for (auto const& track : project.tracks) { for (auto const& clip : track.clips) { if (!song.has_range) { end = std::max (end, timing.convert (Time (clip.position.value + clip.duration, clip.position.unit), TimeUnit::Seconds)); } } }
 	if (!song.has_range) { end = std::max (end, 1.0); }
 	require (std::isfinite (begin) && std::isfinite (end) && begin >= 0 && end > begin, "Invalid native song range");
-	std::map<std::string, std::string> channels, media_ids;
+	std::map<std::string, std::string> channels, track_ids, media_ids;
 	std::string master;
-	for (auto const& track : project.tracks) { channels[track.id] = uid (); if (track.master) { master = channels[track.id]; } }
+	for (auto const& track : project.tracks) {
+		if (track.kind != TrackKind::Folder) { channels[track.id] = uid (); }
+		if (!track.master) { track_ids[track.id] = uid (); }
+		if (track.master) { master = channels[track.id]; }
+	}
 	Document meta ("MetaInformation"), arrangement ("Song"), pool ("MediaPool"), mixer ("AudioMixer"), midi ("MusicTrackDevice");
 	auto attribute = [&] (const char* id, const std::string& value) { Node a = node (meta.root, "Attribute"); prop (a, "id", id); prop (a, "value", value); };
 	attribute ("Document:MimeType", "application/x.presonus-song"); attribute ("Document:FormatVersion", "9");
 	attribute ("Document:Generator", "Ardour Project Exchange"); attribute ("Document:Title", song.title);
 	attribute ("Media:SampleRate", number (song.sample_rate)); attribute ("Media:Tempo", number (project.tempo));
 	attribute ("Media:TimeSignatureNumerator", number (project.numerator)); attribute ("Media:TimeSignatureDenominator", number (project.denominator));
-	attribute ("Media:TrackCount", number (project.tracks.size () - 1)); attribute ("Media:Length", number (end - begin)); attribute ("Media:TimeFormat", "2");
+	attribute ("Media:TrackCount", number (std::count_if (project.tracks.begin (), project.tracks.end (), [] (const Track& t) {
+		return t.kind == TrackKind::Audio || t.kind == TrackKind::MIDI;
+	}))); attribute ("Media:Length", number (end - begin)); attribute ("Media:TimeFormat", "2");
 	Node root = node (arrangement.root, "Attributes", "Root"); prop (root, "defaultTimeFormat", 2); prop (root, "timeFormat", 0); prop (root, "length", end);
 	Node context = node (root, "Attributes", "timeContext"); prop (context, "sampleRate", song.sample_rate); prop (context, "frameType", 1);
 	Node tempos = node (context, "TempoMap", "tempoMap"); auto steps = timing.stepped (.00001);
@@ -252,6 +265,14 @@ void StudioOneSong::write (const StudioOneSongData& song, const std::string& fil
 	prop (outputs, "name", "AudioOutput"); prop (audio_tracks, "name", "AudioTrack"); prop (music_tracks, "name", "MusicTrack");
 	ProjectArchiveWriter archive (filename, ArchiveLimits (), cancel); unsigned track_number = 0, music_number = 0;
 	for (auto const& track : project.tracks) {
+		if (track.kind == TrackKind::Folder) {
+			Node folder = node (tracks, "FolderTrack"); prop (folder, "version", 1);
+			prop (folder, "trackID", track_ids.at (track.id)); prop (folder, "timeFormat", 2); prop (folder, "name", track.name);
+			if (!track.color.empty ()) { prop (folder, "color", color (track.color)); }
+			if (!track.parent.empty ()) { prop (folder, "parentFolder", track_ids.at (track.parent)); }
+			prop (node (folder, "Attributes", "AutomationRegionList"), "visible", 0);
+			continue;
+		}
 		check (cancel); bool musical = track.kind == TrackKind::MIDI;
 		Node channel = node (track.master ? outputs : musical ? music_tracks : audio_tracks, track.master ? "AudioOutputChannel" : musical ? "MusicTrackChannel" : "AudioTrackChannel");
 		unique_id (channel, "uniqueID", channels[track.id]); prop (channel, "name", "Channel" + std::to_string (++track_number)); prop (channel, "label", track.name);
@@ -265,7 +286,8 @@ void StudioOneSong::write (const StudioOneSongData& song, const std::string& fil
 		}
 		if (track.master) { continue; }
 		Node t = node (tracks, "MediaTrack"); prop (t, "mediaType", musical ? "Music" : "Audio"); prop (t, "tempoFollow", musical ? 2 : 0);
-		prop (t, "version", 1); prop (t, "trackID", uid ()); prop (t, "trackNumber", track_number); prop (t, "timeFormat", musical ? 2 : 0); prop (t, "name", track.name); prop (t, "color", color (track.color));
+		prop (t, "version", 1); prop (t, "trackID", track_ids.at (track.id)); prop (t, "trackNumber", track_number); prop (t, "timeFormat", musical ? 2 : 0); prop (t, "name", track.name); prop (t, "color", color (track.color));
+		if (!track.parent.empty ()) { prop (t, "parentFolder", track_ids.at (track.parent)); }
 		unique_id (t, "channelID", channels[track.id]); if (!musical) { speaker (t, "trackFormat", track.channels); }
 		Node events = node (t, "List", "Events");
 		for (auto const& clip : track.clips) {

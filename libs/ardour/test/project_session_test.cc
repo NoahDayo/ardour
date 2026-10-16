@@ -836,15 +836,14 @@ void ProjectSessionTest::midi_controller_roundtrip ()
 void ProjectSessionTest::native_song_export_roundtrip ()
 {
 	Fixture fixture; auto input = example (fixture);
-	input.tracks.erase (input.tracks.begin () + 1);
 	for (auto& track : input.tracks) {
-		track.parent.clear (); if (!track.master) { track.destination = "master"; }
+		if (!track.master) { track.destination = "master"; }
 		for (auto& clip : track.clips) { for (auto& note : clip.notes) { note.channel = 0; note.release_velocity = 64.0 / 127; } }
 	}
 	input.tempos = {{PX::Time (0), 100, false}, {PX::Time (3), 120, false}};
 	input.meters = {{PX::Time (0), 3, 4}, {PX::Time (3), 5, 8}};
 	input.markers.push_back ({"Verse", PX::Time (6)});
-	auto& clip = input.tracks[1].clips[0]; clip.gain = .5;
+	auto& clip = input.tracks[2].clips[0]; clip.gain = .5;
 	clip.envelope.unit = PX::TimeUnit::Seconds;
 	clip.envelope.points = {{0, 0, true}, {.125, 1, true}, {.375, 1, true}, {.5, 0, true}};
 	package (fixture, input);
@@ -864,6 +863,10 @@ void ProjectSessionTest::native_song_export_roundtrip ()
 	CPPUNIT_ASSERT_EQUAL (0, g_rename (fixture.path ("Exported Song").c_str (), fixture.path ("Moved Song").c_str ()));
 	auto output = PX::StudioOneSong::read (fixture.path ("Moved Song/Project.song"));
 	CPPUNIT_ASSERT_EQUAL (std::string ("NativeSource"), output.title);
+	auto const& exported_folder = track_named (output.project, "Band");
+	CPPUNIT_ASSERT_EQUAL (PX::TrackKind::Folder, exported_folder.kind);
+	CPPUNIT_ASSERT_EQUAL (exported_folder.id, track_named (output.project, "Stereo").parent);
+	CPPUNIT_ASSERT_EQUAL (exported_folder.id, track_named (output.project, "Notes").parent);
 	CPPUNIT_ASSERT_EQUAL (rate, output.sample_rate);
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (.5, output.start.value, 1.0 / rate); CPPUNIT_ASSERT_DOUBLES_EQUAL (6, output.end.value, 1.0 / rate);
 	CPPUNIT_ASSERT_EQUAL (size_t (2), output.project.tempos.size ()); CPPUNIT_ASSERT_EQUAL (size_t (2), output.project.meters.size ());
@@ -881,6 +884,9 @@ void ProjectSessionTest::native_song_export_roundtrip ()
 	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("returned.dawproject"));
 	auto returned = PX::DawProject::read (fixture.path ("returned.dawproject"));
 	auto const& audio = track_named (returned, "Stereo"); auto const& midi = track_named (returned, "Notes");
+	auto const& folder = track_named (returned, "Band");
+	CPPUNIT_ASSERT_EQUAL (PX::TrackKind::Folder, folder.kind);
+	CPPUNIT_ASSERT_EQUAL (folder.id, audio.parent); CPPUNIT_ASSERT_EQUAL (folder.id, midi.parent);
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (.75, audio.volume, 1e-6); CPPUNIT_ASSERT_DOUBLES_EQUAL (.3, audio.pan, 1e-6);
 	CPPUNIT_ASSERT_EQUAL (std::string ("#12ab34"), audio.color);
 	CPPUNIT_ASSERT_EQUAL (size_t (2), audio.clips.size ()); CPPUNIT_ASSERT (!audio.clips[1].enabled);
@@ -892,7 +898,7 @@ void ProjectSessionTest::native_song_export_roundtrip ()
 	CPPUNIT_ASSERT_EQUAL (size_t (1), midi.clips.size ()); CPPUNIT_ASSERT_EQUAL (size_t (2), midi.clips[0].notes.size ());
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (4, midi.clips[0].position.value, 1e-6); CPPUNIT_ASSERT_DOUBLES_EQUAL (1, midi.clips[0].offset.value, 1e-6);
 	for (size_t i = 0; i < 2; ++i) {
-		auto const& expected = input.tracks[2].clips[0].notes[i]; auto const& actual = midi.clips[0].notes[i];
+		auto const& expected = input.tracks[3].clips[0].notes[i]; auto const& actual = midi.clips[0].notes[i];
 		CPPUNIT_ASSERT_DOUBLES_EQUAL (expected.time, actual.time, 1e-6); CPPUNIT_ASSERT_DOUBLES_EQUAL (expected.duration, actual.duration, 1e-6);
 		CPPUNIT_ASSERT_EQUAL (expected.key, actual.key); CPPUNIT_ASSERT_EQUAL (expected.channel, actual.channel);
 		CPPUNIT_ASSERT_DOUBLES_EQUAL (expected.velocity, actual.velocity, 1e-6);

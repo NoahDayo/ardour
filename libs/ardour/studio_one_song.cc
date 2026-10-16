@@ -255,6 +255,7 @@ private:
 	void channel (Track& track, Node n);
 	void transport (Node context);
 	void track (Node n);
+	void folder (Node n);
 	void automation (Node n, const std::string& name);
 };
 
@@ -366,7 +367,8 @@ void Reader::channel (Track& track, Node n)
 void Reader::track (Node n)
 {
 	check (); Track t; t.id = value (n, "trackID"); t.name = value (n, "name"); t.color = color (value (n, "color"));
-	attributes (n, {"mediaType", "tempoFollow", "materialMode", "trackNumber", "layersFollow", "followLayerName", "followGlobalTransposition", "version", "trackID", "timeFormat", "name", "color", "delay", "transpose"}, t.name);
+	attributes (n, {"mediaType", "tempoFollow", "materialMode", "trackNumber", "layersFollow", "followLayerName", "followGlobalTransposition", "version", "trackID", "parentFolder", "timeFormat", "name", "color", "delay", "transpose"}, t.name);
+	t.parent = value (n, "parentFolder");
 	std::string type = value (n, "mediaType");
 	require (type == "Audio" || type == "Music", "Unsupported native track media type"); t.kind = type == "Audio" ? TrackKind::Audio : TrackKind::MIDI;
 	unsigned format = integer (n, "timeFormat", 2); unit (format);
@@ -425,6 +427,23 @@ void Reader::track (Node n)
 	if (t.kind == TrackKind::Audio && !t.clips.empty () && integer (n, "tempoFollow") == 2 &&
 	    std::any_of (result.project.tempos.begin (), result.project.tempos.end (), [&] (const TempoChange& tempo) { return tempo.bpm != result.project.tempo; })) {
 		unsupported (t.name, "Audio following a changing tempo with time-stretching requires rendering");
+	}
+	result.project.tracks.push_back (t);
+}
+
+void Reader::folder (Node n)
+{
+	check ();
+	Track t; t.id = value (n, "trackID"); t.name = value (n, "name"); t.color = color (value (n, "color"));
+	t.parent = value (n, "parentFolder"); t.kind = TrackKind::Folder;
+	attributes (n, {"version", "trackID", "parentFolder", "timeFormat", "name", "color"}, t.name);
+	unit (integer (n, "timeFormat", 2));
+	for (Node c : children (n)) {
+		if (is (c, "Attributes") && id (c) == "AutomationRegionList") {
+			if (!children (c).empty ()) { unsupported (t.name, "Folder automation is not yet supported"); }
+		} else if (!is (c, "Attributes") || id (c) != "attributes" || !children (c).empty ()) {
+			unsupported (t.name, "Native folder content is not yet supported");
+		}
 	}
 	result.project.tracks.push_back (t);
 }
@@ -503,6 +522,7 @@ StudioOneSongData Reader::read ()
 	}
 	for (Node n : children (child (root_node, "List", "Tracks"))) {
 		if (is (n, "MediaTrack")) { track (n); }
+		else if (is (n, "FolderTrack")) { folder (n); }
 		else if (is (n, "MarkerTrack")) {
 			unsigned format = integer (n, "timeFormat", 2); bool start = false, end = false;
 			for (Node m : children (n)) { if (is (m, "MarkerEvent")) {

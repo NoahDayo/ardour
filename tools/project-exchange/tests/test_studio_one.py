@@ -324,6 +324,44 @@ class NativeSongTest(unittest.TestCase):
         self.entries["pan.envelopex"] = ubj({"bipolar": 1, "events": [{"time": 0., "value": .5}]})
         self.assertTrue(any(d["disposition"] == 3 for d in self.read()["project"]["report"]))
 
+    def test_organizational_folders_preserve_children_in_both_directions(self):
+        folder = ('<FolderTrack version="1" trackID="band" timeFormat="2" name="Band" color="FF336699">'
+                  '<Attributes x:id="AutomationRegionList" visible="0"/>'
+                  '<Attributes x:id="attributes" expanded="1"/></FolderTrack>')
+        self.entries["Song/song.xml"] = (SONG.replace('<MediaTrack trackID="audio"', folder + '<MediaTrack trackID="audio" parentFolder="band"')
+            .replace('<MediaTrack trackID="midi"', '<MediaTrack trackID="midi" parentFolder="band"'))
+        project = self.read()["project"]
+        folder_track, audio, midi, master = project["tracks"]
+        self.assertEqual((folder_track["name"], folder_track["kind"], folder_track["color"]), ("Band", 2, "#996633"))
+        self.assertEqual((audio["parent"], midi["parent"], audio["destination"]), ("band", "band", master["id"]))
+        self.assertFalse(any(d["disposition"] == 3 for d in project["report"]))
+        self.writable_fixture()
+        output, _ = self.export()
+        with zipfile.ZipFile(output) as archive:
+            meta = {a.get("id"): a.get("value") for a in self.native_xml(archive, "metainfo.xml")}
+            self.assertEqual(meta["Media:TrackCount"], "2")
+            arrangement = self.native_xml(archive, "Song/song.xml")
+            tracks = arrangement.find("Attributes[@id='Root']/List[@id='Tracks']")
+            exported_folder = tracks.find("FolderTrack")
+            self.assertIsNotNone(exported_folder)
+            self.assertEqual(exported_folder.get("name"), "Band")
+            self.assertEqual([t.get("parentFolder") for t in tracks.findall("MediaTrack")],
+                             [exported_folder.get("trackID")] * 2)
+        returned = self.read(path=output)["project"]
+        self.assertEqual([t["parent"] for t in returned["tracks"][1:3]], [returned["tracks"][0]["id"]] * 2)
+
+    def test_folder_content_and_unknown_parent_are_not_discarded(self):
+        folder = '<FolderTrack trackID="band" name="Band"><Attributes x:id="AutomationRegionList"/></FolderTrack>'
+        self.entries["Song/song.xml"] = SONG.replace('<MediaTrack trackID="audio"', folder + '<MediaTrack trackID="audio" parentFolder="band"')
+        self.assertFalse(any(d["disposition"] == 3 for d in self.read()["project"]["report"]))
+        self.entries["Song/song.xml"] = self.entries["Song/song.xml"].replace('parentFolder="band"', 'parentFolder="missing"')
+        self.assertIn("Unknown track reference", self.read(status=1))
+        self.entries["Song/song.xml"] = self.entries["Song/song.xml"].replace('parentFolder="missing"', 'parentFolder="band"')
+        self.entries["Song/song.xml"] = self.entries["Song/song.xml"].replace('<Attributes x:id="AutomationRegionList"/>',
+            '<Attributes x:id="AutomationRegionList"><AutomationRegion title="Volume"/></Attributes>')
+        self.assertTrue(any(d["disposition"] == 3 and "Folder automation" in d["detail"]
+                            for d in self.read()["project"]["report"]))
+
     def writable_fixture(self):
         self.entries["Performances/notes.musicx"] = ubj({"timeFormat": 2, "events": [
             {"start": 1.25, "length": .5, "pitch": 60, "velocity": .75},
