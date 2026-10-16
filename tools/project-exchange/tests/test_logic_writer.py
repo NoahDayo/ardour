@@ -586,15 +586,31 @@ class LogicWriterTest(unittest.TestCase):
                 expected = level * min(1, 2 * (1 - balance) if channel == 0 else 2 * balance)
                 self.assertAlmostEqual(actual, expected, delta=2e-5)
 
-    def test_rejects_zero_gain_stereo_balance_automation(self):
+    def test_zero_gain_stereo_balance_automation(self):
         stereo = self.root.findall("AudioTrack")[1]
         stereo.set("gain", "0")
         automation = ET.SubElement(stereo, "PanAutomation")
         ET.SubElement(automation, "Point", time="0", value=".25", linear="true")
         ET.SubElement(automation, "Point", time="2", value=".75", linear="true")
         result = self.run_writer()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("zero gain", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with aaf2.open(str(self.output / "Project.aaf"), "r") as aaf:
+            slots = [slot for slot in next(aaf.content.toplevel()).slots if slot.name == stereo.attrib["name"]]
+            self.assertEqual(len(slots), 2)
+            tags = [slot.segment["UserComments"].value[0].value for slot in slots]
+            self.assertEqual(tags[0], tags[1])
+            self.assertTrue(tags[0].startswith("3|"))
+            silent = dict((int(at), float(value)) for at, value in
+                          (item.split("=") for item in tags[0][2:].split(",")))
+            for at, expected in ((0, .25), (48000, .5), (96000, .75)):
+                self.assertAlmostEqual(silent[at], expected)
+        extracted = self.directory / "extracted"
+        extracted.mkdir()
+        probe = subprocess.run([self.probe, str(self.output / "Project.aaf"), str(extracted)],
+                               capture_output=True, text=True, encoding="utf-8", timeout=30)
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        for track in json.loads(probe.stdout)["tracks"][1:]:
+            self.assertTrue(all(level == 0 for _, level in track["gain_curve"]))
 
     def test_rejects_audio_outside_source(self):
         self.root.find("AudioTrack/Clip").set("offset", "95000")

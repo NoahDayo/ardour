@@ -437,9 +437,12 @@ def write_aaf(root, destination):
             require(gain >= 0, "Invalid audio gain")
             balance = number(track, "pan")
             require(0 <= balance <= 1, "Invalid audio pan")
-            require(channels == 1 or not pan_points or gain_points or gain > 0,
-                    "Moving stereo balance with zero gain is not yet mapped to AAF")
-            combined = moving_stereo_levels(gain_points, pan_points, end) if channels == 2 and gain_points and pan_points else None
+            combined = None
+            if channels == 2 and pan_points and (gain_points or gain == 0):
+                combined = moving_stereo_levels(gain_points or [(0, 0, True)], pan_points, end)
+                if not gain_points:
+                    require(combined[1].startswith("2|"), "Missing silent stereo balance metadata")
+                    combined = (combined[0], "3|" + combined[1][2:])
             balance_curves = stereo_balance_points(pan_points, gain) if channels == 2 and pan_points and not combined else None
             for channel, (slot, sequence) in enumerate(zip(composition_slots, sequences)):
                 sequence.length = end

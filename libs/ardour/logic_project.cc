@@ -249,8 +249,9 @@ struct LogicProject::Impl {
 			    l.empty () || l.size () != r.size () || left.volume_automation.unit != TimeUnit::Seconds ||
 			    right.volume_automation.unit != TimeUnit::Seconds) { return false; }
 			std::map<long long, double> silent_balance;
+			bool static_silence = std::strncmp (left_tag, "3|", 2) == 0;
 			if (std::strcmp (left_tag, "1") != 0) {
-				if (std::strncmp (left_tag, "2|", 2) || !left_tag[2]) { return false; }
+				if ((!static_silence && std::strncmp (left_tag, "2|", 2)) || !left_tag[2]) { return false; }
 				std::string text (left_tag);
 				size_t start = 2;
 				try {
@@ -279,6 +280,7 @@ struct LogicProject::Impl {
 				    !std::isfinite (r[i].value) || l[i].value < 0 || r[i].value < 0 ||
 				    (i && l[i].time - l[i - 1].time < quantum * .5)) { return false; }
 				double common = std::max (l[i].value, r[i].value);
+				if (static_silence && common != 0) { return false; }
 				double position;
 				if (common == 0) {
 					double sample = l[i].time / quantum;
@@ -355,9 +357,16 @@ struct LogicProject::Impl {
 				if (combined_gain_balance) {
 					left.volume = common_gain_curve.points.front ().value;
 					left.pan = tagged_balance.points.front ().value;
-					left.volume_automation = std::move (common_gain_curve);
+					if (sources[i]->ardour_stereo_gain_balance[0] != '3') {
+						left.volume_automation = std::move (common_gain_curve);
+					} else {
+						left.volume_automation = Automation ();
+					}
 					left.pan_automation = std::move (tagged_balance);
-					project.report.push_back ({Disposition::Transformed, left.name, "Tagged paired AAF levels restored as editable stereo gain and balance automation"});
+					project.report.push_back ({Disposition::Transformed, left.name,
+					                           sources[i]->ardour_stereo_gain_balance[0] == '3'
+					                           ? "Tagged paired AAF levels restored as static zero gain and editable stereo balance automation"
+					                           : "Tagged paired AAF levels restored as editable stereo gain and balance automation"});
 				} else if (gain_balanced) {
 					left.volume = common_gain_curve.points.front ().value;
 					left.volume_automation = std::move (common_gain_curve);
