@@ -212,6 +212,34 @@ struct LogicProject::Impl {
 			}
 			return true;
 		};
+		auto gain_with_balance = [] (const Track& left, const Track& right, double quantum, Automation& result, double& position) {
+			auto const& l = left.volume_automation.points;
+			auto const& r = right.volume_automation.points;
+			if (l.empty () || l.size () != r.size () || left.volume_automation.unit != TimeUnit::Seconds ||
+			    right.volume_automation.unit != TimeUnit::Seconds) { return false; }
+			double reference_left = 0, reference_right = 0;
+			for (size_t i = 0; i < l.size (); ++i) {
+				if (l[i].time != r[i].time || l[i].linear != r[i].linear || !std::isfinite (l[i].value) ||
+				    !std::isfinite (r[i].value) || l[i].value < 0 || r[i].value < 0 ||
+				    (i && l[i].time - l[i - 1].time < quantum * .5)) { return false; }
+				if (std::max (l[i].value, r[i].value) > 1e-6 && reference_left == 0 && reference_right == 0) {
+					double common = std::max (l[i].value, r[i].value);
+					reference_left = l[i].value / common;
+					reference_right = r[i].value / common;
+				}
+			}
+			if (reference_left == 0 && reference_right == 0) { return false; }
+			for (size_t i = 0; i < l.size (); ++i) {
+				double common = std::max (l[i].value, r[i].value);
+				double tolerance = std::max (1e-6, common * 2e-5);
+				if (std::fabs (l[i].value - common * reference_left) > tolerance ||
+				    std::fabs (r[i].value - common * reference_right) > tolerance) { return false; }
+				result.points.push_back ({l[i].time, common, l[i].linear});
+			}
+			result.unit = TimeUnit::Seconds;
+			position = reference_left >= reference_right ? reference_right / 2 : 1 - reference_left / 2;
+			return true;
+		};
 		std::vector<Track> paired;
 		paired.reserve (project.tracks.size ());
 		paired.push_back (std::move (project.tracks.front ()));
@@ -219,8 +247,9 @@ struct LogicProject::Impl {
 			check ();
 			auto& left = project.tracks[i + 1];
 			bool can_pair = i + 1 < sources.size ();
-			Automation moving_balance; double balance_gain = 1;
+			Automation moving_balance, common_gain_curve; double balance_gain = 1, static_pan = .5;
 			bool variable_balance = false;
+			bool gain_balanced = false;
 			if (can_pair) {
 				auto& right = project.tracks[i + 2];
 				bool empty_pair = left.clips.empty () && right.clips.empty () &&
@@ -228,12 +257,14 @@ struct LogicProject::Impl {
 				                  !sources[i]->format && !sources[i + 1]->format;
 				bool shared_gain = left.volume == right.volume && same_curve (left.volume_automation, right.volume_automation);
 				bool static_balance = left.volume_automation.points.empty () && right.volume_automation.points.empty ();
-				variable_balance = !shared_gain && !static_balance &&
+				gain_balanced = !shared_gain && !static_balance &&
+				                gain_with_balance (left, right, seconds (1, sources[i]->edit_rate), common_gain_curve, static_pan);
+				variable_balance = !shared_gain && !static_balance && !gain_balanced &&
 				                   balance_curve (left, right, seconds (1, sources[i]->edit_rate), moving_balance, balance_gain);
 				can_pair = sources[i]->number == 1 && sources[i + 1]->number == 2 &&
 				           ((sources[i]->format == 1 && sources[i + 1]->format == 1 && !left.clips.empty ()) || empty_pair) &&
 				           left.name == right.name && left.channels == 1 && right.channels == 1 &&
-				           (shared_gain || static_balance || variable_balance) && left.pan == .5 && right.pan == .5 &&
+				           (shared_gain || static_balance || gain_balanced || variable_balance) && left.pan == .5 && right.pan == .5 &&
 				           left.mute == right.mute && left.solo == right.solo &&
 				           left.pan_automation.points.empty () && right.pan_automation.points.empty () &&
 				           left.clips.size () == right.clips.size ();
@@ -258,7 +289,12 @@ struct LogicProject::Impl {
 			if (can_pair) {
 				auto& right = project.tracks[i + 2];
 				left.channels = 2;
-				if (variable_balance) {
+				if (gain_balanced) {
+					left.volume = common_gain_curve.points.front ().value;
+					left.volume_automation = std::move (common_gain_curve);
+					left.pan = static_pan;
+					project.report.push_back ({Disposition::Transformed, left.name, "Paired mono AAF levels restored as stereo gain automation and static balance"});
+				} else if (variable_balance) {
 					left.volume = balance_gain;
 					left.volume_automation.points.clear ();
 					left.pan = moving_balance.points.front ().value;

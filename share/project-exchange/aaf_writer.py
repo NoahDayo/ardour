@@ -371,16 +371,16 @@ def write_aaf(root, destination):
             balance = number(track, "pan")
             require(0 <= balance <= 1, "Invalid audio pan")
             require(channels == 1 or not pan_points or (not gain_points and gain > 0),
-                    "Stereo balance with gain automation or zero gain is not yet mapped to AAF")
-            require(channels == 1 or balance == .5 or not gain_points,
-                    "Stereo balance with gain automation is not yet mapped to AAF")
+                    "Moving stereo balance with gain automation or zero gain is not yet mapped to AAF")
             balance_curves = stereo_balance_points(pan_points, gain) if channels == 2 and pan_points else None
             for channel, (slot, sequence) in enumerate(zip(composition_slots, sequences)):
                 sequence.length = end
                 if balance_curves:
                     sequence = apply_automation(output, sequence, mono_gain, amplitude, balance_curves[channel])
                 elif gain_points:
-                    sequence = apply_automation(output, sequence, mono_gain, amplitude, gain_points)
+                    side = min(1, 2 * (1 - balance) if channel == 0 else 2 * balance) if channels == 2 else 1
+                    sequence = apply_automation(output, sequence, mono_gain, amplitude,
+                                                [(at, value * side, linear) for at, value, linear in gain_points])
                 else:
                     # Ardour's stereo balance panner leaves one side at unity
                     # and attenuates the other. AS-01 exposes separate mono

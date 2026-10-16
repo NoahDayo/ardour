@@ -457,14 +457,42 @@ class LogicWriterTest(unittest.TestCase):
             for (_, actual), expected in zip(points, levels):
                 self.assertAlmostEqual(actual, expected, delta=1e-6)
 
-    def test_rejects_stereo_balance_with_gain_automation(self):
+    def test_static_stereo_balance_with_gain_automation(self):
+        stereo = self.root.findall("AudioTrack")[1]
+        automation = ET.SubElement(stereo, "GainAutomation")
+        for at, value in ((0, .4), (2, .8)):
+            ET.SubElement(automation, "Point", time=str(at), value=str(value), linear="true")
+        for pan, levels in ((0, ((.4, .8), (0, 0))),
+                            (.25, ((.4, .8), (.2, .4))),
+                            (1, ((0, 0), (.4, .8)))):
+            with self.subTest(pan=pan):
+                self.output = self.directory / ("gain-balance-" + str(pan))
+                self.output.mkdir()
+                stereo.set("pan", str(pan))
+                result = self.run_writer()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                extracted = self.directory / ("extracted-" + str(pan))
+                extracted.mkdir()
+                result = subprocess.run([self.probe, str(self.output / "Project.aaf"), str(extracted)],
+                                        capture_output=True, text=True, encoding="utf-8", timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for track, expected in zip(json.loads(result.stdout)["tracks"][1:], levels):
+                    self.assertNotIn("pan_curve", track)
+                    self.assertEqual(track["gain_length"], 96000)
+                    self.assertEqual([(round(at * 96000), value) for at, value in track["gain_curve"]],
+                                     [(0, expected[0]), (96000, expected[1])])
+
+    def test_rejects_moving_stereo_balance_with_gain_automation(self):
         stereo = self.root.findall("AudioTrack")[1]
         stereo.set("pan", ".25")
         automation = ET.SubElement(stereo, "GainAutomation")
         ET.SubElement(automation, "Point", time="0", value=".5", linear="true")
+        pan = ET.SubElement(stereo, "PanAutomation")
+        ET.SubElement(pan, "Point", time="0", value=".25", linear="true")
+        ET.SubElement(pan, "Point", time="2", value=".75", linear="true")
         result = self.run_writer()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Stereo balance with gain automation", result.stderr)
+        self.assertIn("Moving stereo balance with gain automation", result.stderr)
 
     def test_rejects_zero_gain_stereo_balance_automation(self):
         stereo = self.root.findall("AudioTrack")[1]
