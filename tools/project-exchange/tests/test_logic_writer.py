@@ -408,8 +408,39 @@ class LogicWriterTest(unittest.TestCase):
         self.assertEqual(transition['length'], 6000)
         self.assertEqual(transition['points'], [[0, 1], [1, 1]])
 
+    def test_stereo_pairwise_overlap_preserves_both_channels(self):
+        track = self.root.findall("AudioTrack")[1]
+        track.findall("Clip")[1].set("time", "30000")
+        result = self.run_writer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        extracted = self.directory / "stereo-overlap-audio"
+        extracted.mkdir()
+        result = subprocess.run([self.probe, str(self.output / 'Project.aaf'), str(extracted)],
+                                capture_output=True, text=True, encoding='utf-8', timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tracks = json.loads(result.stdout)['tracks']
+        self.assertEqual(len(tracks), 3)
+        for channel in tracks[1:]:
+            self.assertEqual(channel['channels'], 1)
+            self.assertEqual([c['position'] for c in channel['clips']], [12000, 30000])
+            self.assertEqual([c['length'] for c in channel['clips']], [24000, 12000])
+            self.assertEqual(len(channel['transitions']), 1)
+            self.assertEqual(channel['transitions'][0]['length'], 6000)
+            self.assertEqual(channel['transitions'][0]['points'], [[0, 1], [1, 1]])
+
     def test_rejects_three_simultaneous_audio_clips(self):
         track = self.root.find("AudioTrack")
+        track.findall("Clip")[1].set("time", "30000")
+        third = ET.fromstring(ET.tostring(track.findall("Clip")[1]))
+        third.set("time", "32000")
+        third.set("length", "24000")
+        track.append(third)
+        result = self.run_writer()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("pairwise", result.stderr)
+
+    def test_rejects_three_simultaneous_stereo_clips(self):
+        track = self.root.findall("AudioTrack")[1]
         track.findall("Clip")[1].set("time", "30000")
         third = ET.fromstring(ET.tostring(track.findall("Clip")[1]))
         third.set("time", "32000")

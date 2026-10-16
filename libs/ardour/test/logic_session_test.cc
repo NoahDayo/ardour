@@ -90,6 +90,7 @@ class LogicSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST_SUITE (LogicSessionTest);
 	CPPUNIT_TEST (saved_session_export);
 	CPPUNIT_TEST (paired_mono_layout);
+	CPPUNIT_TEST (stereo_pairwise_overlap);
 	CPPUNIT_TEST (existing_destination);
 	CPPUNIT_TEST (missing_runtime);
 	CPPUNIT_TEST (writer_failure);
@@ -105,6 +106,7 @@ class LogicSessionTest : public CppUnit::TestFixture {
 public:
 	void saved_session_export ();
 	void paired_mono_layout ();
+	void stereo_pairwise_overlap ();
 	void existing_destination ();
 	void missing_runtime ();
 	void writer_failure ();
@@ -118,6 +120,63 @@ public:
 	void aaf_transitions ();
 };
 CPPUNIT_TEST_SUITE_REGISTRATION (LogicSessionTest);
+
+void LogicSessionTest::stereo_pairwise_overlap ()
+{
+	Fixture fixture;
+	const samplecnt_t rate = fixture.session->sample_rate ();
+	auto original = std::dynamic_pointer_cast<Track> (fixture.session->route_by_name ("Stereo"));
+	CPPUNIT_ASSERT (original);
+	auto regions = original->playlist ()->region_list ();
+	CPPUNIT_ASSERT_EQUAL (size_t (2), regions->size ());
+	for (auto const& region : *regions) {
+		auto audio = std::dynamic_pointer_cast<AudioRegion> (region);
+		CPPUNIT_ASSERT (audio);
+		audio->set_opaque (false);
+		if (audio->position_sample () > rate * 2) {
+			audio->set_position (Temporal::timepos_t (samplepos_t (rate * 3 / 2)));
+			audio->set_muted (false);
+		}
+	}
+	PX::SessionExchange::export_logic (*fixture.session, fixture.path ("StereoOverlap"), fixture.report);
+	PX::LogicProject aaf (fixture.path ("StereoOverlap/Project.aaf"));
+	CPPUNIT_ASSERT (!PX::has_unsupported_features (aaf.project ()));
+	CPPUNIT_ASSERT_EQUAL (size_t (2), aaf.project ().tracks.size ());
+	auto const& track = aaf.project ().tracks[1];
+	CPPUNIT_ASSERT_EQUAL (2u, track.channels);
+	CPPUNIT_ASSERT_EQUAL (size_t (2), track.clips.size ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (1.25, track.clips[0].position.value, 1.0 / rate);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (1.5, track.clips[1].position.value, 1.0 / rate);
+	CPPUNIT_ASSERT_EQUAL (size_t (1), aaf.project ().media.size ());
+	regions.reset (); original.reset ();
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("StereoOverlap/Project.aaf"),
+	                                                      "", fixture.path ("OverlapImported"), "OverlapImported", fixture.report);
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("OverlapImported"), "OverlapImported", nullptr, "", true));
+	AudioEngine::instance ()->set_session (fixture.session.get ());
+	auto restored = std::dynamic_pointer_cast<Track> (fixture.session->route_by_name ("Stereo"));
+	CPPUNIT_ASSERT (restored);
+	regions = restored->playlist ()->region_list ();
+	CPPUNIT_ASSERT_EQUAL (size_t (2), regions->size ());
+	for (unsigned channel = 0; channel < 2; ++channel) {
+		for (auto const& check : std::array<std::pair<double, double>, 3> {{{1.4, .125}, {1.6, .25}, {1.9, .125}}}) {
+			samplepos_t at = samplepos_t (check.first * rate);
+			float actual = 0;
+			for (auto const& region : *regions) {
+				auto audio = std::dynamic_pointer_cast<AudioRegion> (region);
+				CPPUNIT_ASSERT (audio && audio->n_channels () == 2);
+				if (at < audio->position_sample () || at >= audio->position_sample () + audio->length_samples ()) { continue; }
+				float sample = 0, mix = 0, gain = 0;
+				CPPUNIT_ASSERT_EQUAL (samplecnt_t (1), audio->read_at (&sample, &mix, &gain, at, 1, channel));
+				actual += sample;
+			}
+			CPPUNIT_ASSERT_DOUBLES_EQUAL (channel ? -check.second : check.second, actual, 1e-5);
+		}
+	}
+	regions.reset (); restored.reset ();
+}
 
 void LogicSessionTest::paired_mono_layout ()
 {

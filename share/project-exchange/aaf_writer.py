@@ -302,20 +302,22 @@ def write_aaf(root, destination):
                 master, slots, frames = media[clip.attrib["media"]]
                 require(len(slots) == channels and offset + length <= frames, "Invalid audio clip source range")
                 if position < end:
-                    require(channels == 1 and position > previous_position and position + length > end and position >= preceding_end,
-                            "Overlapping audio requires mono clips with pairwise, non-nested overlaps")
+                    require(position > previous_position and position + length > end and position >= preceding_end,
+                            "Overlapping audio requires pairwise, non-nested overlaps")
                     overlap = end - position
-                    transition = output.create.Transition("sound", overlap)
-                    transition.cutpoint = overlap // 2
-                    group = output.create.OperationGroup(dissolve, overlap, media_kind="sound")
                     # AS-01 12.19: Level(t)*B + Level(1-t)*A. Unity Level
-                    # sums the overlap; each clip keeps its own gain envelope.
-                    curve = output.create.VaryingValue(level, "Linear")
-                    curve.add_keyframe(0, "1")
-                    curve.add_keyframe(1, "1")
-                    group.parameters.append(curve)
-                    transition["OperationGroup"].value = group
-                    sequences[0].components.append(transition)
+                    # sums the overlap on each mono slot independently; each
+                    # clip keeps its own gain envelope.
+                    for sequence in sequences:
+                        transition = output.create.Transition("sound", overlap)
+                        transition.cutpoint = overlap // 2
+                        group = output.create.OperationGroup(dissolve, overlap, media_kind="sound")
+                        curve = output.create.VaryingValue(level, "Linear")
+                        curve.add_keyframe(0, "1")
+                        curve.add_keyframe(1, "1")
+                        group.parameters.append(curve)
+                        transition["OperationGroup"].value = group
+                        sequence.components.append(transition)
                 if position > end:
                     for sequence in sequences:
                         sequence.components.append(output.create.Filler("sound", position - end))
