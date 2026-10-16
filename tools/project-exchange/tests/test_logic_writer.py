@@ -419,6 +419,44 @@ class LogicWriterTest(unittest.TestCase):
                 self.assertEqual([track["gain"] for track in tracks[1:]], list(levels))
                 self.assertEqual([track.get("pan", .5) for track in tracks[1:]], [.5, .5])
 
+    def test_stereo_balance_ramp_and_hold_become_channel_curves(self):
+        stereo = self.root.findall("AudioTrack")[1]
+        automation = ET.SubElement(stereo, "PanAutomation")
+        for at, value, linear in ((0, .25, True), (2, .75, False), (4, .25, True)):
+            ET.SubElement(automation, "Point", time=str(at), value=str(value), linear=str(linear).lower())
+        result = self.run_writer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        extracted = self.directory / "extracted"
+        extracted.mkdir()
+        result = subprocess.run([self.probe, str(self.output / "Project.aaf"), str(extracted)],
+                                capture_output=True, text=True, encoding="utf-8", timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for track, levels in zip(json.loads(result.stdout)["tracks"][1:],
+                                 ((.75, .75, .375, .375, .75), (.375, .75, .75, .75, .375))):
+            self.assertNotIn("pan_curve", track)
+            self.assertEqual(track["gain_length"], 192000)
+            self.assertEqual([(round(at * 192000), value) for at, value in track["gain_curve"]],
+                             list(zip((0, 48000, 96000, 191999, 192000), levels)))
+
+    def test_stereo_balance_center_between_samples(self):
+        stereo = self.root.findall("AudioTrack")[1]
+        automation = ET.SubElement(stereo, "PanAutomation")
+        for at, value in ((0, .2), (3 / 48000, .9)):
+            ET.SubElement(automation, "Point", time=str(at), value=str(value), linear="true")
+        result = self.run_writer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        extracted = self.directory / "extracted"
+        extracted.mkdir()
+        result = subprocess.run([self.probe, str(self.output / "Project.aaf"), str(extracted)],
+                                capture_output=True, text=True, encoding="utf-8", timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for track, levels in zip(json.loads(result.stdout)["tracks"][1:],
+                                 ((.75, .75, .5, .15), (.3, .65, .75, .75))):
+            points = [(round(at * track["gain_length"]), value) for at, value in track["gain_curve"]]
+            self.assertEqual([at for at, _ in points], [0, 1, 2, 3])
+            for (_, actual), expected in zip(points, levels):
+                self.assertAlmostEqual(actual, expected, delta=1e-6)
+
     def test_rejects_stereo_balance_with_gain_automation(self):
         stereo = self.root.findall("AudioTrack")[1]
         stereo.set("pan", ".25")
@@ -427,6 +465,16 @@ class LogicWriterTest(unittest.TestCase):
         result = self.run_writer()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Stereo balance with gain automation", result.stderr)
+
+    def test_rejects_zero_gain_stereo_balance_automation(self):
+        stereo = self.root.findall("AudioTrack")[1]
+        stereo.set("gain", "0")
+        automation = ET.SubElement(stereo, "PanAutomation")
+        ET.SubElement(automation, "Point", time="0", value=".25", linear="true")
+        ET.SubElement(automation, "Point", time="2", value=".75", linear="true")
+        result = self.run_writer()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("zero gain", result.stderr)
 
     def test_rejects_audio_outside_source(self):
         self.root.find("AudioTrack/Clip").set("offset", "95000")

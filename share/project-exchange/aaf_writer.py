@@ -224,6 +224,25 @@ def automation_points(node, rate, pan=False):
     return points
 
 
+def stereo_balance_points(points, gain):
+    """Sample a balance ramp at its center kink, retaining exact sample values."""
+    expanded = []
+    for previous, following in zip(points, points[1:]):
+        expanded.append(previous)
+        start, first, linear = previous
+        end, last, _ = following
+        if linear and (first - .5) * (last - .5) < 0:
+            crossing = start + (end - start) * (.5 - first) / (last - first)
+            for at in sorted({math.floor(crossing), math.ceil(crossing)}):
+                if start < at < end:
+                    value = first + (last - first) * (at - start) / (end - start)
+                    expanded.append((at, value, True))
+    expanded.append(points[-1])
+    require(len(expanded) <= 100000, "Stereo balance automation exceeds the event limit")
+    return [[(at, gain * min(1, 2 * (1 - value) if channel == 0 else 2 * value), linear)
+             for at, value, linear in expanded] for channel in range(2)]
+
+
 def apply_automation(output, segment, definition, parameter, points):
     discrete = all(not p[2] for p in points[:-1])
     expanded = []
@@ -351,12 +370,16 @@ def write_aaf(root, destination):
             require(gain >= 0, "Invalid audio gain")
             balance = number(track, "pan")
             require(0 <= balance <= 1, "Invalid audio pan")
-            require(channels == 1 or not pan_points, "Stereo pan automation is not yet mapped to AAF")
+            require(channels == 1 or not pan_points or (not gain_points and gain > 0),
+                    "Stereo balance with gain automation or zero gain is not yet mapped to AAF")
             require(channels == 1 or balance == .5 or not gain_points,
                     "Stereo balance with gain automation is not yet mapped to AAF")
+            balance_curves = stereo_balance_points(pan_points, gain) if channels == 2 and pan_points else None
             for channel, (slot, sequence) in enumerate(zip(composition_slots, sequences)):
                 sequence.length = end
-                if gain_points:
+                if balance_curves:
+                    sequence = apply_automation(output, sequence, mono_gain, amplitude, balance_curves[channel])
+                elif gain_points:
                     sequence = apply_automation(output, sequence, mono_gain, amplitude, gain_points)
                 else:
                     # Ardour's stereo balance panner leaves one side at unity
@@ -365,7 +388,7 @@ def write_aaf(root, destination):
                     side = min(1, 2 * (1 - balance) if channel == 0 else 2 * balance) if channels == 2 else 1
                     if gain * side != 1:
                         sequence = apply_constant(output, sequence, mono_gain, amplitude, gain * side)
-                if pan_points:
+                if channels == 1 and pan_points:
                     sequence = apply_automation(output, sequence, mono_pan, pan, pan_points)
                 elif channels == 1 and balance != .5:
                     sequence = apply_constant(output, sequence, mono_pan, pan, balance)

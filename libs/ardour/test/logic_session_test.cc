@@ -92,6 +92,7 @@ class LogicSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (saved_session_export);
 	CPPUNIT_TEST (paired_mono_layout);
 	CPPUNIT_TEST (stereo_balance_roundtrip);
+	CPPUNIT_TEST (stereo_balance_automation_roundtrip);
 	CPPUNIT_TEST (stereo_pairwise_overlap);
 	CPPUNIT_TEST (existing_destination);
 	CPPUNIT_TEST (missing_runtime);
@@ -109,6 +110,7 @@ public:
 	void saved_session_export ();
 	void paired_mono_layout ();
 	void stereo_balance_roundtrip ();
+	void stereo_balance_automation_roundtrip ();
 	void stereo_pairwise_overlap ();
 	void existing_destination ();
 	void missing_runtime ();
@@ -215,6 +217,12 @@ void LogicSessionTest::paired_mono_layout ()
 	CPPUNIT_ASSERT_EQUAL (size_t (3), mismatched.project ().tracks.size ());
 	CPPUNIT_ASSERT_EQUAL (1u, mismatched.project ().tracks[1].channels);
 	CPPUNIT_ASSERT_EQUAL (1u, mismatched.project ().tracks[2].channels);
+	PX::LogicProject independent (fixture.path ("SplitFixtures/IndependentLevels.aaf"));
+	CPPUNIT_ASSERT_EQUAL (size_t (3), independent.project ().tracks.size ());
+	CPPUNIT_ASSERT_EQUAL (1u, independent.project ().tracks[1].channels);
+	CPPUNIT_ASSERT_EQUAL (1u, independent.project ().tracks[2].channels);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.625, PX::automation_value (independent.project ().tracks[1].volume_automation, .5625), 1e-7);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.3125, PX::automation_value (independent.project ().tracks[2].volume_automation, .5625), 1e-7);
 	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
 	fixture.session = PX::SessionExchange::import_logic (*AudioEngine::instance (), source, "", fixture.path ("SplitImported"), "SplitImported", fixture.report);
 	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
@@ -269,6 +277,55 @@ void LogicSessionTest::stereo_balance_roundtrip ()
 	auto found = std::find_if (returned.tracks.begin (), returned.tracks.end (), [] (const PX::Track& track) { return track.name == "Stereo"; });
 	CPPUNIT_ASSERT (found != returned.tracks.end ());
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (.25, found->pan, 1e-7);
+}
+
+void LogicSessionTest::stereo_balance_automation_roundtrip ()
+{
+	Fixture fixture;
+	const std::array<std::pair<double, double>, 3> positions {{{0, .25}, {1, .5}, {2, .75}}};
+	auto original = fixture.session->route_by_name ("Stereo");
+	CPPUNIT_ASSERT (original);
+	original->panner_shell ()->select_panner_by_uri ("http://ardour.org/plugin/panner_balance");
+	CPPUNIT_ASSERT_EQUAL (std::string ("http://ardour.org/plugin/panner_balance"), original->panner_shell ()->current_panner_uri ());
+	auto control = original->pan_azimuth_control ();
+	CPPUNIT_ASSERT (control);
+	control->alist ()->set_time_domain (Temporal::AudioTime);
+	CPPUNIT_ASSERT (control->alist ()->set_interpolation (Evoral::ControlList::Linear));
+	control->alist ()->add (Temporal::timepos_t (samplepos_t (0)), .25, false, false);
+	control->alist ()->add (Temporal::timepos_t (samplepos_t (fixture.session->sample_rate () * 2)), .75, false, false);
+	control->set_automation_state (Play);
+	PX::SessionExchange::export_logic (*fixture.session, fixture.path ("MovingBalance"), fixture.report);
+	PX::LogicProject aaf (fixture.path ("MovingBalance/Project.aaf"));
+	CPPUNIT_ASSERT (!PX::has_unsupported_features (aaf.project ()));
+	CPPUNIT_ASSERT_EQUAL (size_t (2), aaf.project ().tracks.size ());
+	auto const& track = aaf.project ().tracks[1];
+	CPPUNIT_ASSERT_EQUAL (2u, track.channels);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.75, track.volume, 2e-5);
+	CPPUNIT_ASSERT (track.volume_automation.points.empty ());
+	for (auto expected : positions) {
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (expected.second, PX::automation_value (track.pan_automation, expected.first), 2e-5);
+	}
+	control.reset (); original.reset ();
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("MovingBalance/Project.aaf"),
+	                                                       fixture.path ("MovingBalance/Project.mid"), fixture.path ("MovingReturn"), "MovingReturn", fixture.report);
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("MovingReturn"), "MovingReturn", nullptr, "", true));
+	AudioEngine::instance ()->set_session (fixture.session.get ());
+	auto restored = fixture.session->route_by_name ("Stereo");
+	CPPUNIT_ASSERT (restored && restored->pan_azimuth_control ());
+	for (auto expected : positions) {
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (expected.second, restored->pan_azimuth_control ()->alist ()->eval (
+		                              Temporal::timepos_t (samplepos_t (expected.first * fixture.session->sample_rate ()))), 2e-5);
+	}
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("moving-balance-return.dawproject"));
+	auto returned = PX::DawProject::read (fixture.path ("moving-balance-return.dawproject"));
+	auto found = std::find_if (returned.tracks.begin (), returned.tracks.end (), [] (const PX::Track& value) { return value.name == "Stereo"; });
+	CPPUNIT_ASSERT (found != returned.tracks.end ());
+	for (auto expected : positions) {
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (expected.second, PX::automation_value (found->pan_automation, expected.first), 2e-5);
+	}
 }
 
 void LogicSessionTest::aaf_transitions ()

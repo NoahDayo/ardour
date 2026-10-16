@@ -1571,10 +1571,11 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 		if (!track.plugins.empty ()) { unsupported (project, track.name, "AAF/MIDI cannot preserve VST3 plugin state; render processing first"); }
 		if (track.solo) { unsupported (project, track.name, "Clear solo before AAF/MIDI export"); }
 		if (track.kind == TrackKind::Audio && track.channels == 2 &&
-		    (!track.pan_automation.points.empty () || (track.pan != .5 && !track.volume_automation.points.empty ()))) {
-			unsupported (project, track.name, "Stereo balance automation or balance with gain automation cannot yet be represented in AAF export");
-		} else if (track.kind == TrackKind::Audio && track.channels == 2 && track.pan != .5) {
-			project.report.push_back ({Disposition::Transformed, track.name, "Static stereo balance becomes independent AAF left/right channel levels"});
+		    (((track.pan != .5 || !track.pan_automation.points.empty ()) && !track.volume_automation.points.empty ()) ||
+		     (!track.pan_automation.points.empty () && track.volume == 0))) {
+			unsupported (project, track.name, "Stereo balance with gain automation or zero gain cannot yet be represented in AAF export");
+		} else if (track.kind == TrackKind::Audio && track.channels == 2 && (track.pan != .5 || !track.pan_automation.points.empty ())) {
+			project.report.push_back ({Disposition::Transformed, track.name, "Stereo balance becomes independent AAF left/right channel levels"});
 		}
 		if (track.kind == TrackKind::MIDI && (track.volume != 1 || track.pan != .5 || track.mute || !track.volume_automation.points.empty () || !track.pan_automation.points.empty ())) {
 			unsupported (project, track.name, "MIDI track mixer settings cannot yet be represented in Standard MIDI Files");

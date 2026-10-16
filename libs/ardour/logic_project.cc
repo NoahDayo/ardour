@@ -174,6 +174,44 @@ struct LogicProject::Impl {
 			       a.duration == b.duration && a.offset.unit == b.offset.unit && a.offset.value == b.offset.value &&
 			       a.enabled == b.enabled && a.gain == b.gain && same_curve (a.envelope, b.envelope);
 		};
+		auto balance_curve = [] (const Track& left, const Track& right, double quantum, Automation& result, double& common) {
+			if (left.volume_automation.points.empty () && right.volume_automation.points.empty ()) { return false; }
+			if ((!left.volume_automation.points.empty () && left.volume_automation.unit != TimeUnit::Seconds) ||
+			    (!right.volume_automation.points.empty () && right.volume_automation.unit != TimeUnit::Seconds)) { return false; }
+			std::set<double> times {0};
+			for (auto const& point : left.volume_automation.points) { times.insert (point.time); }
+			for (auto const& point : right.volume_automation.points) { times.insert (point.time); }
+			if (times.size () > 100000) { return false; }
+			auto level = [] (const Track& track, double at) {
+				return track.volume_automation.points.empty () ? track.volume : automation_value (track.volume_automation, at);
+			};
+			common = std::max (level (left, 0), level (right, 0));
+			if (!std::isfinite (common) || common <= 0) { return false; }
+			double tolerance = std::max (1e-6, common * 2e-5);
+			auto valid = [&] (double at) {
+				double l = level (left, at), r = level (right, at);
+				return std::isfinite (l) && std::isfinite (r) && l >= 0 && r >= 0 &&
+				       std::fabs (std::max (l, r) - common) <= tolerance;
+			};
+			for (auto it = times.begin (); it != times.end (); ++it) {
+				if (!valid (*it)) { return false; }
+				auto next = std::next (it);
+				/* Colliding control times cannot be restored as distinct Ardour
+				 * sample-time events. Leave such AAF slots as separate mono tracks. */
+				if (next != times.end () && *next - *it < quantum * .5) { return false; }
+				if (next != times.end () && *next - *it > quantum * 1.5 && !valid ((*it + *next) / 2)) { return false; }
+			}
+			bool linear = false;
+			for (auto const& point : left.volume_automation.points) { linear |= point.linear; }
+			for (auto const& point : right.volume_automation.points) { linear |= point.linear; }
+			result.unit = TimeUnit::Seconds;
+			for (double at : times) {
+				double l = level (left, at), r = level (right, at);
+				double position = l >= r ? r / (2 * common) : 1 - l / (2 * common);
+				result.points.push_back ({at, std::max (0.0, std::min (1.0, position)), linear});
+			}
+			return true;
+		};
 		std::vector<Track> paired;
 		paired.reserve (project.tracks.size ());
 		paired.push_back (std::move (project.tracks.front ()));
@@ -181,6 +219,8 @@ struct LogicProject::Impl {
 			check ();
 			auto& left = project.tracks[i + 1];
 			bool can_pair = i + 1 < sources.size ();
+			Automation moving_balance; double balance_gain = 1;
+			bool variable_balance = false;
 			if (can_pair) {
 				auto& right = project.tracks[i + 2];
 				bool empty_pair = left.clips.empty () && right.clips.empty () &&
@@ -188,10 +228,12 @@ struct LogicProject::Impl {
 				                  !sources[i]->format && !sources[i + 1]->format;
 				bool shared_gain = left.volume == right.volume && same_curve (left.volume_automation, right.volume_automation);
 				bool static_balance = left.volume_automation.points.empty () && right.volume_automation.points.empty ();
+				variable_balance = !shared_gain && !static_balance &&
+				                   balance_curve (left, right, seconds (1, sources[i]->edit_rate), moving_balance, balance_gain);
 				can_pair = sources[i]->number == 1 && sources[i + 1]->number == 2 &&
 				           ((sources[i]->format == 1 && sources[i + 1]->format == 1 && !left.clips.empty ()) || empty_pair) &&
 				           left.name == right.name && left.channels == 1 && right.channels == 1 &&
-				           (shared_gain || static_balance) && left.pan == .5 && right.pan == .5 &&
+				           (shared_gain || static_balance || variable_balance) && left.pan == .5 && right.pan == .5 &&
 				           left.mute == right.mute && left.solo == right.solo &&
 				           left.pan_automation.points.empty () && right.pan_automation.points.empty () &&
 				           left.clips.size () == right.clips.size ();
@@ -216,7 +258,13 @@ struct LogicProject::Impl {
 			if (can_pair) {
 				auto& right = project.tracks[i + 2];
 				left.channels = 2;
-				if (left.volume != right.volume) {
+				if (variable_balance) {
+					left.volume = balance_gain;
+					left.volume_automation.points.clear ();
+					left.pan = moving_balance.points.front ().value;
+					left.pan_automation = std::move (moving_balance);
+					project.report.push_back ({Disposition::Transformed, left.name, "Paired mono AAF levels restored as editable stereo balance automation"});
+				} else if (left.volume != right.volume) {
 					/* Two AS-01 mono levels can represent Ardour's stereo balance:
 					 * one side stays at the common gain while the other is attenuated. */
 					double common = std::max (left.volume, right.volume);
