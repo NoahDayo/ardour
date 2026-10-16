@@ -17,6 +17,7 @@
 #include "ardour/logic_project.h"
 #include "ardour/midi_region.h"
 #include "ardour/midi_model.h"
+#include "ardour/panner_shell.h"
 #include "ardour/playlist.h"
 #include "ardour/track.h"
 #include "ardour/project_session.h"
@@ -90,6 +91,7 @@ class LogicSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST_SUITE (LogicSessionTest);
 	CPPUNIT_TEST (saved_session_export);
 	CPPUNIT_TEST (paired_mono_layout);
+	CPPUNIT_TEST (stereo_balance_roundtrip);
 	CPPUNIT_TEST (stereo_pairwise_overlap);
 	CPPUNIT_TEST (existing_destination);
 	CPPUNIT_TEST (missing_runtime);
@@ -106,6 +108,7 @@ class LogicSessionTest : public CppUnit::TestFixture {
 public:
 	void saved_session_export ();
 	void paired_mono_layout ();
+	void stereo_balance_roundtrip ();
 	void stereo_pairwise_overlap ();
 	void existing_destination ();
 	void missing_runtime ();
@@ -232,6 +235,40 @@ void LogicSessionTest::paired_mono_layout ()
 		CPPUNIT_ASSERT_EQUAL (samplecnt_t (samples.size ()), source->read (samples.data (), 0, samples.size ()));
 		for (float value : samples) { CPPUNIT_ASSERT_EQUAL (channel ? -.25f : .125f, value); }
 	}
+}
+
+void LogicSessionTest::stereo_balance_roundtrip ()
+{
+	Fixture fixture;
+	auto original = fixture.session->route_by_name ("Stereo");
+	CPPUNIT_ASSERT (original);
+	original->panner_shell ()->select_panner_by_uri ("http://ardour.org/plugin/panner_balance");
+	CPPUNIT_ASSERT_EQUAL (std::string ("http://ardour.org/plugin/panner_balance"), original->panner_shell ()->current_panner_uri ());
+	CPPUNIT_ASSERT (original->pan_azimuth_control ());
+	original->pan_azimuth_control ()->set_value (.25, PBD::Controllable::NoGroup);
+	PX::SessionExchange::export_logic (*fixture.session, fixture.path ("Balance"), fixture.report);
+	PX::LogicProject aaf (fixture.path ("Balance/Project.aaf"));
+	CPPUNIT_ASSERT (!PX::has_unsupported_features (aaf.project ()));
+	CPPUNIT_ASSERT_EQUAL (size_t (2), aaf.project ().tracks.size ());
+	CPPUNIT_ASSERT_EQUAL (2u, aaf.project ().tracks[1].channels);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.75, aaf.project ().tracks[1].volume, 1e-7);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.25, aaf.project ().tracks[1].pan, 1e-7);
+	original.reset ();
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("Balance/Project.aaf"),
+	                                                       fixture.path ("Balance/Project.mid"), fixture.path ("Returned"), "Returned", fixture.report);
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("Returned"), "Returned", nullptr, "", true));
+	AudioEngine::instance ()->set_session (fixture.session.get ());
+	auto restored = fixture.session->route_by_name ("Stereo");
+	CPPUNIT_ASSERT (restored && restored->pan_azimuth_control ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.25, restored->pan_azimuth_control ()->get_value (), 1e-7);
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("balance-return.dawproject"));
+	auto returned = PX::DawProject::read (fixture.path ("balance-return.dawproject"));
+	auto found = std::find_if (returned.tracks.begin (), returned.tracks.end (), [] (const PX::Track& track) { return track.name == "Stereo"; });
+	CPPUNIT_ASSERT (found != returned.tracks.end ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.25, found->pan, 1e-7);
 }
 
 void LogicSessionTest::aaf_transitions ()

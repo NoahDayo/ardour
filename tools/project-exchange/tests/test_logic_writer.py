@@ -401,11 +401,32 @@ class LogicWriterTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Overlapping notes", result.stderr)
 
-    def test_rejects_unmapped_stereo_balance(self):
-        self.root.findall("AudioTrack")[1].set("pan", ".25")
+    def test_stereo_balance_becomes_independent_channel_levels(self):
+        for pan, levels in ((0, (.75, 0)), (.25, (.75, .375)),
+                            (.75, (.375, .75)), (1, (0, .75))):
+            with self.subTest(pan=pan):
+                self.output = self.directory / ("balance-" + str(pan))
+                self.output.mkdir()
+                self.root.findall("AudioTrack")[1].set("pan", str(pan))
+                result = self.run_writer()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                extracted = self.directory / ("extracted-" + str(pan))
+                extracted.mkdir()
+                result = subprocess.run([self.probe, str(self.output / "Project.aaf"), str(extracted)],
+                                        capture_output=True, text=True, encoding="utf-8", timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                tracks = json.loads(result.stdout)["tracks"]
+                self.assertEqual([track["gain"] for track in tracks[1:]], list(levels))
+                self.assertEqual([track.get("pan", .5) for track in tracks[1:]], [.5, .5])
+
+    def test_rejects_stereo_balance_with_gain_automation(self):
+        stereo = self.root.findall("AudioTrack")[1]
+        stereo.set("pan", ".25")
+        automation = ET.SubElement(stereo, "GainAutomation")
+        ET.SubElement(automation, "Point", time="0", value=".5", linear="true")
         result = self.run_writer()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Stereo balance", result.stderr)
+        self.assertIn("Stereo balance with gain automation", result.stderr)
 
     def test_rejects_audio_outside_source(self):
         self.root.find("AudioTrack/Clip").set("offset", "95000")

@@ -186,12 +186,13 @@ struct LogicProject::Impl {
 				bool empty_pair = left.clips.empty () && right.clips.empty () &&
 				                  !sources[i]->timelineItems && !sources[i + 1]->timelineItems &&
 				                  !sources[i]->format && !sources[i + 1]->format;
+				bool shared_gain = left.volume == right.volume && same_curve (left.volume_automation, right.volume_automation);
+				bool static_balance = left.volume_automation.points.empty () && right.volume_automation.points.empty ();
 				can_pair = sources[i]->number == 1 && sources[i + 1]->number == 2 &&
 				           ((sources[i]->format == 1 && sources[i + 1]->format == 1 && !left.clips.empty ()) || empty_pair) &&
 				           left.name == right.name && left.channels == 1 && right.channels == 1 &&
-				           left.volume == right.volume && left.pan == .5 && right.pan == .5 &&
+				           (shared_gain || static_balance) && left.pan == .5 && right.pan == .5 &&
 				           left.mute == right.mute && left.solo == right.solo &&
-				           same_curve (left.volume_automation, right.volume_automation) &&
 				           left.pan_automation.points.empty () && right.pan_automation.points.empty () &&
 				           left.clips.size () == right.clips.size ();
 				if (can_pair) {
@@ -215,6 +216,14 @@ struct LogicProject::Impl {
 			if (can_pair) {
 				auto& right = project.tracks[i + 2];
 				left.channels = 2;
+				if (left.volume != right.volume) {
+					/* Two AS-01 mono levels can represent Ardour's stereo balance:
+					 * one side stays at the common gain while the other is attenuated. */
+					double common = std::max (left.volume, right.volume);
+					left.pan = common == 0 ? .5 : left.volume > right.volume ? right.volume / (2 * common) : 1 - left.volume / (2 * common);
+					left.volume = common;
+					project.report.push_back ({Disposition::Transformed, left.name, "Paired mono AAF levels restored as stereo balance"});
+				}
 				bool renamed_clip = false;
 				for (size_t c = 0; c < left.clips.size (); ++c) {
 					renamed_clip |= left.clips[c].name != right.clips[c].name;
