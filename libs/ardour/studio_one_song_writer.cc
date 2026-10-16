@@ -186,6 +186,8 @@ std::vector<Diagnostic> StudioOneSong::export_report (const Project& project)
 	validate_project (project); TimeMap timing (project); std::vector<Diagnostic> report = project.report;
 	auto unsupported = [&] (const std::string& name, const std::string& detail) { report.push_back ({Disposition::Unsupported, name, detail}); };
 	std::string master; for (auto const& track : project.tracks) { if (track.master) { master = track.id; } }
+	std::map<std::string, const Track*> routes;
+	for (auto const& track : project.tracks) { routes.emplace (track.id, &track); }
 	std::set<std::string> folders;
 	for (auto const& track : project.tracks) { if (track.kind == TrackKind::Folder) { folders.insert (track.id); } }
 	if (master.empty ()) { unsupported ("Master", "Native song export requires a stereo master output"); }
@@ -194,10 +196,18 @@ std::vector<Diagnostic> StudioOneSong::export_report (const Project& project)
 		if (track.channels > 2) { unsupported (track.name, "Native multichannel tracks require the stereo rendered mix option"); }
 		if (track.master) {
 			if (track.channels != 2 || track.pan != .5) { unsupported (track.name, "Native master export requires stereo with centered balance"); }
-		} else if (track.kind == TrackKind::Bus || (!track.parent.empty () && !folders.count (track.parent)) ||
-		           (!track.destination.empty () && track.destination != master)) {
-			unsupported (track.name, "Native bus routing requires the rendered mix option");
-		} else if (track.kind == TrackKind::Audio && track.destination.empty ()) { unsupported (track.name, "Connect the audio track to the master before native song export"); }
+		} else if (!track.parent.empty () && !folders.count (track.parent)) {
+			unsupported (track.name, "Native parent folder is missing");
+		} else if (track.kind == TrackKind::Bus && (track.channels != 2 || !track.parent.empty ())) {
+			unsupported (track.name, "Native bus export requires a stereo bus outside an arranger folder");
+		} else if (track.kind == TrackKind::Audio || track.kind == TrackKind::Bus) {
+			auto destination = routes.find (track.destination);
+			if (destination == routes.end () || destination->second->kind != TrackKind::Bus || track.destination.empty ()) {
+				unsupported (track.name, "Connect the audio track or bus to a master or audio bus before native song export");
+			}
+		} else if (!track.destination.empty () && track.destination != master) {
+			unsupported (track.name, "Native MIDI and folder routing requires the rendered mix option");
+		}
 		if (track.kind == TrackKind::Folder && (track.channels != 2 || track.volume != 1 || track.pan != .5 || track.mute || track.solo)) {
 			unsupported (track.name, "Native folder processing requires the rendered mix option");
 		}
@@ -293,8 +303,8 @@ void StudioOneSong::write (const StudioOneSongData& song, const std::string& fil
 		prop (info, "frameCount", std::round (media.duration * media.sample_rate)); prop (info, "bitDepth", bits);
 	}
 	Node audio_channels = node (mixer.root, "Attributes", "channels"), music_channels = node (midi.root, "Attributes", "channels");
-	Node outputs = node (audio_channels, "ChannelGroup"), audio_tracks = node (audio_channels, "ChannelGroup"), music_tracks = node (music_channels, "ChannelGroup");
-	prop (outputs, "name", "AudioOutput"); prop (audio_tracks, "name", "AudioTrack"); prop (music_tracks, "name", "MusicTrack");
+	Node outputs = node (audio_channels, "ChannelGroup"), audio_tracks = node (audio_channels, "ChannelGroup"), audio_groups = node (audio_channels, "ChannelGroup"), music_tracks = node (music_channels, "ChannelGroup");
+	prop (outputs, "name", "AudioOutput"); prop (audio_tracks, "name", "AudioTrack"); prop (audio_groups, "name", "AudioGroup"); prop (music_tracks, "name", "MusicTrack");
 	ProjectArchiveWriter archive (filename, ArchiveLimits (), cancel); unsigned track_number = 0, music_number = 0;
 	for (auto const& track : project.tracks) {
 		if (track.kind == TrackKind::Folder) {
@@ -305,15 +315,15 @@ void StudioOneSong::write (const StudioOneSongData& song, const std::string& fil
 			prop (node (folder, "Attributes", "AutomationRegionList"), "visible", 0);
 			continue;
 		}
-		check (cancel); bool musical = track.kind == TrackKind::MIDI;
-		Node channel = node (track.master ? outputs : musical ? music_tracks : audio_tracks, track.master ? "AudioOutputChannel" : musical ? "MusicTrackChannel" : "AudioTrackChannel");
+		check (cancel); bool musical = track.kind == TrackKind::MIDI, bus = track.kind == TrackKind::Bus;
+		Node channel = node (track.master ? outputs : bus ? audio_groups : musical ? music_tracks : audio_tracks, track.master ? "AudioOutputChannel" : bus ? "AudioGroupChannel" : musical ? "MusicTrackChannel" : "AudioTrackChannel");
 		unique_id (channel, "uniqueID", channels[track.id]); prop (channel, "name", "Channel" + std::to_string (++track_number)); prop (channel, "label", track.name);
 		prop (channel, "mute", track.mute); prop (channel, "solo", track.solo); prop (channel, "color", color (track.color));
 		if (!musical) {
 			prop (channel, "gain", track.volume); speaker (channel, "speakerType", track.channels);
 			if (!track.master) {
 				prop (channel, "pan", track.pan); prop (node (channel, "Attributes", "Panner"), "panX1", track.pan);
-				prop (node (channel, "Connection", "destination"), "objectID", master + "/Input");
+				prop (node (channel, "Connection", "destination"), "objectID", channels.at (track.destination) + "/Input");
 			}
 		}
 		if (!track.plugins.empty ()) {
@@ -329,7 +339,7 @@ void StudioOneSong::write (const StudioOneSongData& song, const std::string& fil
 			Node combinator = node (inserts, "Attributes", "Combinator"); prop (combinator, "name", "Combinator");
 			unique_id (combinator, "uniqueID", uid ());
 		}
-		if (track.master) { continue; }
+		if (track.master || bus) { continue; }
 		Node t = node (tracks, "MediaTrack"); prop (t, "mediaType", musical ? "Music" : "Audio"); prop (t, "tempoFollow", musical ? 2 : 0);
 		prop (t, "version", 1); prop (t, "trackID", track_ids.at (track.id)); prop (t, "trackNumber", track_number); prop (t, "timeFormat", musical ? 2 : 0); prop (t, "name", track.name); prop (t, "color", color (track.color));
 		if (!track.parent.empty ()) { prop (t, "parentFolder", track_ids.at (track.parent)); }

@@ -251,7 +251,7 @@ private:
 	}
 	void index_channels (Node n) {
 		if (Node uid = child (n, "UID", "uniqueID")) {
-			if (is (n, "AudioTrackChannel") || is (n, "MusicTrackChannel") || is (n, "AudioOutputChannel")) {
+			if (is (n, "AudioTrackChannel") || is (n, "MusicTrackChannel") || is (n, "AudioGroupChannel") || is (n, "AudioOutputChannel")) {
 				std::string key = value (uid, "uid"); require (!key.empty () && channels.emplace (key, n).second, "Duplicate native channel ID");
 			}
 		}
@@ -622,6 +622,13 @@ StudioOneSongData Reader::read ()
 			}
 		} else { unsupported (value (n, "name"), "Native track type is not yet supported: " + std::string (reinterpret_cast<const char*> (n->name))); }
 	}
+	for (auto const& pair : channels) { if (is (pair.second, "AudioGroupChannel")) {
+		Track bus; bus.id = pair.first; bus.kind = TrackKind::Bus; bus.name = value (pair.second, "label", "Bus");
+		bus.color = color (value (pair.second, "color")); channel (bus, pair.second);
+		std::string speaker = value (child (pair.second, "SpeakerSetup", "speakerType"), "type", "Stereo");
+		require (speaker == "Stereo", "Unsupported native bus speaker arrangement");
+		result.project.tracks.push_back (bus);
+	} }
 	for (auto const& pair : channels) { if (is (pair.second, "AudioOutputChannel")) {
 		Track master; master.id = pair.first; master.kind = TrackKind::Bus; master.master = true; master.name = value (pair.second, "label", "Master"); channel (master, pair.second);
 		result.project.tracks.push_back (master);
@@ -636,7 +643,7 @@ StudioOneSongData Reader::read ()
 	}
 	result.project.markers = result.markers;
 	validate_project (result.project);
-	result.project.report.push_back ({Disposition::Preserved, "Native Studio One song", "Audio, MIDI notes, clip positions and gain, track names, colors, static mixer controls and tempo/meter steps read directly from the .song file"});
+	result.project.report.push_back ({Disposition::Preserved, "Native Studio One song", "Audio, MIDI notes, clip positions and gain, track names, colors, static mixer controls, bus routing and tempo/meter steps read directly from the .song file"});
 	return result;
 }
 

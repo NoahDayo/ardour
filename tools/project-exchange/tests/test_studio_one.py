@@ -350,6 +350,60 @@ class NativeSongTest(unittest.TestCase):
         returned = self.read(path=output)["project"]
         self.assertEqual([t["parent"] for t in returned["tracks"][1:3]], [returned["tracks"][0]["id"]] * 2)
 
+    def test_native_audio_buses_preserve_nested_routing_in_both_directions(self):
+        # Studio Pro saves buses in AudioGroup, separate from arranger MediaTracks.
+        groups = ('<ChannelGroup name="AudioGroup">'
+                  '<AudioGroupChannel gain="0.8" pan="0.3" label="Drums" color="FF112233" mute="1" solo="0">'
+                  '<SpeakerSetup x:id="speakerType" type="Stereo"/>'
+                  '<UID x:id="uniqueID" uid="bus-drums"/>'
+                  '<Connection x:id="destination" objectID="bus-stem/Input"/>'
+                  '<Attributes x:id="Panner" panX1="0.3" panWidth="1"/></AudioGroupChannel>'
+                  '<AudioGroupChannel gain="0.6" pan="0.5" label="Stem" mute="0" solo="1">'
+                  '<SpeakerSetup x:id="speakerType" type="Stereo"/>'
+                  '<UID x:id="uniqueID" uid="bus-stem"/>'
+                  '<Connection x:id="destination" objectID="master/Input"/>'
+                  '</AudioGroupChannel></ChannelGroup>')
+        self.entries["Devices/audiomixer.xml"] = (MIXER.replace('objectID="master/Input"', 'objectID="bus-drums/Input"', 1)
+            .replace('<ChannelGroup name="AudioOutput">', groups + '<ChannelGroup name="AudioOutput">'))
+        before = self.read()["project"]
+        audio, midi, drums, stem, master = before["tracks"]
+        self.assertEqual([(t["name"], t["kind"], t["destination"]) for t in (drums, stem)],
+                         [("Drums", 3, stem["id"]), ("Stem", 3, master["id"])])
+        self.assertEqual((audio["destination"], drums["id"]), ("bus-drums", "bus-drums"))
+        self.assertEqual((drums["volume"], drums["pan"], drums["mute"], drums["color"]),
+                         (.8, .3, True, "#332211"))
+        self.assertFalse(any(d["disposition"] == 3 for d in before["report"]))
+        self.writable_fixture()
+        output, _ = self.export()
+        with zipfile.ZipFile(output) as archive:
+            mixer = self.native_xml(archive, "Devices/audiomixer.xml")
+            buses = mixer.findall(".//ChannelGroup[@name='AudioGroup']/AudioGroupChannel")
+            self.assertEqual([b.get("label") for b in buses], ["Drums", "Stem"])
+            uid = {b.get("label"): b.find("UID").get("uid") for b in buses}
+            self.assertEqual(buses[0].find("Connection").get("objectID"), uid["Stem"] + "/Input")
+            self.assertEqual(mixer.find(".//AudioTrackChannel/Connection").get("objectID"), uid["Drums"] + "/Input")
+            self.assertEqual(self.native_xml(archive, "Song/song.xml").findall(".//MediaTrack")[0].get("name"), "Audio")
+        after = self.read(path=output)["project"]
+        by_name = {t["name"]: t for t in after["tracks"]}
+        self.assertEqual(by_name["Audio"]["destination"], by_name["Drums"]["id"])
+        self.assertEqual(by_name["Drums"]["destination"], by_name["Stem"]["id"])
+        self.assertEqual(by_name["Stem"]["destination"], by_name["Main"]["id"])
+        self.assertEqual((by_name["Drums"]["volume"], by_name["Drums"]["pan"], by_name["Drums"]["mute"]),
+                         (.8, .3, True))
+        self.assertFalse(any(d["disposition"] == 3 for d in after["report"]))
+
+    def test_native_bus_dangling_and_cyclic_routes_are_refused(self):
+        group = ('<ChannelGroup name="AudioGroup"><AudioGroupChannel label="Bus">'
+                 '<UID x:id="uniqueID" uid="bus"/>'
+                 '<Connection x:id="destination" objectID="master/Input"/>'
+                 '</AudioGroupChannel></ChannelGroup>')
+        mixer = MIXER.replace('<ChannelGroup name="AudioOutput">', group + '<ChannelGroup name="AudioOutput">')
+        self.entries["Devices/audiomixer.xml"] = mixer.replace('objectID="master/Input"', 'objectID="missing/Input"', 1)
+        self.assertIn("Unknown track reference", self.read(status=1))
+        self.entries["Devices/audiomixer.xml"] = mixer.replace(
+            group, group.replace('objectID="master/Input"', 'objectID="bus/Input"'))
+        self.assertIn("Cyclic", self.read(status=1))
+
     def test_native_vst3_insert_reads_embedded_state_without_silent_loss(self):
         class_id = "00112233445566778899AABBCCDDEEFF"
         native_id = "{00112233-4455-6677-8899-AABBCCDDEEFF}"
