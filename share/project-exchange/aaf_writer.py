@@ -259,9 +259,7 @@ def write_aaf(root, destination):
         output.dictionary.register_def(level)
         dissolve = operation(output, "0c3bea41-fc05-11d2-8a29-0050040ef7d2", "MonoAudioDissolve", 2, level)
         mono_gain = operation(output, "9d2ea894-0968-11d3-8a38-0050040ef7d2", "MonoAudioGain", 1, amplitude)
-        stereo_gain = operation(output, "9d2ea895-0968-11d3-8a38-0050040ef7d2", "StereoAudioGain", 1, amplitude)
         mono_pan = operation(output, "9d2ea893-0968-11d3-8a38-0050040ef7d2", "MonoAudioPan", 1, pan)
-        combiner = operation(output, "6b46dd7a-132d-4856-ab21-8b751d8462ec", "AudioChannelCombiner", 2)
         composition = output.create.CompositionMob(root.attrib["name"])
         composition.usage = "Usage_TopLevel"
         output.content.mobs.append(composition)
@@ -291,9 +289,11 @@ def write_aaf(root, destination):
         for track in root.findall("AudioTrack"):
             channels = integer(track, "channels")
             require(channels in (1, 2), "Unsupported audio track channels")
-            slot = composition.create_sound_slot(rate)
-            slot.name = track.attrib["name"]
-            sequence = output.create.Sequence("sound")
+            composition_slots = [composition.create_sound_slot(rate) for _ in range(channels)]
+            sequences = [output.create.Sequence("sound") for _ in composition_slots]
+            for channel, slot in enumerate(composition_slots, 1):
+                slot.name = track.attrib["name"]
+                slot["PhysicalTrackNumber"].value = channel
             end = 0
             previous_position, preceding_end = -1, 0
             for clip in sorted(track.findall("Clip"), key=lambda c: integer(c, "time")):
@@ -315,14 +315,11 @@ def write_aaf(root, destination):
                     curve.add_keyframe(1, "1")
                     group.parameters.append(curve)
                     transition["OperationGroup"].value = group
-                    sequence.components.append(transition)
+                    sequences[0].components.append(transition)
                 if position > end:
-                    sequence.components.append(output.create.Filler("sound", position - end))
+                    for sequence in sequences:
+                        sequence.components.append(output.create.Filler("sound", position - end))
                 references = [master.create_source_clip(s.slot_id, start=offset, length=length, media_kind="sound") for s in slots]
-                segment = references[0]
-                if channels == 2:
-                    segment = output.create.OperationGroup(combiner, length, media_kind="sound")
-                    segment.segments.extend(references)
                 clip_gain = number(clip, "gain") if "gain" in clip.attrib else 1
                 require(clip_gain >= 0, "Invalid clip gain")
                 if clip.attrib.get("enabled") != "true":
@@ -331,36 +328,40 @@ def write_aaf(root, destination):
                 if clip_points:
                     require(clip_points[-1][0] <= length, "Clip automation extends outside clip")
                     clip_points = [(at, value * clip_gain, linear) for at, value, linear in clip_points]
-                    segment = apply_automation(output, segment, mono_gain if channels == 1 else stereo_gain, amplitude, clip_points)
-                elif clip_gain != 1:
-                    segment = apply_constant(output, segment, mono_gain if channels == 1 else stereo_gain, amplitude, clip_gain)
-                for field in ("name", "color"):
-                    if clip.attrib.get(field):
-                        segment["UserComments"].append(output.create.TaggedValue("Ardour." + field, clip.attrib[field]))
-                sequence.components.append(segment)
+                for sequence, segment in zip(sequences, references):
+                    if clip_points:
+                        segment = apply_automation(output, segment, mono_gain, amplitude, clip_points)
+                    elif clip_gain != 1:
+                        segment = apply_constant(output, segment, mono_gain, amplitude, clip_gain)
+                    for field in ("name", "color"):
+                        if clip.attrib.get(field):
+                            segment["UserComments"].append(output.create.TaggedValue("Ardour." + field, clip.attrib[field]))
+                    sequence.components.append(segment)
                 previous_position, preceding_end, end = position, end, position + length
             gain_points = automation_points(track.find("GainAutomation"), rate)
             pan_points = automation_points(track.find("PanAutomation"), rate, pan=True)
             automation_end = max([end, 1] + [p[0] for p in gain_points + pan_points])
             if (gain_points or pan_points) and automation_end > end:
-                sequence.components.append(output.create.Filler("sound", automation_end - end))
+                for sequence in sequences:
+                    sequence.components.append(output.create.Filler("sound", automation_end - end))
                 end = automation_end
-            sequence.length = end
             gain = number(track, "gain")
             require(gain >= 0, "Invalid audio gain")
-            if gain_points:
-                sequence = apply_automation(output, sequence, mono_gain if channels == 1 else stereo_gain, amplitude, gain_points)
-            elif gain != 1:
-                sequence = apply_constant(output, sequence, mono_gain if channels == 1 else stereo_gain, amplitude, gain)
             balance = number(track, "pan")
             require(0 <= balance <= 1, "Invalid audio pan")
-            if pan_points:
-                require(channels == 1, "Stereo pan automation is not yet mapped to AAF")
-                sequence = apply_automation(output, sequence, mono_pan, pan, pan_points)
-            elif balance != .5:
-                require(channels == 1, "Stereo balance is not yet mapped to AAF")
-                sequence = apply_constant(output, sequence, mono_pan, pan, balance)
-            slot.segment = sequence
+            require(channels == 1 or not pan_points, "Stereo pan automation is not yet mapped to AAF")
+            require(channels == 1 or balance == .5, "Stereo balance is not yet mapped to AAF")
+            for slot, sequence in zip(composition_slots, sequences):
+                sequence.length = end
+                if gain_points:
+                    sequence = apply_automation(output, sequence, mono_gain, amplitude, gain_points)
+                elif gain != 1:
+                    sequence = apply_constant(output, sequence, mono_gain, amplitude, gain)
+                if pan_points:
+                    sequence = apply_automation(output, sequence, mono_pan, pan, pan_points)
+                elif balance != .5:
+                    sequence = apply_constant(output, sequence, mono_pan, pan, balance)
+                slot.segment = sequence
             duration = max(duration, end)
         timecode = composition.create_timeline_slot(25)
         timecode.name = "Timecode"

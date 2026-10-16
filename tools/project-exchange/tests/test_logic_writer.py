@@ -140,17 +140,17 @@ class LogicWriterTest(unittest.TestCase):
                                 capture_output=True, text=True, encoding="utf-8", timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         parsed = json.loads(result.stdout)
-        self.assertEqual(len(parsed["tracks"]), 2)
-        for i, track in enumerate(parsed["tracks"], 1):
-            self.assertEqual(track["name"], "Audio %d café" % i)
-            self.assertEqual(track["channels"], i)
+        self.assertEqual(len(parsed["tracks"]), 3)
+        for i, track in enumerate(parsed["tracks"]):
+            self.assertEqual(track["name"], "Audio %d café" % (1 if i == 0 else 2))
+            self.assertEqual(track["channels"], 1)
             self.assertEqual(track["rate"], [48000, 1])
             self.assertEqual(track["gain"], .75)
-            if i == 1:
+            if i == 0:
                 self.assertEqual(track["pan"], .25)
             self.assertEqual(track["clips"], [
-                {"position": 12000, "length": 24000, "offset": 6000, "channels": i, "gain": .375},
-                {"position": 48000, "length": 12000, "offset": 30000, "channels": i, "gain": 0}])
+                {"position": 12000, "length": 24000, "offset": 6000, "channels": 1, "gain": .375},
+                {"position": 48000, "length": 12000, "offset": 30000, "channels": 1, "gain": 0}])
         for media in parsed["media"]:
             with wave.open(media["path"], "rb") as source:
                 self.assertEqual(source.getsampwidth(), 3)
@@ -169,7 +169,10 @@ class LogicWriterTest(unittest.TestCase):
         self.assertTrue(all(track[-1][0] == 16 * PPQN for track in tracks))
         with aaf2.open(str(self.output / "Project.aaf"), "r") as aaf:
             composition = next(aaf.content.toplevel())
-            tc = list(composition.slots)[-1].segment
+            slots = list(composition.slots)
+            self.assertEqual([slot["PhysicalTrackNumber"].value for slot in slots[:-1]], [1, 1, 2])
+            self.assertEqual([slot.name for slot in slots[:-1]], ["Audio 1 café", "Audio 2 café", "Audio 2 café"])
+            tc = slots[-1].segment
             self.assertEqual((tc.start, tc.length, tc.fps), (0, 240, 25))
         metadata = ET.parse(self.output / "Metadata.xml").getroot()
         self.assertTrue(all("path" not in media.attrib for media in metadata.findall("Media")))
@@ -301,7 +304,7 @@ class LogicWriterTest(unittest.TestCase):
                     self.assertIn("with an unresolved extension type", result.stderr)
                 else:
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(len(json.loads(result.stdout)["tracks"]), 2)
+                    self.assertEqual(len(json.loads(result.stdout)["tracks"]), 3)
 
     def test_reader_preserves_stereo_gain_automation(self):
         result = self.run_writer()

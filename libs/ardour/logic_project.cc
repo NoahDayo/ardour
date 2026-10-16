@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <set>
 #include <limits>
 #include <fcntl.h>
 #include <glib/gstdio.h>
@@ -157,6 +158,76 @@ struct LogicProject::Impl {
 		project.media.push_back ({id, "audio/" + id + ".wav", first->samplerate, unsigned (selected.size ()), double (first->length) / first->samplerate});
 		return id;
 	}
+	void pair_stereo_tracks (const std::vector<aafiAudioTrack*>& sources) {
+		/* AS-01 represents stereo composition audio as two mono slots. Only
+		 * regroup a consecutive L/R pair when its clips really select the two
+		 * channels of the same essence and all editable controls agree. */
+		auto same_curve = [] (const Automation& a, const Automation& b) {
+			if (a.unit != b.unit || a.points.size () != b.points.size ()) { return false; }
+			for (size_t i = 0; i < a.points.size (); ++i) {
+				if (a.points[i].time != b.points[i].time || a.points[i].value != b.points[i].value || a.points[i].linear != b.points[i].linear) { return false; }
+			}
+			return true;
+		};
+		auto same_clip = [&] (const Clip& a, const Clip& b) {
+			return a.name == b.name && a.kind == b.kind && a.position.unit == b.position.unit && a.position.value == b.position.value &&
+			       a.duration == b.duration && a.offset.unit == b.offset.unit && a.offset.value == b.offset.value &&
+			       a.enabled == b.enabled && a.gain == b.gain && same_curve (a.envelope, b.envelope);
+		};
+		std::vector<Track> paired;
+		paired.reserve (project.tracks.size ());
+		paired.push_back (std::move (project.tracks.front ()));
+		for (size_t i = 0; i < sources.size (); ++i) {
+			check ();
+			auto& left = project.tracks[i + 1];
+			bool can_pair = i + 1 < sources.size ();
+			if (can_pair) {
+				auto& right = project.tracks[i + 2];
+				can_pair = sources[i]->number == 1 && sources[i + 1]->number == 2 &&
+				           sources[i]->format == 1 && sources[i + 1]->format == 1 &&
+				           left.name == right.name && left.channels == 1 && right.channels == 1 &&
+				           left.volume == right.volume && left.pan == .5 && right.pan == .5 &&
+				           left.mute == right.mute && left.solo == right.solo &&
+				           same_curve (left.volume_automation, right.volume_automation) &&
+				           left.pan_automation.points.empty () && right.pan_automation.points.empty () &&
+				           !left.clips.empty () && left.clips.size () == right.clips.size ();
+				if (can_pair) {
+					for (size_t c = 0; c < left.clips.size (); ++c) {
+						auto a = channels.find (left.clips[c].media), b = channels.find (right.clips[c].media);
+						if (!same_clip (left.clips[c], right.clips[c]) || a == channels.end () || b == channels.end () ||
+						    a->second.size () != 1 || b->second.size () != 1 ||
+						    a->second[0].first != b->second[0].first || a->second[0].second != 0 || b->second[0].second != 1) {
+							can_pair = false; break;
+						}
+					}
+				}
+			}
+			if (can_pair) {
+				auto& right = project.tracks[i + 2];
+				left.channels = 2;
+				for (size_t c = 0; c < left.clips.size (); ++c) {
+					std::vector<Channel> selected {channels.at (left.clips[c].media)[0], channels.at (right.clips[c].media)[0]};
+					auto found = media_ids.find (selected);
+					if (found == media_ids.end ()) {
+						std::string id = "aaf-media-" + std::to_string (media_ids.size ());
+						media_ids[selected] = id; channels[id] = selected;
+						auto source = selected.front ().first;
+						project.media.push_back ({id, "audio/" + id + ".wav", source->samplerate, 2, double (source->length) / source->samplerate});
+						left.clips[c].media = id;
+					} else { left.clips[c].media = found->second; }
+				}
+				paired.push_back (std::move (left));
+				++i;
+			} else { paired.push_back (std::move (left)); }
+		}
+		project.tracks.swap (paired);
+		std::set<std::string> used_media;
+		for (auto const& track : project.tracks) {
+			for (auto const& clip : track.clips) { if (!clip.media.empty ()) { used_media.insert (clip.media); } }
+		}
+		auto& media = project.media;
+		media.erase (std::remove_if (media.begin (), media.end (), [&] (const Media& item) { return !used_media.count (item.id); }), media.end ());
+	}
 	std::string source_file (aafiAudioEssenceFile* source, const std::string& parent) {
 		auto found = extracted.find (source);
 		if (found != extracted.end ()) { return found->second; }
@@ -191,6 +262,7 @@ LogicProject::LogicProject (const std::string& path, const std::string& midi, Ca
 	project.tracks.push_back (master);
 	if (self.aaf->Video && self.aaf->Video->Tracks) { project.report.push_back ({Disposition::Unsupported, "AAF video", "Video tracks are not yet supported by project import"}); }
 	unsigned track_number = 0;
+	std::vector<aafiAudioTrack*> source_tracks;
 	aafiAudioTrack* track;
 	AAFI_foreachAudioTrack (self.aaf.get (), track) {
 		self.check ();
@@ -262,7 +334,9 @@ LogicProject::LogicProject (const std::string& path, const std::string& midi, Ca
 			}
 		}
 		project.tracks.push_back (output);
+		source_tracks.push_back (track);
 	}
+	self.pair_stereo_tracks (source_tracks);
 	double origin = self.aaf->Timecode ? seconds (self.aaf->Timecode->start, self.aaf->Timecode->edit_rate) : 0;
 	if (!midi.empty ()) { read_project_midi (midi, project, origin, cancel); }
 	else { project.report.push_back ({Disposition::Transformed, "Transport", "AAF carries no musical tempo map; imported audio uses 120 BPM and 4/4 until a companion MIDI file is supplied"}); }

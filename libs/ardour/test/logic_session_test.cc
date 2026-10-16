@@ -252,22 +252,35 @@ void LogicSessionTest::saved_session_export ()
 	CPPUNIT_ASSERT (aaf);
 	CPPUNIT_ASSERT_EQUAL (0, aafi_load_file (aaf.get (), Glib::build_filename (output, "Project.aaf").c_str ()));
 	aafiAudioTrack* track = aaf->Audio->Tracks;
-	CPPUNIT_ASSERT (track && !track->next);
-	CPPUNIT_ASSERT_EQUAL (std::string ("Stereo"), std::string (track->name));
-	CPPUNIT_ASSERT (track->gain);
-	CPPUNIT_ASSERT_DOUBLES_EQUAL (.75, aafRationalToDouble (track->gain->value[0]), 1e-8);
-	aafiTimelineItem* item;
-	unsigned count = 0;
-	AAFI_foreachTrackItem (track, item) {
-		aafiAudioClip* clip = aafi_timelineItemToAudioClip (item);
-		if (!clip) { continue; }
-		CPPUNIT_ASSERT_EQUAL (int64_t ((count ? 2.5 : 1.25) * fixture.session->sample_rate ()), clip->pos);
-		CPPUNIT_ASSERT_EQUAL (int64_t (.5 * fixture.session->sample_rate ()), clip->len);
-		CPPUNIT_ASSERT_EQUAL (int64_t (.375 * fixture.session->sample_rate ()), clip->essence_offset);
-		if (count) { CPPUNIT_ASSERT (clip->gain); CPPUNIT_ASSERT_EQUAL (0.0, aafRationalToDouble (clip->gain->value[0])); }
-		++count;
+	CPPUNIT_ASSERT (track && track->next && !track->next->next);
+	for (unsigned channel = 1; track; track = track->next, ++channel) {
+		CPPUNIT_ASSERT_EQUAL (std::string ("Stereo"), std::string (track->name));
+		CPPUNIT_ASSERT_EQUAL (channel, track->number);
+		CPPUNIT_ASSERT_EQUAL (uint16_t (1), track->format);
+		CPPUNIT_ASSERT (track->gain);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (.75, aafRationalToDouble (track->gain->value[0]), 1e-8);
+		aafiTimelineItem* item;
+		unsigned count = 0;
+		AAFI_foreachTrackItem (track, item) {
+			aafiAudioClip* clip = aafi_timelineItemToAudioClip (item);
+			if (!clip) { continue; }
+			CPPUNIT_ASSERT_EQUAL (int64_t ((count ? 2.5 : 1.25) * fixture.session->sample_rate ()), clip->pos);
+			CPPUNIT_ASSERT_EQUAL (int64_t (.5 * fixture.session->sample_rate ()), clip->len);
+			CPPUNIT_ASSERT_EQUAL (int64_t (.375 * fixture.session->sample_rate ()), clip->essence_offset);
+			CPPUNIT_ASSERT (clip->essencePointerList);
+			CPPUNIT_ASSERT_EQUAL (uint32_t (channel), clip->essencePointerList->essenceChannel);
+			if (count) { CPPUNIT_ASSERT (clip->gain); CPPUNIT_ASSERT_EQUAL (0.0, aafRationalToDouble (clip->gain->value[0])); }
+			++count;
+		}
+		CPPUNIT_ASSERT_EQUAL (2u, count);
 	}
-	CPPUNIT_ASSERT_EQUAL (2u, count);
+	PX::LogicProject regrouped (Glib::build_filename (output, "Project.aaf"));
+	CPPUNIT_ASSERT (!PX::has_unsupported_features (regrouped.project ()));
+	CPPUNIT_ASSERT_EQUAL (size_t (2), regrouped.project ().tracks.size ());
+	CPPUNIT_ASSERT_EQUAL (2u, regrouped.project ().tracks[1].channels);
+	CPPUNIT_ASSERT_EQUAL (size_t (2), regrouped.project ().tracks[1].clips.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (1), regrouped.project ().media.size ());
+	unsigned count = 0;
 	CPPUNIT_ASSERT_EQUAL (0, g_mkdir (fixture.path ("Extracted").c_str (), 0700));
 	aafiAudioEssenceFile* media;
 	count = 0;
