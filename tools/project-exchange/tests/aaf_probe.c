@@ -109,7 +109,16 @@ main (int argc, char** argv)
 				if (i) { putchar (','); }
 				printf ("[%.12g,%.12g]", aafRationalToDouble (fade->time_a[i]), aafRationalToDouble (fade->value_a[i]));
 			}
-			printf ("]}");
+			putchar (']');
+			if (fade->flags & AAFI_TRANS_TWO_CURVE) {
+				printf (",\"incoming_flags\":%u,\"incoming_points\":[", fade->flags_b);
+				for (int i = 0; i < fade->pts_cnt_b; ++i) {
+					if (i) { putchar (','); }
+					printf ("[%.12g,%.12g]", aafRationalToDouble (fade->time_b[i]), aafRationalToDouble (fade->value_b[i]));
+				}
+				putchar (']');
+			}
+			putchar ('}');
 		}
 		if (transitions) { putchar (']'); }
 		putchar ('}');

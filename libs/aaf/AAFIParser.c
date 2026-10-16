@@ -77,6 +77,27 @@
 
 static aafRational_t AAFI_DEFAULT_TC_EDIT_RATE = { 25, 1 };
 
+static int
+is_audio_dissolve (const aafUID_t* operation)
+{
+	return aafUIDCmp (operation, &AAFOperationDef_MonoAudioDissolve) ||
+	       aafUIDCmp (operation, &AAFOperationDef_TwoParameterMonoAudioDissolve);
+}
+
+/* A is the single Level, or OutgoingLevel; B is IncomingLevel. */
+static int
+dissolve_parameter (const aafUID_t* operation, const aafUID_t* parameter)
+{
+	if (aafUIDCmp (operation, &AAFOperationDef_MonoAudioDissolve)) {
+		return aafUIDCmp (parameter, &AAFParameterDef_Level) ? 1 : 0;
+	}
+	if (aafUIDCmp (operation, &AAFOperationDef_TwoParameterMonoAudioDissolve)) {
+		if (aafUIDCmp (parameter, &AAFParameterDef_OutgoingLevel)) { return 1; }
+		if (aafUIDCmp (parameter, &AAFParameterDef_IncomingLevel)) { return 2; }
+	}
+	return 0;
+}
+
 #define RESET_CTX__AudioGain(ctx)                      \
 	ctx.current_clip_is_muted              = 0;    \
 	ctx.current_clip_gain                  = NULL; \
@@ -1687,7 +1708,7 @@ parse_OperationGroup (AAF_Iface* aafi, aafObject* OpGroup, td* __ptd)
 		aafi->ctx.current_opgroup_affect_track = 0;
 	}
 
-	if (aafUIDCmp (OperationIdentification, &AAFOperationDef_MonoAudioDissolve)) {
+	if (is_audio_dissolve (OperationIdentification)) {
 		if (!aafUIDCmp (OpGroup->Parent->Class->ID, &AAFClassID_Transition)) {
 			TRACE_OBJ_ERROR (aafi, OpGroup, &__td, "Parent should be AAFClassID_Transition");
 			return -1;
@@ -1697,14 +1718,23 @@ parse_OperationGroup (AAF_Iface* aafi, aafObject* OpGroup, td* __ptd)
 
 		aafiTransition* Trans = aafi->ctx.current_transition;
 
-		/*
-		 * Mono Audio Dissolve (Fade, Cross Fade)
-		 *
-		 * The same parameter (curve/level) is applied to the outgoing fade on first
-		 * clip (if any) and to the incoming fade on second clip (if any).
-		 */
-
-		Trans->flags |= AAFI_TRANS_SINGLE_CURVE;
+		if (!Trans) { TRACE_OBJ_ERROR (aafi, OpGroup, &__td, "Missing transition context"); return -1; }
+		if (aafUIDCmp (OperationIdentification, &AAFOperationDef_TwoParameterMonoAudioDissolve)) {
+			Trans->flags |= AAFI_TRANS_TWO_CURVE | AAFI_INTERPOL_LINEAR;
+			Trans->value_a[0] = (aafRational_t) {1, 1};
+			Trans->value_a[1] = (aafRational_t) {0, 1};
+			Trans->time_b = calloc (2, sizeof (aafRational_t));
+			Trans->value_b = calloc (2, sizeof (aafRational_t));
+			if (!Trans->time_b || !Trans->value_b) { TRACE_OBJ_ERROR (aafi, OpGroup, &__td, "Could not allocate incoming dissolve curve"); return -1; }
+			Trans->pts_cnt_b = 2;
+			Trans->time_b[0] = (aafRational_t) {0, 1};
+			Trans->time_b[1] = (aafRational_t) {1, 1};
+			Trans->value_b[0] = (aafRational_t) {0, 1};
+			Trans->value_b[1] = (aafRational_t) {1, 1};
+			Trans->flags_b = AAFI_INTERPOL_LINEAR;
+		} else {
+			Trans->flags |= AAFI_TRANS_SINGLE_CURVE;
+		}
 
 		aafObject* Param      = NULL;
 		aafObject* Parameters = aaf_get_propertyValue (OpGroup, PID_OperationGroup_Parameters, &AAFTypeID_ParameterStrongReferenceVector);
@@ -1728,7 +1758,7 @@ parse_OperationGroup (AAF_Iface* aafi, aafObject* OpGroup, td* __ptd)
 
 		void* ComponentAttributeList = aaf_get_propertyValue (OpGroup, aaf_get_PropertyIDByName (aafi->aafd, "ComponentAttributeList"), &AAFTypeID_TaggedValueStrongReferenceVector);
 
-		if (ComponentAttributeList) {
+		if (ComponentAttributeList && (Trans->flags & AAFI_TRANS_SINGLE_CURVE)) {
 			int32_t* curveType = aaf_get_TaggedValueByName (aafi->aafd, ComponentAttributeList, "_ATN_AUDIO_DISSOLVE_CURVETYPE", &AAFTypeID_Int32);
 
 			if (curveType) {
@@ -1869,7 +1899,6 @@ parse_OperationGroup (AAF_Iface* aafi, aafObject* OpGroup, td* __ptd)
 		 * Unknown usage and implementation, not encountered yet:
 		 *
 		 * 	AAFOperationDef_MonoAudioMixdown
-		 * 	AAFOperationDef_TwoParameterMonoAudioDissolve
 		 * 	AAFOperationDef_StereoAudioDissolve
 		 */
 		debug ("Unsupported OperationIdentification: %s", aaft_OperationDefToText (aafi->aafd, OperationIdentification));
@@ -2007,7 +2036,22 @@ parse_ConstantValue (AAF_Iface* aafi, aafObject* ConstantValue, td* __ptd)
 
 	aafUID_t* mobUsageCode = aaf_get_propertyValue (ParentMob, PID_Mob_UsageCode, &AAFTypeID_UsageType);
 
-	if ((aafUIDCmp (OperationIdentification, &AAFOperationDef_MonoAudioGain) ||
+	int dissolve = dissolve_parameter (OperationIdentification, ParamDef);
+	if (dissolve) {
+		aafiTransition* Trans = aafi->ctx.current_transition;
+		aafRational_t* value = aaf_get_indirectValue (aafi->aafd, Indirect, &AAFTypeID_Rational);
+		if (!Trans || !value || !value->denominator || aafRationalToDouble (*value) < 0 || aafRationalToDouble (*value) > 1) {
+			TRACE_OBJ_ERROR (aafi, ConstantValue, &__td, "Invalid constant dissolve level"); return -1;
+		}
+		uint32_t* flags = dissolve == 2 ? &Trans->flags_b : &Trans->flags;
+		if (*flags & AAFI_TRANS_CUSTOM_CURVE) {
+			TRACE_OBJ_ERROR (aafi, ConstantValue, &__td, "Duplicate dissolve Level curve"); return -1;
+		}
+		aafRational_t* values = dissolve == 2 ? Trans->value_b : Trans->value_a;
+		values[0] = values[1] = *value;
+		*flags = (*flags & ~AAFI_INTERPOL_MASK) | AAFI_INTERPOL_LINEAR | AAFI_TRANS_CUSTOM_CURVE;
+		TRACE_OBJ (aafi, ConstantValue, &__td);
+	} else if ((aafUIDCmp (OperationIdentification, &AAFOperationDef_MonoAudioGain) ||
 	     aafUIDCmp (OperationIdentification, &AAFOperationDef_StereoAudioGain)) &&
 	    aafUIDCmp (ParamDef, &AAFParameterDef_Amplitude)) {
 		aafRational_t* value = aaf_get_indirectValue (aafi->aafd, Indirect, &AAFTypeID_Rational);
@@ -2154,7 +2198,7 @@ parse_VaryingValue (AAF_Iface* aafi, aafObject* VaryingValue, td* __ptd)
 	aafUID_t*           InterpolationIdentification = aaf_get_InterpolationIdentificationByWeakRef (aafi->aafd, InterpolationDefWeakRef);
 
 	if (!InterpolationIdentification) {
-		if (aafUIDCmp (OperationIdentification, &AAFOperationDef_MonoAudioDissolve)) {
+		if (is_audio_dissolve (OperationIdentification)) {
 			TRACE_OBJ_ERROR (aafi, VaryingValue, &__td, "Missing dissolve interpolation definition"); return -1;
 		}
 		TRACE_OBJ_WARNING (aafi, VaryingValue, &__td, "Could not retrieve InterpolationIdentification: Falling back to Linear");
@@ -2173,7 +2217,7 @@ parse_VaryingValue (AAF_Iface* aafi, aafObject* VaryingValue, td* __ptd)
 		interpolation = AAFI_INTERPOL_LOG;
 	} else {
 		TRACE_OBJ_WARNING (aafi, VaryingValue, &__td, "Unknown InterpolationIdentification value: Falling back to Linear");
-		if (aafUIDCmp (OperationIdentification, &AAFOperationDef_MonoAudioDissolve)) {
+		if (is_audio_dissolve (OperationIdentification)) {
 			TRACE_OBJ_ERROR (aafi, VaryingValue, &__td, "Unknown dissolve interpolation definition"); return -1;
 		}
 		interpolation = AAFI_INTERPOL_LINEAR;
@@ -2182,7 +2226,7 @@ parse_VaryingValue (AAF_Iface* aafi, aafObject* VaryingValue, td* __ptd)
 	aafObject* Points = aaf_get_propertyValue (VaryingValue, PID_VaryingValue_PointList, &AAFTypeID_ControlPointStrongReferenceVector);
 
 	if (!Points) {
-		if (aafUIDCmp (OperationIdentification, &AAFOperationDef_MonoAudioDissolve)) {
+		if (is_audio_dissolve (OperationIdentification)) {
 			TRACE_OBJ_ERROR (aafi, VaryingValue, &__td, "Missing dissolve PointList"); return -1;
 		}
 		/*
@@ -2193,8 +2237,8 @@ parse_VaryingValue (AAF_Iface* aafi, aafObject* VaryingValue, td* __ptd)
 		return -1;
 	}
 
-	if (aafUIDCmp (OperationIdentification, &AAFOperationDef_MonoAudioDissolve) &&
-	    aafUIDCmp (ParamDef, &AAFParameterDef_Level)) {
+	int dissolve = dissolve_parameter (OperationIdentification, ParamDef);
+	if (dissolve) {
 		aafiTransition* Trans = aafi->ctx.current_transition;
 
 		if (!Trans) {
@@ -2202,7 +2246,8 @@ parse_VaryingValue (AAF_Iface* aafi, aafObject* VaryingValue, td* __ptd)
 			return -1;
 		}
 
-		if ((Trans->flags & AAFI_TRANS_CUSTOM_CURVE) || !Points->Header ||
+		uint32_t* flags = dissolve == 2 ? &Trans->flags_b : &Trans->flags;
+		if ((*flags & AAFI_TRANS_CUSTOM_CURVE) || !Points->Header ||
 		    Points->Header->_entryCount < 2 || Points->Header->_entryCount > 100000) {
 			TRACE_OBJ_ERROR (aafi, VaryingValue, &__td, "Duplicate or excessive dissolve Level curve");
 			return -1;
@@ -2215,9 +2260,25 @@ parse_VaryingValue (AAF_Iface* aafi, aafObject* VaryingValue, td* __ptd)
 			TRACE_OBJ_ERROR (aafi, VaryingValue, &__td, "Invalid dissolve ControlPoints");
 			return -1;
 		}
-		free (Trans->time_a); free (Trans->value_a);
-		Trans->time_a = times; Trans->value_a = values; Trans->pts_cnt_a = count;
-		Trans->flags = (Trans->flags & ~AAFI_INTERPOL_MASK) | interpolation | AAFI_TRANS_CUSTOM_CURVE;
+		double previous = -1;
+		for (int i = 0; i < count; ++i) {
+			if (!times[i].denominator || !values[i].denominator ||
+			    aafRationalToDouble (times[i]) <= previous || aafRationalToDouble (times[i]) > 1 ||
+			    (i == 0 && times[i].numerator != 0) || (i == count - 1 && aafRationalToDouble (times[i]) != 1) ||
+			    aafRationalToDouble (values[i]) < 0 || aafRationalToDouble (values[i]) > 1) {
+				free (times); free (values);
+				TRACE_OBJ_ERROR (aafi, VaryingValue, &__td, "Invalid dissolve ControlPoints"); return -1;
+			}
+			previous = aafRationalToDouble (times[i]);
+		}
+		if (dissolve == 2) {
+			free (Trans->time_b); free (Trans->value_b);
+			Trans->time_b = times; Trans->value_b = values; Trans->pts_cnt_b = count;
+		} else {
+			free (Trans->time_a); free (Trans->value_a);
+			Trans->time_a = times; Trans->value_a = values; Trans->pts_cnt_a = count;
+		}
+		*flags = (*flags & ~AAFI_INTERPOL_MASK) | interpolation | AAFI_TRANS_CUSTOM_CURVE;
 
 		TRACE_OBJ (aafi, VaryingValue, &__td);
 	} else if ((aafUIDCmp (OperationIdentification, &AAFOperationDef_MonoAudioGain) ||

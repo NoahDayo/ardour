@@ -75,7 +75,7 @@ typedef enum aafiTransition_e {
 	AAFI_TRANS_FADE_IN  = 1 << 6,
 	AAFI_TRANS_FADE_OUT = 1 << 7,
 	AAFI_TRANS_XFADE    = 1 << 8,
-	AAFI_TRANS_CUSTOM_CURVE = 1 << 9, /* Explicit single-parameter Level curve. */
+	AAFI_TRANS_CUSTOM_CURVE = 1 << 9, /* Explicit curve, rather than its default. */
 
 } aafiTransition_e;
 
@@ -108,7 +108,8 @@ typedef enum aafiInterpolation_e {
  * With a single curve (AAFI_TRANS_SINGLE_CURVE), the same curve is mirrored and applied
  * as fade in and fade out to obtain a cross fade.
  *
- * Having two curves (AAFI_TRANS_TWO_CURVE) allows a cross fade to have one curve per fade.
+ * With two curves (AAFI_TRANS_TWO_CURVE), A is outgoing and B is incoming.
+ * Both are evaluated forward in transition time, with independent interpolation.
  *
  * A transition should have at least two points, one at time zero and one at time 1.
  */
@@ -174,7 +175,7 @@ typedef struct aafiTransition {
 	 * second curve. Used only if Transition has the AAFI_TRANS_TWO_CURVE flag.
 	 */
 
-	aafRational_t** time_b;
+	aafRational_t* time_b;
 
 	/**
 	 * Multiplier level values, each one applying at the corresponding indexed time.
@@ -182,7 +183,10 @@ typedef struct aafiTransition {
 	 * interpolation. Used only if Transitions has the AAFI_TRANS_TWO_CURVE flag.
 	 */
 
-	aafRational_t** value_b;
+	aafRational_t* value_b;
+
+	/* Interpolation and AAFI_TRANS_CUSTOM_CURVE for the incoming B curve. */
+	uint32_t flags_b;
 
 } aafiTransition;
 

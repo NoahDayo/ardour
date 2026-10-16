@@ -88,7 +88,7 @@ class AafWriterTest(unittest.TestCase):
     probe = None
 
     def test_dissolve_default_and_explicit_points(self):
-        for mode in ("default", "custom", "hold"):
+        for mode in ("default", "custom", "hold", "constant"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory(prefix="ardour-aaf-fades-") as work:
                 directory = Path(work)
                 transition_fixtures.make_transition_fixture(directory / "fades.aaf", mode=mode)
@@ -98,10 +98,39 @@ class AafWriterTest(unittest.TestCase):
                 self.assertEqual([(c["position"], c["length"], c["offset"]) for c in track["clips"]], [(24000, 96000, 6000), (96000, 96000, 18000)])
                 self.assertEqual([t["length"] for t in track["transitions"]], [12000, 24000, 24000])
                 expected = [[0, 0], [1, 1]] if mode == "default" else [[0, 0], [.25, .8], [.75, .9], [1, 1]]
+                if mode == "constant": expected = [[0, .5], [1, .5]]
                 for index, transition in enumerate(track["transitions"]):
                     self.assertEqual(transition["points"], expected)
                     self.assertTrue(transition["flags"] & (1 << (13 if mode == "hold" else 11)))
                     self.assertTrue(transition["flags"] & (1 << [6, 8, 7][index]))
+
+    def test_independent_dissolve_points(self):
+        for mode in ("two-default", "two-custom", "two-mixed", "two-reverse-mixed", "two-incoming-default", "two-outgoing-default", "two-constant"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(prefix="ardour-aaf-two-curves-") as work:
+                directory = Path(work)
+                transition_fixtures.make_transition_fixture(directory / "fades.aaf", mode=mode)
+                result = subprocess.run([self.probe, str(directory / "fades.aaf"), str(directory)], capture_output=True, text=True, encoding="utf-8", timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                fades = json.loads(result.stdout)["tracks"][0]["transitions"]
+                self.assertEqual(len(fades), 3)
+                outgoing = [[0, 1], [1, 0]] if mode in ("two-default", "two-outgoing-default") else [[0, .65], [.5, .3], [1, 0]]
+                incoming = [[0, 0], [1, 1]] if mode in ("two-default", "two-incoming-default") else [[0, 0], [.25, .8], [.75, .9], [1, .75]]
+                if mode == "two-constant": outgoing, incoming = [[0, .5], [1, .5]], [[0, .75], [1, .75]]
+                for fade in fades:
+                    self.assertTrue(fade["flags"] & (1 << 5))
+                    self.assertEqual(fade["points"], outgoing)
+                    self.assertEqual(fade["incoming_points"], incoming)
+                    self.assertEqual(fade["flags"] & 0xfc00, 1 << (13 if mode == "two-reverse-mixed" else 11))
+                    self.assertEqual(fade["incoming_flags"] & 0xfc00, 1 << (13 if mode == "two-mixed" else 11))
+
+    def test_invalid_independent_dissolve_rejected(self):
+        for mode in ("two-bad-incoming", "two-bad-outgoing", "two-missing-end", "two-one-point", "two-constant-negative", "two-constant-excess"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(prefix="ardour-aaf-two-curves-") as work:
+                directory = Path(work)
+                transition_fixtures.make_transition_fixture(directory / "fades.aaf", mode=mode)
+                result = subprocess.run([self.probe, str(directory / "fades.aaf"), str(directory)], capture_output=True, text=True, encoding="utf-8", timeout=30)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("dissolve", result.stderr)
 
     def test_incomplete_dissolve_level_rejected(self):
         with tempfile.TemporaryDirectory(prefix="ardour-aaf-fades-") as work:

@@ -127,7 +127,8 @@ void LogicSessionTest::aaf_transitions ()
 		PX::SessionExchange::export_logic (*fixture.session, fixture.path ("Fixtures"), fixture.report);
 	}
 	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
-	for (std::string mode : {"long", "bad-cut", "bad-level", "bad-time", "missing-end", "one-point", "spline"}) {
+	for (std::string mode : {"long", "bad-cut", "bad-level", "bad-time", "missing-end", "one-point", "spline",
+	                         "two-bad-incoming", "two-bad-outgoing", "two-missing-end", "two-one-point", "two-spline-in", "two-spline-out", "two-constant-negative", "two-constant-excess"}) {
 		CPPUNIT_ASSERT_THROW (PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("Fixtures/" + mode + ".aaf"), "", fixture.path ("Invalid"), "Invalid", fixture.report), PX::ExchangeError);
 		CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("Invalid"), Glib::FILE_TEST_EXISTS));
 		CPPUNIT_ASSERT (!AudioEngine::instance ()->session ());
@@ -135,6 +136,13 @@ void LogicSessionTest::aaf_transitions ()
 	unsigned calls = 0;
 	CPPUNIT_ASSERT_THROW (PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("Fixtures/custom.aaf"), "", fixture.path ("Cancelled"), "Cancelled", fixture.report, [&] { return ++calls > 8; }), PX::ArchiveCancelled);
 	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("Cancelled"), Glib::FILE_TEST_EXISTS));
+	calls = 0;
+	{ PX::LogicProject counted (fixture.path ("Fixtures/two-custom.aaf"), "", [&] { ++calls; return false; }); }
+	CPPUNIT_ASSERT (calls > 1);
+	unsigned cancel_at = calls / 2;
+	calls = 0;
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("Fixtures/two-custom.aaf"), "", fixture.path ("CancelledTwo"), "CancelledTwo", fixture.report, [&] { return ++calls >= cancel_at; }), PX::ArchiveCancelled);
+	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("CancelledTwo"), Glib::FILE_TEST_EXISTS));
 	auto verify = [&] (const std::string& mode) {
 		std::vector<float> sum (rate * 9 / 2, 0), mix (512), gain (512);
 		auto track = std::dynamic_pointer_cast<Track> (fixture.session->route_by_name ("Dissolves")); CPPUNIT_ASSERT (track);
@@ -153,7 +161,20 @@ void LogicSessionTest::aaf_transitions ()
 			}
 			for (size_t i = 0; i < pcm.size (); ++i) { sum[audio->position_sample () + i] += pcm[i]; }
 		}
-		auto level = [&] (double t) {
+		auto level = [&] (double t, bool incoming) {
+			if (mode.compare (0, 4, "two-") == 0) {
+				if (mode == "two-constant") { return incoming ? .75 : .5; }
+				if (mode == "two-default" || mode == (incoming ? "two-incoming-default" : "two-outgoing-default")) { return incoming ? t : 1 - t; }
+				if (!incoming) {
+					if (mode == "two-reverse-mixed") { return t < .5 ? .65 : t < 1 ? .3 : 0.0; }
+					return t < .5 ? .65 - .7 * t : .6 - .6 * t;
+				}
+				if (mode == "two-mixed") { return t < .25 ? 0.0 : t < .75 ? .8 : t < 1 ? .9 : .75; }
+				if (t < .25) { return t * 3.2; }
+				return t < .75 ? .8 + (t - .25) * .2 : .9 - (t - .75) * .6;
+			}
+			if (!incoming) { t = 1 - t; }
+			if (mode == "constant") { return .5; }
 			if (mode == "default") { return t; }
 			if (mode == "hold") { return t < .25 ? 0.0 : t < .75 ? .8 : t < 1 ? .9 : 1.0; }
 			if (t < .25) { return t * 3.2; }
@@ -163,13 +184,13 @@ void LogicSessionTest::aaf_transitions ()
 		for (samplepos_t i = 0; i < samplepos_t (sum.size ()); ++i) {
 			double expected = 0;
 			if (i >= rate / 2 && i < rate * 5 / 2) {
-				double in = i < rate * 3 / 4 ? level (double (i - rate / 2) / (rate / 4)) : 1;
-				double out = i >= rate * 2 ? level (double (rate * 5 / 2 - i) / (rate / 2)) : 1;
+				double in = i < rate * 3 / 4 ? level (double (i - rate / 2) / (rate / 4), true) : 1;
+				double out = i >= rate * 2 ? level (double (i - rate * 2) / (rate / 2), false) : 1;
 				expected += .125 * in * out;
 			}
 			if (i >= rate * 2 && i < rate * 4) {
-				double in = i < rate * 5 / 2 ? level (double (i - rate * 2) / (rate / 2)) : 1;
-				double out = i >= rate * 7 / 2 ? level (double (rate * 4 - i) / (rate / 2)) : 1;
+				double in = i < rate * 5 / 2 ? level (double (i - rate * 2) / (rate / 2), true) : 1;
+				double out = i >= rate * 7 / 2 ? level (double (i - rate * 7 / 2) / (rate / 2), false) : 1;
 				expected += .25 * in * out;
 			}
 			CPPUNIT_ASSERT_DOUBLES_EQUAL_MESSAGE (mode + " frame " + std::to_string (i), expected, sum[i], 3e-6);
@@ -181,7 +202,8 @@ void LogicSessionTest::aaf_transitions ()
 		fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path (name), name, nullptr, "", true));
 		AudioEngine::instance ()->set_session (fixture.session.get ());
 	};
-	for (std::string mode : {"default", "custom", "hold", "nonunity"}) {
+	for (std::string mode : {"default", "custom", "hold", "nonunity", "constant", "two-default", "two-custom", "two-mixed", "two-reverse-mixed",
+	                         "two-incoming-default", "two-outgoing-default", "two-constant"}) {
 		auto source = fixture.path ("Fixtures/" + mode + ".aaf"); auto bytes = Glib::file_get_contents (source);
 		fixture.session = PX::SessionExchange::import_logic (*AudioEngine::instance (), source, "", fixture.path (mode), mode, fixture.report);
 		reopen (mode); verify (mode);
@@ -198,6 +220,7 @@ void LogicSessionTest::aaf_transitions ()
 	}
 	for (auto const& name : Glib::Dir (fixture.root)) { CPPUNIT_ASSERT (name.find (".ardour-exchange-") != 0); }
 	std::cout << "AAF default, asymmetric, hold and non-unity fades preserve saved PCM through DAWproject and AAF returns; malformed/cancellation guards passed" << std::endl;
+	std::cout << "AAF independent outgoing/incoming curves preserve saved PCM with separate interpolation, optional defaults and constant levels; malformed/cancellation guards passed" << std::endl;
 }
 
 void LogicSessionTest::flat_mixer_automation ()

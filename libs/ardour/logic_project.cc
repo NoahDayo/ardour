@@ -80,20 +80,26 @@ struct LogicProject::Impl {
 	}
 	void transition (Clip& clip, const aafiTransition* fade, bool incoming, const aafRational_t* rate, double quantum) {
 		require (fade && fade->len > 0 && fade->cut_pt >= 0 && fade->cut_pt <= fade->len, "Invalid AAF transition length or cut point");
-		if ((fade->flags & AAFI_TRANS_CURVE_COUNT_MASK) != AAFI_TRANS_SINGLE_CURVE ||
-		    ((fade->flags & AAFI_INTERPOL_MASK) != AAFI_INTERPOL_LINEAR && (fade->flags & AAFI_INTERPOL_MASK) != AAFI_INTERPOL_CONSTANT)) {
+		unsigned curves = fade->flags & AAFI_TRANS_CURVE_COUNT_MASK;
+		bool second = curves == AAFI_TRANS_TWO_CURVE && incoming;
+		unsigned interpolation = (second ? fade->flags_b : fade->flags) & AAFI_INTERPOL_MASK;
+		if ((curves != AAFI_TRANS_SINGLE_CURVE && curves != AAFI_TRANS_TWO_CURVE) ||
+		    (interpolation != AAFI_INTERPOL_LINEAR && interpolation != AAFI_INTERPOL_CONSTANT)) {
 			project.report.push_back ({Disposition::Unsupported, clip.name, "AAF dissolve curve type requires explicit conversion"}); return;
 		}
-		require (fade->pts_cnt_a >= 2 && fade->pts_cnt_a <= 100000 && fade->time_a && fade->value_a, "Invalid AAF dissolve points");
+		int count = second ? fade->pts_cnt_b : fade->pts_cnt_a;
+		auto times = second ? fade->time_b : fade->time_a;
+		auto values = second ? fade->value_b : fade->value_a;
+		require (count >= 2 && count <= 100000 && times && values, "Invalid AAF dissolve points");
 		double duration = seconds (fade->len, rate);
 		require (duration <= clip.duration, "AAF transition exceeds its audio clip");
 		Automation curve {TimeUnit::Seconds, {}};
 		double previous = -1;
-		for (int i = 0; i < fade->pts_cnt_a; ++i) {
+		for (int i = 0; i < count; ++i) {
 			check ();
-			double t = rational (&fade->time_a[i]), v = rational (&fade->value_a[i]);
+			double t = rational (&times[i]), v = rational (&values[i]);
 			require (t >= 0 && t <= 1 && t > previous && v >= 0 && v <= 1, "Invalid AAF dissolve timeline or level");
-			curve.points.push_back ({t * duration, v, bool (fade->flags & AAFI_INTERPOL_LINEAR)}); previous = t;
+			curve.points.push_back ({t * duration, v, interpolation == AAFI_INTERPOL_LINEAR}); previous = t;
 		}
 		require (curve.points.front ().time == 0 && previous == 1, "AAF dissolve must define both endpoints");
 		// Linearize holds before reversing: Level(1-t) is left-continuous at
@@ -102,7 +108,7 @@ struct LogicProject::Impl {
 		duration = curve.points.back ().time;
 		double end = std::round (clip.duration / quantum) * quantum;
 		require (duration > 0 && end >= duration, "AAF transition is shorter than the audio resolution");
-		if (!incoming) {
+		if (!incoming && curves == AAFI_TRANS_SINGLE_CURVE) {
 			std::reverse (curve.points.begin (), curve.points.end ());
 			for (auto& point : curve.points) { point.time = duration - point.time; }
 		}
@@ -119,7 +125,9 @@ struct LogicProject::Impl {
 		curve.points.clear ();
 		for (auto const& point : points) { curve.points.push_back ({point.first, point.second, true}); }
 		clip.envelope = multiply_automation (clip.envelope, curve, quantum);
-		project.report.push_back ({Disposition::Transformed, clip.name, "AAF dissolve converted to an editable clip envelope; outgoing curve mirrored in time, edges and hold steps rounded to audio samples"});
+		project.report.push_back ({Disposition::Transformed, clip.name, curves == AAFI_TRANS_TWO_CURVE
+		                          ? "AAF independent incoming/outgoing dissolve curves converted to editable clip envelopes; edges and hold steps rounded to audio samples"
+		                          : "AAF dissolve converted to an editable clip envelope; outgoing curve mirrored in time, edges and hold steps rounded to audio samples"});
 	}
 	std::string media (aafiAudioClip* clip) {
 		std::vector<Channel> selected;
