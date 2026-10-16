@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Internal AAF/SMF writer. Input is Ardour's validated exchange manifest."""
 import argparse
+from bisect import bisect_right
 import hashlib
 from fractions import Fraction
 import math
@@ -243,6 +244,68 @@ def stereo_balance_points(points, gain):
              for at, value, linear in expanded] for channel in range(2)]
 
 
+def moving_stereo_levels(gains, pans, end):
+    """Approximate gain times balance at audio samples, splitting quadratic arcs."""
+    require(all(value > 0 for _, value, _ in gains),
+            "Moving stereo balance with zero gain automation cannot be restored")
+    gain_times, pan_times = ([point[0] for point in curve] for curve in (gains, pans))
+
+    def value(curve, curve_times, at):
+        index = bisect_right(curve_times, at) - 1
+        if index < 0:
+            return curve[0][1]
+        if index + 1 == len(curve) or not curve[index][2]:
+            return curve[index][1]
+        start, first, _ = curve[index]
+        stop, last, _ = curve[index + 1]
+        return first + (last - first) * (at - start) / (stop - start)
+
+    times = {0, end, *gain_times, *pan_times}
+    for curve in (gains, pans):
+        for previous, following in zip(curve, curve[1:]):
+            if not previous[2] and previous[1] != following[1] and following[0] - previous[0] > 1:
+                times.add(following[0] - 1)
+    for previous, following in zip(pans, pans[1:]):
+        start, first, linear = previous
+        stop, last, _ = following
+        if linear and (first - .5) * (last - .5) < 0:
+            crossing = start + (stop - start) * (.5 - first) / (last - first)
+            times.update((math.floor(crossing), math.ceil(crossing)))
+    times = sorted(at for at in times if 0 <= at <= end)
+    require(len(times) <= 100000, "Stereo mixer automation exceeds the event limit")
+    levels = {}
+    selected = set(times)
+
+    def at(time):
+        if time not in levels:
+            gain = value(gains, gain_times, time)
+            balance = value(pans, pan_times, time)
+            levels[time] = (gain * min(1, 2 * (1 - balance)), gain * min(1, 2 * balance))
+        return levels[time]
+
+    def refine(start, stop):
+        if stop - start <= 1:
+            return
+        first, last = at(start), at(stop)
+        middle = (start + stop) // 2
+        actual = at(middle)
+        fraction = (middle - start) / (stop - start)
+        error = max(abs(actual[channel] - (first[channel] + (last[channel] - first[channel]) * fraction))
+                    for channel in range(2))
+        tolerance = 1e-5 * max(1, *first, *last)
+        if error > tolerance:
+            require(len(selected) < 100000, "Stereo mixer automation exceeds the event limit")
+            selected.add(middle)
+            refine(start, middle)
+            refine(middle, stop)
+
+    for start, stop in zip(times, times[1:]):
+        refine(start, stop)
+    output_times = sorted(selected)
+    require(len(output_times) <= 100000, "Stereo mixer automation exceeds the event limit")
+    return [[(time, at(time)[channel], True) for time in output_times] for channel in range(2)]
+
+
 def apply_automation(output, segment, definition, parameter, points):
     discrete = all(not p[2] for p in points[:-1])
     expanded = []
@@ -279,6 +342,9 @@ def write_aaf(root, destination):
         dissolve = operation(output, "0c3bea41-fc05-11d2-8a29-0050040ef7d2", "MonoAudioDissolve", 2, level)
         mono_gain = operation(output, "9d2ea894-0968-11d3-8a38-0050040ef7d2", "MonoAudioGain", 1, amplitude)
         mono_pan = operation(output, "9d2ea893-0968-11d3-8a38-0050040ef7d2", "MonoAudioPan", 1, pan)
+        output.dictionary.register_def(output.create.TaggedValueDef(
+            "21a8ae63-2486-43b5-a6f2-54132481bcf3", "Ardour.StereoGainBalance",
+            "Paired mono channel levels encode Ardour stereo gain and balance automation"))
         composition = output.create.CompositionMob(root.attrib["name"])
         composition.usage = "Usage_TopLevel"
         output.content.mobs.append(composition)
@@ -370,12 +436,16 @@ def write_aaf(root, destination):
             require(gain >= 0, "Invalid audio gain")
             balance = number(track, "pan")
             require(0 <= balance <= 1, "Invalid audio pan")
-            require(channels == 1 or not pan_points or (not gain_points and gain > 0),
-                    "Moving stereo balance with gain automation or zero gain is not yet mapped to AAF")
-            balance_curves = stereo_balance_points(pan_points, gain) if channels == 2 and pan_points else None
+            require(channels == 1 or not pan_points or gain_points or gain > 0,
+                    "Moving stereo balance with zero gain is not yet mapped to AAF")
+            combined_curves = moving_stereo_levels(gain_points, pan_points, end) if channels == 2 and gain_points and pan_points else None
+            balance_curves = stereo_balance_points(pan_points, gain) if channels == 2 and pan_points and not combined_curves else None
             for channel, (slot, sequence) in enumerate(zip(composition_slots, sequences)):
                 sequence.length = end
-                if balance_curves:
+                if combined_curves:
+                    sequence = apply_automation(output, sequence, mono_gain, amplitude, combined_curves[channel])
+                    sequence["UserComments"].append(output.create.TaggedValue("Ardour.StereoGainBalance", "1"))
+                elif balance_curves:
                     sequence = apply_automation(output, sequence, mono_gain, amplitude, balance_curves[channel])
                 elif gain_points:
                     side = min(1, 2 * (1 - balance) if channel == 0 else 2 * balance) if channels == 2 else 1

@@ -240,6 +240,24 @@ struct LogicProject::Impl {
 			position = reference_left >= reference_right ? reference_right / 2 : 1 - reference_left / 2;
 			return true;
 		};
+		auto tagged_gain_balance = [] (const Track& left, const Track& right, double quantum, Automation& gain, Automation& balance) {
+			auto const& l = left.volume_automation.points;
+			auto const& r = right.volume_automation.points;
+			if (l.empty () || l.size () != r.size () || left.volume_automation.unit != TimeUnit::Seconds ||
+			    right.volume_automation.unit != TimeUnit::Seconds) { return false; }
+			gain.unit = balance.unit = TimeUnit::Seconds;
+			for (size_t i = 0; i < l.size (); ++i) {
+				if (l[i].time != r[i].time || l[i].linear != r[i].linear || !std::isfinite (l[i].value) ||
+				    !std::isfinite (r[i].value) || l[i].value < 0 || r[i].value < 0 ||
+				    (i && l[i].time - l[i - 1].time < quantum * .5)) { return false; }
+				double common = std::max (l[i].value, r[i].value);
+				if (common <= 0) { return false; }
+				double position = l[i].value >= r[i].value ? r[i].value / (2 * common) : 1 - l[i].value / (2 * common);
+				gain.points.push_back ({l[i].time, common, l[i].linear});
+				balance.points.push_back ({l[i].time, std::max (0.0, std::min (1.0, position)), l[i].linear});
+			}
+			return true;
+		};
 		std::vector<Track> paired;
 		paired.reserve (project.tracks.size ());
 		paired.push_back (std::move (project.tracks.front ()));
@@ -247,24 +265,30 @@ struct LogicProject::Impl {
 			check ();
 			auto& left = project.tracks[i + 1];
 			bool can_pair = i + 1 < sources.size ();
-			Automation moving_balance, common_gain_curve; double balance_gain = 1, static_pan = .5;
+			Automation moving_balance, common_gain_curve, tagged_balance; double balance_gain = 1, static_pan = .5;
 			bool variable_balance = false;
 			bool gain_balanced = false;
+			bool combined_gain_balance = false;
+			bool any_combined_tag = false;
 			if (can_pair) {
 				auto& right = project.tracks[i + 2];
+				any_combined_tag = sources[i]->ardour_stereo_gain_balance || sources[i + 1]->ardour_stereo_gain_balance;
+				combined_gain_balance = sources[i]->ardour_stereo_gain_balance && sources[i + 1]->ardour_stereo_gain_balance &&
+				                        tagged_gain_balance (left, right, seconds (1, sources[i]->edit_rate), common_gain_curve, tagged_balance);
 				bool empty_pair = left.clips.empty () && right.clips.empty () &&
 				                  !sources[i]->timelineItems && !sources[i + 1]->timelineItems &&
 				                  !sources[i]->format && !sources[i + 1]->format;
 				bool shared_gain = left.volume == right.volume && same_curve (left.volume_automation, right.volume_automation);
 				bool static_balance = left.volume_automation.points.empty () && right.volume_automation.points.empty ();
-				gain_balanced = !shared_gain && !static_balance &&
+				gain_balanced = !any_combined_tag && !shared_gain && !static_balance &&
 				                gain_with_balance (left, right, seconds (1, sources[i]->edit_rate), common_gain_curve, static_pan);
-				variable_balance = !shared_gain && !static_balance && !gain_balanced &&
+				variable_balance = !any_combined_tag && !shared_gain && !static_balance && !gain_balanced &&
 				                   balance_curve (left, right, seconds (1, sources[i]->edit_rate), moving_balance, balance_gain);
 				can_pair = sources[i]->number == 1 && sources[i + 1]->number == 2 &&
 				           ((sources[i]->format == 1 && sources[i + 1]->format == 1 && !left.clips.empty ()) || empty_pair) &&
 				           left.name == right.name && left.channels == 1 && right.channels == 1 &&
-				           (shared_gain || static_balance || gain_balanced || variable_balance) && left.pan == .5 && right.pan == .5 &&
+				           (any_combined_tag ? combined_gain_balance : (shared_gain || static_balance || gain_balanced || variable_balance)) &&
+				           left.pan == .5 && right.pan == .5 &&
 				           left.mute == right.mute && left.solo == right.solo &&
 				           left.pan_automation.points.empty () && right.pan_automation.points.empty () &&
 				           left.clips.size () == right.clips.size ();
@@ -289,7 +313,13 @@ struct LogicProject::Impl {
 			if (can_pair) {
 				auto& right = project.tracks[i + 2];
 				left.channels = 2;
-				if (gain_balanced) {
+				if (combined_gain_balance) {
+					left.volume = common_gain_curve.points.front ().value;
+					left.pan = tagged_balance.points.front ().value;
+					left.volume_automation = std::move (common_gain_curve);
+					left.pan_automation = std::move (tagged_balance);
+					project.report.push_back ({Disposition::Transformed, left.name, "Tagged paired AAF levels restored as editable stereo gain and balance automation"});
+				} else if (gain_balanced) {
 					left.volume = common_gain_curve.points.front ().value;
 					left.volume_automation = std::move (common_gain_curve);
 					left.pan = static_pan;
@@ -325,6 +355,9 @@ struct LogicProject::Impl {
 				paired.push_back (std::move (left));
 				++i;
 			} else {
+				if (any_combined_tag) {
+					project.report.push_back ({Disposition::Transformed, left.name, "Tagged stereo gain/balance could not be regrouped; channel levels remain separate mono tracks"});
+				}
 				if (!sources[i]->format && !sources[i]->timelineItems) {
 					project.report.push_back ({Disposition::Transformed, left.name, "Empty AAF track has no channel layout; imported as mono"});
 				}

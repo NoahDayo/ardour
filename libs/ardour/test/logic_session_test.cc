@@ -94,6 +94,7 @@ class LogicSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (stereo_balance_roundtrip);
 	CPPUNIT_TEST (stereo_balance_gain_automation_roundtrip);
 	CPPUNIT_TEST (stereo_balance_automation_roundtrip);
+	CPPUNIT_TEST (stereo_combined_automation_roundtrip);
 	CPPUNIT_TEST (stereo_pairwise_overlap);
 	CPPUNIT_TEST (existing_destination);
 	CPPUNIT_TEST (missing_runtime);
@@ -113,6 +114,7 @@ public:
 	void stereo_balance_roundtrip ();
 	void stereo_balance_gain_automation_roundtrip ();
 	void stereo_balance_automation_roundtrip ();
+	void stereo_combined_automation_roundtrip ();
 	void stereo_pairwise_overlap ();
 	void existing_destination ();
 	void missing_runtime ();
@@ -225,6 +227,13 @@ void LogicSessionTest::paired_mono_layout ()
 	CPPUNIT_ASSERT_EQUAL (1u, independent.project ().tracks[2].channels);
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (.625, PX::automation_value (independent.project ().tracks[1].volume_automation, .5625), 1e-7);
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (.3125, PX::automation_value (independent.project ().tracks[2].volume_automation, .5625), 1e-7);
+	PX::LogicProject partial (fixture.path ("SplitFixtures/PartialTag.aaf"));
+	CPPUNIT_ASSERT_EQUAL (size_t (3), partial.project ().tracks.size ());
+	CPPUNIT_ASSERT_EQUAL (1u, partial.project ().tracks[1].channels);
+	CPPUNIT_ASSERT_EQUAL (1u, partial.project ().tracks[2].channels);
+	CPPUNIT_ASSERT (std::any_of (partial.project ().report.begin (), partial.project ().report.end (), [] (const PX::Diagnostic& item) {
+		return item.detail.find ("channel levels remain separate mono tracks") != std::string::npos;
+	}));
 	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
 	fixture.session = PX::SessionExchange::import_logic (*AudioEngine::instance (), source, "", fixture.path ("SplitImported"), "SplitImported", fixture.report);
 	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
@@ -389,6 +398,62 @@ void LogicSessionTest::stereo_balance_automation_roundtrip ()
 	CPPUNIT_ASSERT (found != returned.tracks.end ());
 	for (auto expected : positions) {
 		CPPUNIT_ASSERT_DOUBLES_EQUAL (expected.second, PX::automation_value (found->pan_automation, expected.first), 2e-5);
+	}
+}
+
+void LogicSessionTest::stereo_combined_automation_roundtrip ()
+{
+	Fixture fixture;
+	auto original = fixture.session->route_by_name ("Stereo");
+	CPPUNIT_ASSERT (original);
+	original->panner_shell ()->select_panner_by_uri ("http://ardour.org/plugin/panner_balance");
+	auto gain = original->gain_control ();
+	auto pan = original->pan_azimuth_control ();
+	CPPUNIT_ASSERT (gain && pan);
+	gain->alist ()->set_time_domain (Temporal::AudioTime);
+	pan->alist ()->set_time_domain (Temporal::AudioTime);
+	CPPUNIT_ASSERT (gain->alist ()->set_interpolation (Evoral::ControlList::Linear));
+	CPPUNIT_ASSERT (pan->alist ()->set_interpolation (Evoral::ControlList::Linear));
+	const samplepos_t stop = fixture.session->sample_rate () * 2;
+	gain->alist ()->add (Temporal::timepos_t (samplepos_t (0)), .4, false, false);
+	gain->alist ()->add (Temporal::timepos_t (stop), .8, false, false);
+	pan->alist ()->add (Temporal::timepos_t (samplepos_t (0)), .25, false, false);
+	pan->alist ()->add (Temporal::timepos_t (stop), .75, false, false);
+	gain->set_automation_state (Play);
+	pan->set_automation_state (Play);
+	PX::SessionExchange::export_logic (*fixture.session, fixture.path ("CombinedBalance"), fixture.report);
+	PX::LogicProject aaf (fixture.path ("CombinedBalance/Project.aaf"));
+	CPPUNIT_ASSERT (!PX::has_unsupported_features (aaf.project ()));
+	CPPUNIT_ASSERT_EQUAL (size_t (2), aaf.project ().tracks.size ());
+	auto const& track = aaf.project ().tracks[1];
+	CPPUNIT_ASSERT_EQUAL (2u, track.channels);
+	CPPUNIT_ASSERT (!track.volume_automation.points.empty () && !track.pan_automation.points.empty ());
+	for (double seconds : {0.0, .25, .5, .75, 1.0, 1.25, 1.5, 1.75, 2.0}) {
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (.4 + .2 * seconds, PX::automation_value (track.volume_automation, seconds), 5e-5);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (.25 + .25 * seconds, PX::automation_value (track.pan_automation, seconds), 5e-5);
+	}
+	gain.reset (); pan.reset (); original.reset ();
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("CombinedBalance/Project.aaf"),
+	                                                       fixture.path ("CombinedBalance/Project.mid"), fixture.path ("CombinedReturn"), "CombinedReturn", fixture.report);
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("CombinedReturn"), "CombinedReturn", nullptr, "", true));
+	AudioEngine::instance ()->set_session (fixture.session.get ());
+	auto restored = fixture.session->route_by_name ("Stereo");
+	CPPUNIT_ASSERT (restored && restored->gain_control () && restored->pan_azimuth_control ());
+	for (double seconds : {0.0, .25, .5, .75, 1.0, 1.25, 1.5, 1.75, 2.0}) {
+		auto position = Temporal::timepos_t (samplepos_t (seconds * fixture.session->sample_rate ()));
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (.4 + .2 * seconds, restored->gain_control ()->alist ()->eval (position), 5e-5);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (.25 + .25 * seconds, restored->pan_azimuth_control ()->alist ()->eval (position), 5e-5);
+	}
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("combined-return.dawproject"));
+	auto returned = PX::DawProject::read (fixture.path ("combined-return.dawproject"));
+	auto found = std::find_if (returned.tracks.begin (), returned.tracks.end (), [] (const PX::Track& value) { return value.name == "Stereo"; });
+	CPPUNIT_ASSERT (found != returned.tracks.end ());
+	for (double seconds : {0.0, .25, .5, .75, 1.0, 1.25, 1.5, 1.75, 2.0}) {
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (.4 + .2 * seconds, PX::automation_value (found->volume_automation, seconds), 5e-5);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (.25 + .25 * seconds, PX::automation_value (found->pan_automation, seconds), 5e-5);
 	}
 }
 

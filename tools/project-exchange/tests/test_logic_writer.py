@@ -482,17 +482,90 @@ class LogicWriterTest(unittest.TestCase):
                     self.assertEqual([(round(at * 96000), value) for at, value in track["gain_curve"]],
                                      [(0, expected[0]), (96000, expected[1])])
 
-    def test_rejects_moving_stereo_balance_with_gain_automation(self):
+    def test_moving_stereo_balance_with_gain_automation(self):
         stereo = self.root.findall("AudioTrack")[1]
         stereo.set("pan", ".25")
         automation = ET.SubElement(stereo, "GainAutomation")
-        ET.SubElement(automation, "Point", time="0", value=".5", linear="true")
+        for at, value in ((0, .4), (2, .8)):
+            ET.SubElement(automation, "Point", time=str(at), value=str(value), linear="true")
+        pan = ET.SubElement(stereo, "PanAutomation")
+        ET.SubElement(pan, "Point", time="0", value=".25", linear="true")
+        ET.SubElement(pan, "Point", time="2", value=".75", linear="true")
+        result = self.run_writer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with aaf2.open(str(self.output / "Project.aaf"), "r") as aaf:
+            self.assertEqual(aaf.dictionary.lookup_taggedvaluedef("Ardour.StereoGainBalance").name,
+                             "Ardour.StereoGainBalance")
+            sound = [slot for slot in next(aaf.content.toplevel()).slots if slot.name == stereo.attrib["name"]]
+            self.assertEqual(len(sound), 2)
+            for slot in sound:
+                comments = slot.segment["UserComments"].value
+                self.assertEqual([(tag.name, tag.value) for tag in comments], [("Ardour.StereoGainBalance", "1")])
+        extracted = self.directory / "extracted"
+        extracted.mkdir()
+        result = subprocess.run([self.probe, str(self.output / "Project.aaf"), str(extracted)],
+                                capture_output=True, text=True, encoding="utf-8", timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tracks = json.loads(result.stdout)["tracks"][1:]
+
+        def sampled(curve, length, sample):
+            points = [(at * length, value) for at, value in curve]
+            before = points[0]
+            for after in points[1:]:
+                if sample <= after[0]:
+                    return before[1] + (after[1] - before[1]) * (sample - before[0]) / (after[0] - before[0])
+                before = after
+            return before[1]
+
+        for seconds in (0, .25, .5, .75, 1, 1.25, 1.5, 1.75, 2):
+            gain = .4 + .2 * seconds
+            balance = .25 + .25 * seconds
+            for channel, track in enumerate(tracks):
+                expected = gain * min(1, 2 * (1 - balance) if channel == 0 else 2 * balance)
+                actual = sampled(track["gain_curve"], track["gain_length"], seconds * 48000)
+                self.assertAlmostEqual(actual, expected, delta=2e-5)
+
+    def test_rejects_zero_gain_with_moving_stereo_balance(self):
+        stereo = self.root.findall("AudioTrack")[1]
+        gain = ET.SubElement(stereo, "GainAutomation")
+        ET.SubElement(gain, "Point", time="0", value=".5", linear="true")
+        ET.SubElement(gain, "Point", time="2", value="0", linear="true")
         pan = ET.SubElement(stereo, "PanAutomation")
         ET.SubElement(pan, "Point", time="0", value=".25", linear="true")
         ET.SubElement(pan, "Point", time="2", value=".75", linear="true")
         result = self.run_writer()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Moving stereo balance with gain automation", result.stderr)
+        self.assertIn("zero gain automation", result.stderr)
+
+    def test_moving_stereo_levels_fractional_center_and_hold_step(self):
+        stereo = self.root.findall("AudioTrack")[1]
+        gain = ET.SubElement(stereo, "GainAutomation")
+        pan = ET.SubElement(stereo, "PanAutomation")
+        for sample, value, linear in ((0, .4, True), (4, .8, False), (10, .6, True)):
+            ET.SubElement(gain, "Point", time=str(sample / 48000), value=str(value), linear=str(linear).lower())
+        for sample, value, linear in ((0, .2, True), (3, .9, False), (10, .1, True)):
+            ET.SubElement(pan, "Point", time=str(sample / 48000), value=str(value), linear=str(linear).lower())
+        result = self.run_writer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        extracted = self.directory / "extracted"
+        extracted.mkdir()
+        result = subprocess.run([self.probe, str(self.output / "Project.aaf"), str(extracted)],
+                                capture_output=True, text=True, encoding="utf-8", timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tracks = json.loads(result.stdout)["tracks"][1:]
+        for sample in range(11):
+            level = .4 + .1 * sample if sample <= 4 else .8 if sample < 10 else .6
+            balance = .2 + .7 * sample / 3 if sample <= 3 else .9 if sample < 10 else .1
+            for channel, track in enumerate(tracks):
+                points = [(round(at * track["gain_length"]), value) for at, value in track["gain_curve"]]
+                before = points[0]
+                for after in points[1:]:
+                    if sample <= after[0]:
+                        actual = before[1] + (after[1] - before[1]) * (sample - before[0]) / (after[0] - before[0])
+                        break
+                    before = after
+                expected = level * min(1, 2 * (1 - balance) if channel == 0 else 2 * balance)
+                self.assertAlmostEqual(actual, expected, delta=2e-5)
 
     def test_rejects_zero_gain_stereo_balance_automation(self):
         stereo = self.root.findall("AudioTrack")[1]

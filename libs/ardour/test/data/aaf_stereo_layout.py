@@ -11,7 +11,8 @@ if vendor.is_dir():
 import aaf2
 
 
-def make_fixture(path, rate=48000, right_position=12000, empty_pair=True, independent_levels=False):
+def make_fixture(path, rate=48000, right_position=12000, empty_pair=True, independent_levels=False,
+                 proportional_levels=False, one_tag=False):
     sources = []
     for name, sample in (("Left", 4096), ("Right", -8192)):
         source = path.with_name(path.stem + "-" + name + ".wav")
@@ -37,6 +38,9 @@ def make_fixture(path, rate=48000, right_position=12000, empty_pair=True, indepe
                 output.dictionary.register_def(definition)
                 output.dictionary.register_def(output.create.InterpolationDef(
                     "5b6c85a4-0ede-11d3-80a9-006008143e6f", "Linear"))
+                if one_tag:
+                    output.dictionary.register_def(output.create.TaggedValueDef(
+                        "21a8ae63-2486-43b5-a6f2-54132481bcf3", "Ardour.StereoGainBalance"))
             masters = []
             for source in sources:
                 master = output.create.MasterMob(source.stem)
@@ -57,9 +61,13 @@ def make_fixture(path, rate=48000, right_position=12000, empty_pair=True, indepe
                     group = output.create.OperationGroup(definition, slot.segment.length, media_kind="sound")
                     group.segments.append(slot.segment.copy())
                     curve = output.create.VaryingValue(amplitude, "Linear")
-                    for at, value in enumerate(("1/4", "3/4") if channel == 1 else ("1/2", "1/4")):
+                    levels = (("2/5", "4/5") if channel == 1 else ("1/5", "2/5")) if proportional_levels else (
+                        ("1/4", "3/4") if channel == 1 else ("1/2", "1/4"))
+                    for at, value in enumerate(levels):
                         curve.add_keyframe(at, value)
                     group.parameters.append(curve)
+                    if one_tag and channel == 1:
+                        group["UserComments"].append(output.create.TaggedValue("Ardour.StereoGainBalance", "1"))
                     slot.segment = group
             if empty_pair:
                 for channel in (1, 2):
@@ -78,6 +86,8 @@ if __name__ == "__main__":
     make_fixture(destination / "Project.aaf")
     make_fixture(destination / "Mismatched.aaf", right_position=12001, empty_pair=False)
     make_fixture(destination / "IndependentLevels.aaf", empty_pair=False, independent_levels=True)
+    make_fixture(destination / "PartialTag.aaf", empty_pair=False, independent_levels=True,
+                 proportional_levels=True, one_tag=True)
     (destination / "Project.mid").write_bytes(bytes.fromhex(
         "4d54686400000006000000014b004d54726b0000000400ff2f00"))
     (destination / "Metadata.xml").write_text("<IndependentFixture/>", encoding="utf-8")

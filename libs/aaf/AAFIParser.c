@@ -1842,6 +1842,11 @@ parse_OperationGroup (AAF_Iface* aafi, aafObject* OpGroup, td* __ptd)
 		RESET_CTX__AudioChannelCombiner (aafi->ctx);
 	} else if (aafUIDCmp (OperationIdentification, &AAFOperationDef_MonoAudioGain) ||
 	           aafUIDCmp (OperationIdentification, &AAFOperationDef_StereoAudioGain)) {
+		if (aafi->ctx.current_opgroup_affect_track && aafi->ctx.current_track) {
+			void* comments = aaf_get_propertyValue (OpGroup, PID_Component_UserComments, &AAFTypeID_TaggedValueStrongReferenceVector);
+			char* paired = comments ? aaf_get_TaggedValueByName (aafi->aafd, comments, "Ardour.StereoGainBalance", &AAFTypeID_String) : NULL;
+			if (paired && strcmp (paired, "1") == 0) { aafi->ctx.current_track->ardour_stereo_gain_balance = 1; }
+		}
 		aafObject* Param      = NULL;
 		aafObject* Parameters = aaf_get_propertyValue (OpGroup, PID_OperationGroup_Parameters, &AAFTypeID_ParameterStrongReferenceVector);
 
