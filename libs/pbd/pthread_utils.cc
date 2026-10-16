@@ -604,7 +604,8 @@ PBD::Thread::_run (void* arg)
 	}
 	pthread_mutex_unlock (&thread_map_lock);
 
-	pthread_exit (0);
+	/* Returning from the entry point performs the normal pthread cleanup.
+	 * Avoid an extra forced unwind through pthread_exit on Windows. */
 	return 0;
 }
 
