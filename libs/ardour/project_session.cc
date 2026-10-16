@@ -1694,7 +1694,9 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 		XMLNode& item = *root.add_child ("Marker");
 		item.set_property ("name", marker.name);
 		item.set_property ("time", timing.convert (marker.position, TimeUnit::Beats));
-		duration = std::max (duration, timing.convert (marker.position, TimeUnit::Seconds));
+		double seconds = timing.convert (marker.position, TimeUnit::Seconds);
+		item.set_property ("seconds", seconds);
+		duration = std::max (duration, seconds);
 	}
 	root.set_property ("duration", duration);
 	root.set_property ("durationBeats", timing.convert (Time (duration, TimeUnit::Seconds), TimeUnit::Beats));

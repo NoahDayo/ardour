@@ -365,6 +365,22 @@ def write_aaf(root, destination):
                     sequence = apply_constant(output, sequence, mono_pan, pan, balance)
                 slot.segment = sequence
             duration = max(duration, end)
+        markers = root.findall("Marker")
+        if markers:
+            slot = output.create.EventMobSlot(max((s.slot_id for s in composition.slots), default=0) + 1)
+            slot.name = "Markers"
+            slot.edit_rate = rate
+            sequence = output.create.Sequence("DescriptiveMetadata")
+            for source in sorted(markers, key=lambda m: number(m, "seconds")):
+                seconds = number(source, "seconds")
+                require(0 <= seconds <= (2**63 - 1) / rate, "Invalid AAF marker time")
+                position = math.floor(seconds * rate + 0.5)
+                marker = output.create.DescriptiveMarker()
+                marker["Position"].value = position
+                marker["Comment"].value = source.attrib["name"]
+                sequence.components.append(marker)
+            slot.segment = sequence
+            composition.slots.append(slot)
         timecode = composition.create_timeline_slot(25)
         timecode.name = "Timecode"
         timecode.segment = output.create.Timecode(25, length=max(1, math.ceil(duration * 25 / rate)))

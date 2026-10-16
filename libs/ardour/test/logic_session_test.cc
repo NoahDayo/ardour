@@ -393,6 +393,9 @@ void LogicSessionTest::saved_session_export ()
 	}
 	PX::LogicProject regrouped (Glib::build_filename (output, "Project.aaf"));
 	CPPUNIT_ASSERT (!PX::has_unsupported_features (regrouped.project ()));
+	CPPUNIT_ASSERT_EQUAL (size_t (1), regrouped.project ().markers.size ());
+	CPPUNIT_ASSERT_EQUAL (std::string (u8"Refrain 音楽"), regrouped.project ().markers[0].name);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (7.5, regrouped.project ().markers[0].position.value, 1.0 / fixture.session->sample_rate ());
 	CPPUNIT_ASSERT_EQUAL (size_t (2), regrouped.project ().tracks.size ());
 	CPPUNIT_ASSERT_EQUAL (2u, regrouped.project ().tracks[1].channels);
 	CPPUNIT_ASSERT_EQUAL (size_t (2), regrouped.project ().tracks[1].clips.size ());

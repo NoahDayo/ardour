@@ -87,7 +87,7 @@ def fixture(directory):
     clip = ET.SubElement(track, "Clip", name="Trimmed notes", time="8", length="4", offset="2", enabled="true")
     for at, length, key in ((0, 1, 59), (1, 2, 60), (3.5, .5, 64), (5.5, 2, 67), (6, 1, 72)):
         ET.SubElement(clip, "Note", time=str(at), length=str(length), key=str(key), channel="2", velocity="83", release="30")
-    ET.SubElement(root, "Marker", name="Refrain 音楽", time="16")
+    ET.SubElement(root, "Marker", name="Refrain 音楽", time="16", seconds="9.6")
     return root, checksums
 
 
@@ -128,6 +128,26 @@ class LogicWriterTest(unittest.TestCase):
         self.assertEqual(parsed["tracks"], [])
         self.assertEqual(parsed["media"], [])
         self.assertEqual(len(read_midi(self.output / "Project.mid")), 2)
+
+    def test_aaf_markers_keep_names_and_sample_positions(self):
+        ET.SubElement(self.root, "Marker", name="Same sample", time="16.00001", seconds="9.600001")
+        result = self.run_writer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with aaf2.open(str(self.output / "Project.aaf"), "r") as aaf:
+            composition = next(aaf.content.toplevel())
+            slot = next(slot for slot in composition.slots if isinstance(slot, aaf2.mobslots.EventMobSlot))
+            self.assertEqual([(m["Position"].value, m["Comment"].value) for m in slot.segment.components],
+                             [(460800, "Refrain 音楽"), (460800, "Same sample")])
+
+    def test_aaf_invalid_marker_time_is_refused(self):
+        for value in ("-1", "1e20", "NaN"):
+            with self.subTest(seconds=value):
+                self.output = self.directory / ("export-" + value)
+                self.output.mkdir()
+                self.root.find("Marker").set("seconds", value)
+                result = self.run_writer()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("marker time" if value != "NaN" else "Nonfinite seconds", result.stderr)
 
     def test_embedded_audio_mixer_and_coordinated_midi(self):
         result = self.run_writer()
@@ -170,8 +190,16 @@ class LogicWriterTest(unittest.TestCase):
         with aaf2.open(str(self.output / "Project.aaf"), "r") as aaf:
             composition = next(aaf.content.toplevel())
             slots = list(composition.slots)
-            self.assertEqual([slot["PhysicalTrackNumber"].value for slot in slots[:-1]], [1, 1, 2])
-            self.assertEqual([slot.name for slot in slots[:-1]], ["Audio 1 café", "Audio 2 café", "Audio 2 café"])
+            sound = [slot for slot in slots if slot.name.startswith("Audio ")]
+            self.assertEqual([slot["PhysicalTrackNumber"].value for slot in sound], [1, 1, 2])
+            self.assertEqual([slot.name for slot in sound], ["Audio 1 café", "Audio 2 café", "Audio 2 café"])
+            event = next(slot for slot in slots if isinstance(slot, aaf2.mobslots.EventMobSlot))
+            self.assertEqual(event.edit_rate, 48000)
+            self.assertEqual(event.name, "Markers")
+            marker, = event.segment.components
+            self.assertIsInstance(marker, aaf2.components.DescriptiveMarker)
+            self.assertEqual(marker["Position"].value, 460800)
+            self.assertEqual(marker["Comment"].value, "Refrain 音楽")
             tc = slots[-1].segment
             self.assertEqual((tc.start, tc.length, tc.fps), (0, 240, 25))
         metadata = ET.parse(self.output / "Metadata.xml").getroot()
