@@ -35,6 +35,13 @@ std::string id (Node node)
 	return result.empty () ? value (node, "id") : result;
 }
 
+std::string vst3_class_id (const std::string& native_uid)
+{
+	require (native_uid.size () == 38 && native_uid.front () == '{' && native_uid.back () == '}',
+	         "Invalid native VST3 class ID");
+	return canonical_vst3_id (native_uid.substr (1, 36));
+}
+
 bool is (Node node, const char* name) { return node && xmlStrEqual (node->name, BAD_CAST name); }
 std::vector<Node> children (Node node)
 {
@@ -231,6 +238,7 @@ private:
 	}
 	void check () { if (cancel && cancel ()) { throw ArchiveCancelled (); } }
 	void unsupported (const std::string& object, const std::string& detail) { result.project.report.push_back ({Disposition::Unsupported, object, detail}); }
+	void insert (Track&, Node);
 	void attributes (Node node, const std::set<std::string>& known, const std::string& object) {
 		for (xmlAttr* a = node->properties; a; a = a->next) {
 			std::string name (reinterpret_cast<const char*> (a->name));
@@ -347,6 +355,9 @@ void Reader::channel (Track& track, Node n)
 			for (Node item : children (c)) {
 				if (id (item) == "Presets" && children (item).empty ()) { continue; }
 				if (id (item) == "Combinator" && children (item).size () == 1 && is (children (item)[0], "UID")) { continue; }
+				if (identifier == "Inserts" && is (item, "Attributes") && id (item).empty () && !value (item, "name").empty ()) {
+					insert (track, item); continue;
+				}
 				unsupported (track.name, "Plug-ins or sends are not yet supported");
 			}
 		} else if (identifier == "Panner") {
@@ -362,6 +373,75 @@ void Reader::channel (Track& track, Node n)
 		require (slash != std::string::npos && target.substr (slash) == "/Input", "Unsupported native channel routing");
 		track.destination = target.substr (0, slash);
 	}
+}
+
+void Reader::insert (Track& track, Node item)
+{
+	check ();
+	/* A native FX slot contains a VST3 class UID and an embedded preset. The
+	 * ghost data also exists when the plug-in is unavailable in Studio Pro, so
+	 * it is metadata only; Ardour still checks the installed plug-in on import. */
+	for (xmlAttr* a = item->properties; a; a = a->next) {
+		std::string name (reinterpret_cast<const char*> (a->name));
+		if (name != "name" && name != "expanded") {
+			unsupported (track.name, "Native plug-in slot property is not yet supported: " + name); return;
+		}
+	}
+	if (value (item, "name").compare (0, 2, "FX") != 0) {
+		unsupported (track.name, "Native insert type is not yet supported"); return;
+	}
+	Node class_uid = child (item, "UID", "deviceClassID");
+	Node data = child (item, "Attributes", "deviceData");
+	Node ghost = child (item, "Attributes", "ghostData");
+	Node info = child (ghost, "Attributes", "classInfo");
+	Node presets = child (item, "Attributes", "Presets");
+	Node path = child (item, "String", "presetPath");
+	if (!class_uid || !data || !ghost || !info || !path || value (ghost, "presetType") != "vstpreset" ||
+	    value (info, "category") != "AudioEffect" || value (info, "subCategory") != "VST3") {
+		unsupported (track.name, "Native insert is not a supported VST3 audio effect with an embedded preset"); return;
+	}
+	attributes (data, {"x:id", "id", "name"}, track.name);
+	attributes (ghost, {"x:id", "id", "presetType"}, track.name);
+	attributes (info, {"x:id", "id", "classID", "name", "category", "subCategory"}, track.name);
+	attributes (path, {"x:id", "id", "text"}, track.name);
+	if (!children (info).empty () || !children (path).empty () || (presets && !children (presets).empty ())) {
+		unsupported (track.name, "Native insert metadata contains unsupported content"); return;
+	}
+	if (presets) { attributes (presets, {"x:id", "id", "pname", "dirty"}, track.name); }
+	for (Node part : children (data)) {
+		if (!is (part, "UID") || id (part) != "uniqueID") {
+			unsupported (track.name, "Native insert device data is not yet supported"); return;
+		}
+	}
+	for (Node part : children (ghost)) {
+		if ((is (part, "Attributes") && (id (part) == "classInfo" || id (part) == "IO"))) { continue; }
+		unsupported (track.name, "Native insert ghost data is not yet supported"); return;
+	}
+	for (Node part : children (item)) {
+		if ((is (part, "UID") && (id (part) == "uniqueID" || id (part) == "deviceClassID")) ||
+		    (is (part, "Attributes") && (id (part) == "deviceData" || id (part) == "ghostData" || id (part) == "Presets")) ||
+		    (is (part, "String") && id (part) == "presetPath")) { continue; }
+		unsupported (track.name, "Native insert contains unsupported processing"); return;
+	}
+	std::string native_id = value (class_uid, "uid");
+	if (vst3_class_id (native_id) != vst3_class_id (value (info, "classID"))) {
+		throw ExchangeError ("Native insert class IDs disagree");
+	}
+	PluginDevice plugin;
+	plugin.id = vst3_class_id (native_id);
+	plugin.name = value (info, "name", value (data, "name"));
+	plugin.role = "audioFX";
+	plugin.state_path = value (path, "text");
+	if (plugin.state_path.compare (0, 17, "Presets/Channels/") != 0 ||
+	    plugin.state_path.size () < 27 || plugin.state_path.substr (plugin.state_path.size () - 10) != ".vstpreset") {
+		throw ExchangeError ("Invalid native VST3 preset path");
+	}
+	if (!members.count (plugin.state_path)) { throw ExchangeError ("Missing native VST3 preset: " + plugin.state_path); }
+	plugin.state = archive.read_text (plugin.state_path, 64 * 1024 * 1024);
+	validate_vst3_state (plugin.id, plugin.state);
+	track.plugins.push_back (std::move (plugin));
+	result.project.report.push_back ({Disposition::Preserved, track.plugins.back ().name,
+	                                  "Embedded native VST3 preset found; the matching installed plug-in is checked during import"});
 }
 
 void Reader::track (Node n)

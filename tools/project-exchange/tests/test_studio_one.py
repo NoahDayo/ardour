@@ -350,6 +350,55 @@ class NativeSongTest(unittest.TestCase):
         returned = self.read(path=output)["project"]
         self.assertEqual([t["parent"] for t in returned["tracks"][1:3]], [returned["tracks"][0]["id"]] * 2)
 
+    def test_native_vst3_insert_reads_embedded_state_without_silent_loss(self):
+        class_id = "00112233445566778899AABBCCDDEEFF"
+        native_id = "{00112233-4455-6677-8899-AABBCCDDEEFF}"
+        member = "Presets/Channels/Stereo/1 - Shared Effect.vstpreset"
+        state = (b"VST3" + struct.pack("<I", 1) + class_id.encode() + struct.pack("<Q", 48) + b"List"
+                 + struct.pack("<I", 1) + b"Comp" + struct.pack("<QQ", 48, 0))
+        slot = ('<Attributes x:id="Inserts"><Attributes name="FX01">'
+                '<UID x:id="uniqueID" uid="{AAAA0000-0000-0000-0000-000000000001}"/>'
+                f'<UID x:id="deviceClassID" uid="{native_id}"/>'
+                '<Attributes x:id="deviceData" name="Shared Effect">'
+                '<UID x:id="uniqueID" uid="{AAAA0000-0000-0000-0000-000000000002}"/></Attributes>'
+                '<Attributes x:id="ghostData" presetType="vstpreset">'
+                f'<Attributes x:id="classInfo" classID="{native_id}" name="Shared Effect" '
+                'category="AudioEffect" subCategory="VST3"/>'
+                '<Attributes x:id="IO"><List x:id="audioInputs"><PortDescription label="Input"/></List>'
+                '<List x:id="audioOutputs"><PortDescription label="Output"/></List></Attributes></Attributes>'
+                '<Attributes x:id="Presets" pname="default" dirty="1"/>'
+                f'<String x:id="presetPath" text="{member}"/></Attributes>'
+                '<Attributes x:id="Presets" pname="default" dirty="0"/>'
+                '<Attributes x:id="Combinator"><UID x:id="uniqueID" uid="{AAAA0000-0000-0000-0000-000000000003}"/>'
+                '</Attributes></Attributes>')
+        self.entries["Devices/audiomixer.xml"] = MIXER.replace('<Connection x:id="destination"', slot + '<Connection x:id="destination"')
+        self.entries[member] = state
+        plugin = self.read()["project"]["tracks"][0]["plugins"][0]
+        self.assertEqual((plugin["id"], plugin["name"], plugin["role"], plugin["state_path"], plugin["state_size"]),
+                         (class_id, "Shared Effect", "audioFX", member, len(state)))
+        self.assertEqual(plugin["enabled"], True)
+        self.assertFalse(any(d["disposition"] == 3 for d in self.read()["project"]["report"]))
+        self.writable_fixture()
+        output, _ = self.export()
+        with zipfile.ZipFile(output) as archive:
+            mixer = self.native_xml(archive, "Devices/audiomixer.xml")
+            slot = mixer.find(".//AudioTrackChannel/Attributes[@id='Inserts']/Attributes[@name='FX01']")
+            self.assertIsNotNone(slot)
+            self.assertEqual(slot.find("UID[@id='deviceClassID']").get("uid"), native_id)
+            exported_member = slot.find("String[@id='presetPath']").get("text")
+            self.assertEqual(archive.read(exported_member), state)
+        returned = self.read(path=output)["project"]["tracks"][0]["plugins"][0]
+        self.assertEqual((returned["id"], returned["name"], returned["state_size"]),
+                         (class_id, "Shared Effect", len(state)))
+
+        self.entries[member] = state[:8] + b"F" + state[9:]
+        self.assertIn("class ID does not match", self.read(status=1))
+        self.entries.pop(member)
+        self.assertIn("Missing native VST3 preset", self.read(status=1))
+        self.entries[member] = state
+        self.entries["Devices/audiomixer.xml"] = self.entries["Devices/audiomixer.xml"].replace('name="FX01"', 'name="FX01" bypass="1"')
+        self.assertTrue(any(d["disposition"] == 3 for d in self.read()["project"]["report"]))
+
     def test_folder_content_and_unknown_parent_are_not_discarded(self):
         folder = '<FolderTrack trackID="band" name="Band"><Attributes x:id="AutomationRegionList"/></FolderTrack>'
         self.entries["Song/song.xml"] = SONG.replace('<MediaTrack trackID="audio"', folder + '<MediaTrack trackID="audio" parentFolder="band"')

@@ -1339,7 +1339,12 @@ void ProjectSessionTest::vst3_plugin_exchange ()
 	}
 	CPPUNIT_ASSERT_MESSAGE ("Requested VST3 test plugin was not discovered", info);
 	CPPUNIT_ASSERT (info->is_effect ());
-	package (fixture, example (fixture));
+	auto project = example (fixture);
+	for (auto& track : project.tracks) {
+		if (!track.master) { track.destination = "master"; }
+		for (auto& clip : track.clips) { for (auto& note : clip.notes) { note.channel = 0; note.release_velocity = 64.0 / 127; } }
+	}
+	package (fixture, project);
 	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"),
 	                                                       fixture.path ("Original"), "Exchange", fixture.report);
 	std::shared_ptr<Route> route;
@@ -1458,6 +1463,28 @@ void ProjectSessionTest::vst3_plugin_exchange ()
 	CPPUNIT_ASSERT_EQUAL (devices[0].state, track_named (returned, "Stereo").plugins.at (0).state);
 	CPPUNIT_ASSERT (!track_named (returned, "Stereo").plugins.at (0).enabled);
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (changed_value, parameter_value (), 1e-5);
+	bool reactivated = false;
+	for (auto const& item : *fixture.session->get_routes ()) { if (item->name () == "Stereo") {
+		item->foreach_processor ([&] (std::weak_ptr<Processor> weak) {
+			if (auto value = std::dynamic_pointer_cast<PluginInsert> (weak.lock ())) { value->activate (); reactivated = true; }
+		});
+	} }
+	CPPUNIT_ASSERT (reactivated);
+	PX::SessionExchange::ExportOptions native_options;
+	PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("with-plugin-song"), fixture.report, native_options);
+	auto native = PX::StudioOneSong::read (fixture.path ("with-plugin-song/Project.song"));
+	auto const& native_devices = track_named (native.project, "Stereo").plugins;
+	CPPUNIT_ASSERT_EQUAL (size_t (1), native_devices.size ());
+	CPPUNIT_ASSERT_EQUAL (devices[0].id, native_devices[0].id);
+	CPPUNIT_ASSERT_EQUAL (devices[0].state, native_devices[0].state);
+	AudioEngine::instance ()->remove_session ();
+	fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_studio_one (*AudioEngine::instance (), fixture.path ("with-plugin-song/Project.song"),
+	                                                        fixture.path ("NativePluginReturn"), "Exchange", fixture.report);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (changed_value, parameter_value (), 1e-5);
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("native-plugin-return.dawproject"));
+	auto native_returned = PX::DawProject::read (fixture.path ("native-plugin-return.dawproject"));
+	CPPUNIT_ASSERT_EQUAL (devices[0].state, track_named (native_returned, "Stereo").plugins.at (0).state);
 	if (const char* external = std::getenv ("ARDOUR_STUDIO_PRO_VST3_TEST_PROJECT")) {
 		if (!*external) { return; }
 		auto assert_supported = [] (const std::vector<PX::Diagnostic>& report) {

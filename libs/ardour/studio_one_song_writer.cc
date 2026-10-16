@@ -44,6 +44,30 @@ std::string uid () {
 }
 void unique_id (Node parent, const char* kind, const std::string& value) { prop (node (parent, "UID", kind), "uid", value); }
 void speaker (Node parent, const char* id, unsigned channels) { prop (node (parent, "SpeakerSetup", id), "type", channels == 1 ? "Mono" : "Stereo"); }
+std::string native_class_id (const std::string& id) {
+	return "{" + id.substr (0, 8) + "-" + id.substr (8, 4) + "-" + id.substr (12, 4) + "-" + id.substr (16, 4) + "-" + id.substr (20) + "}";
+}
+void insert (Node inserts, const PluginDevice& plugin, const std::string& member, unsigned index) {
+	Node slot = node (inserts, "Attributes");
+	prop (slot, "name", std::string ("FX") + (index < 10 ? "0" : "") + std::to_string (index));
+	unique_id (slot, "uniqueID", uid ());
+	std::string class_id = native_class_id (plugin.id);
+	unique_id (slot, "deviceClassID", class_id);
+	Node data = node (slot, "Attributes", "deviceData"); prop (data, "name", plugin.name);
+	unique_id (data, "uniqueID", uid ());
+	Node ghost = node (slot, "Attributes", "ghostData"); prop (ghost, "presetType", "vstpreset");
+	Node info = node (ghost, "Attributes", "classInfo");
+	prop (info, "classID", class_id); prop (info, "name", plugin.name);
+	prop (info, "category", "AudioEffect"); prop (info, "subCategory", "VST3");
+	Node io = node (ghost, "Attributes", "IO");
+	for (const char* kind : {"audioInputs", "audioOutputs"}) {
+		Node ports = node (io, "List", kind), port = node (ports, "PortDescription");
+		prop (port, "flags", 3); prop (port, "subType", 3);
+		prop (port, "label", std::string (kind) == "audioInputs" ? "Input" : "Output");
+	}
+	Node presets = node (slot, "Attributes", "Presets"); prop (presets, "pname", "default"); prop (presets, "dirty", 1);
+	prop (node (slot, "String", "presetPath"), "text", member);
+}
 std::string color (const std::string& value) {
 	if (value.empty ()) { return "FF808080"; }
 	require (value.size () == 7 && value[0] == '#' && value.find_first_not_of ("0123456789abcdefABCDEF", 1) == std::string::npos, "Invalid native song color");
@@ -177,7 +201,15 @@ std::vector<Diagnostic> StudioOneSong::export_report (const Project& project)
 		if (track.kind == TrackKind::Folder && (track.channels != 2 || track.volume != 1 || track.pan != .5 || track.mute || track.solo)) {
 			unsupported (track.name, "Native folder processing requires the rendered mix option");
 		}
-		if (!track.plugins.empty () || !track.sends.empty ()) { unsupported (track.name, "Native plugin state and sends require the rendered mix option"); }
+		if (!track.sends.empty ()) { unsupported (track.name, "Native sends require the rendered mix option"); }
+		for (auto const& plugin : track.plugins) {
+			if (track.master || track.kind != TrackKind::Audio || track.channels != 2 || plugin.role != "audioFX" ||
+			    !plugin.enabled || plugin.state.empty ()) {
+				unsupported (track.name, "Native VST3 export supports enabled, stereo audio-track effects with embedded preset state");
+			} else {
+				report.push_back ({Disposition::Transformed, plugin.name, "VST3 state embedded in the native song; Studio Pro opening and playback are not yet validated"});
+			}
+		}
 		if (!track.volume_automation.points.empty () || !track.pan_automation.points.empty ()) { unsupported (track.name, "Native mixer automation requires the rendered mix option"); }
 		if (track.kind == TrackKind::MIDI && (track.volume != 1 || track.pan != .5)) { unsupported (track.name, "Native MIDI mixer gain and pan require instrument rendering"); }
 		for (auto const& clip : track.clips) {
@@ -283,6 +315,19 @@ void StudioOneSong::write (const StudioOneSongData& song, const std::string& fil
 				prop (channel, "pan", track.pan); prop (node (channel, "Attributes", "Panner"), "panX1", track.pan);
 				prop (node (channel, "Connection", "destination"), "objectID", master + "/Input");
 			}
+		}
+		if (!track.plugins.empty ()) {
+			Node inserts = node (channel, "Attributes", "Inserts"); unsigned index = 0;
+			for (auto const& plugin : track.plugins) {
+				check (cancel);
+				std::string member = "Presets/Channels/Stereo/track-" + std::to_string (track_number) +
+				                     "-fx-" + std::to_string (++index) + ".vstpreset";
+				insert (inserts, plugin, member, index);
+				archive.add_text (member, plugin.state);
+			}
+			Node presets = node (inserts, "Attributes", "Presets"); prop (presets, "pname", "default"); prop (presets, "dirty", 0);
+			Node combinator = node (inserts, "Attributes", "Combinator"); prop (combinator, "name", "Combinator");
+			unique_id (combinator, "uniqueID", uid ());
 		}
 		if (track.master) { continue; }
 		Node t = node (tracks, "MediaTrack"); prop (t, "mediaType", musical ? "Music" : "Audio"); prop (t, "tempoFollow", musical ? 2 : 0);

@@ -94,7 +94,7 @@ struct PluginDevice {
 	std::string id; // VST3 class ID, 32 hexadecimal characters.
 	std::string name;
 	std::string role; // audioFX or instrument.
-	std::string state_path; // Embedded DAWproject .vstpreset member.
+	std::string state_path; // Embedded project-archive .vstpreset member.
 	std::string state; // Binary VST3 preset, populated when reading an archive.
 	bool enabled = true;
 };
