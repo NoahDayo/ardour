@@ -1572,9 +1572,7 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 		if (track.solo) { unsupported (project, track.name, "Clear solo before AAF/MIDI export"); }
 		if (track.kind == TrackKind::Audio && track.channels == 2 &&
 		    !track.pan_automation.points.empty () &&
-		    (track.volume_automation.points.empty () ? track.volume == 0 :
-		     std::any_of (track.volume_automation.points.begin (), track.volume_automation.points.end (),
-		                  [] (const AutomationPoint& point) { return point.value <= 0; }))) {
+		    track.volume_automation.points.empty () && track.volume == 0) {
 			unsupported (project, track.name, "Moving stereo balance with zero gain cannot yet be represented in AAF export");
 		} else if (track.kind == TrackKind::Audio && track.channels == 2 && (track.pan != .5 || !track.pan_automation.points.empty ())) {
 			project.report.push_back ({Disposition::Transformed, track.name, "Stereo gain and balance become independent AAF left/right channel levels; concurrent moving curves are sampled to audio resolution"});

@@ -984,6 +984,7 @@ aafi_freeAudioTracks (aafiAudioTrack** tracks)
 		nextTrack = track->next;
 
 		free (track->name);
+		free (track->ardour_stereo_gain_balance);
 		aafi_freeAudioGain (track->gain);
 		aafi_freeAudioPan (track->pan);
 		aafi_freeTimelineItems (&track->timelineItems);

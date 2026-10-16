@@ -616,7 +616,7 @@ typedef struct aafiAudioTrack {
 	aafiAudioGain* gain;
 
 	aafiAudioPan* pan;
-	uint8_t ardour_stereo_gain_balance; /* Declared UserComment on paired track-level gain groups. */
+	char* ardour_stereo_gain_balance; /* Owned declared UserComment on paired track-level gain groups. */
 
 	char solo;
 	char mute;

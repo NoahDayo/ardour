@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <map>
 #include <set>
 #include <limits>
@@ -240,23 +241,59 @@ struct LogicProject::Impl {
 			position = reference_left >= reference_right ? reference_right / 2 : 1 - reference_left / 2;
 			return true;
 		};
-		auto tagged_gain_balance = [] (const Track& left, const Track& right, double quantum, Automation& gain, Automation& balance) {
+		auto tagged_gain_balance = [] (const Track& left, const Track& right, const char* left_tag, const char* right_tag,
+		                               double quantum, Automation& gain, Automation& balance) {
 			auto const& l = left.volume_automation.points;
 			auto const& r = right.volume_automation.points;
-			if (l.empty () || l.size () != r.size () || left.volume_automation.unit != TimeUnit::Seconds ||
+			if (!left_tag || !right_tag || std::strcmp (left_tag, right_tag) || std::strlen (left_tag) > 4 * 1024 * 1024 ||
+			    l.empty () || l.size () != r.size () || left.volume_automation.unit != TimeUnit::Seconds ||
 			    right.volume_automation.unit != TimeUnit::Seconds) { return false; }
+			std::map<long long, double> silent_balance;
+			if (std::strcmp (left_tag, "1") != 0) {
+				if (std::strncmp (left_tag, "2|", 2) || !left_tag[2]) { return false; }
+				std::string text (left_tag);
+				size_t start = 2;
+				try {
+					while (start < text.size ()) {
+						size_t end = text.find (',', start);
+						if (end == std::string::npos) { end = text.size (); }
+						if (end + 1 == text.size ()) { return false; }
+						size_t separator = text.find ('=', start);
+						if (separator == std::string::npos || separator >= end || separator == start || separator + 1 == end) { return false; }
+						std::string sample_text = text.substr (start, separator - start);
+						std::string balance_text = text.substr (separator + 1, end - separator - 1);
+						size_t used = 0;
+						long long sample = std::stoll (sample_text, &used);
+						if (used != sample_text.size () || std::to_string (sample) != sample_text || sample < 0) { return false; }
+						double position = std::stod (balance_text, &used);
+						if (used != balance_text.size () || !std::isfinite (position) || position < 0 || position > 1 ||
+						    !silent_balance.emplace (sample, position).second || silent_balance.size () > 100000) { return false; }
+						start = end + 1;
+					}
+				} catch (const std::exception&) { return false; }
+			}
 			gain.unit = balance.unit = TimeUnit::Seconds;
+			size_t silent_points = 0;
 			for (size_t i = 0; i < l.size (); ++i) {
 				if (l[i].time != r[i].time || l[i].linear != r[i].linear || !std::isfinite (l[i].value) ||
 				    !std::isfinite (r[i].value) || l[i].value < 0 || r[i].value < 0 ||
 				    (i && l[i].time - l[i - 1].time < quantum * .5)) { return false; }
 				double common = std::max (l[i].value, r[i].value);
-				if (common <= 0) { return false; }
-				double position = l[i].value >= r[i].value ? r[i].value / (2 * common) : 1 - l[i].value / (2 * common);
+				double position;
+				if (common == 0) {
+					double sample = l[i].time / quantum;
+					if (!std::isfinite (sample) || sample < 0 || sample > 9007199254740992.0) { return false; }
+					auto found = silent_balance.find (std::llround (sample));
+					if (found == silent_balance.end () || std::fabs (sample - found->first) > .25) { return false; }
+					position = found->second;
+					++silent_points;
+				} else {
+					position = l[i].value >= r[i].value ? r[i].value / (2 * common) : 1 - l[i].value / (2 * common);
+				}
 				gain.points.push_back ({l[i].time, common, l[i].linear});
 				balance.points.push_back ({l[i].time, std::max (0.0, std::min (1.0, position)), l[i].linear});
 			}
-			return true;
+			return silent_points == silent_balance.size ();
 		};
 		std::vector<Track> paired;
 		paired.reserve (project.tracks.size ());
@@ -274,7 +311,9 @@ struct LogicProject::Impl {
 				auto& right = project.tracks[i + 2];
 				any_combined_tag = sources[i]->ardour_stereo_gain_balance || sources[i + 1]->ardour_stereo_gain_balance;
 				combined_gain_balance = sources[i]->ardour_stereo_gain_balance && sources[i + 1]->ardour_stereo_gain_balance &&
-				                        tagged_gain_balance (left, right, seconds (1, sources[i]->edit_rate), common_gain_curve, tagged_balance);
+				                        tagged_gain_balance (left, right, sources[i]->ardour_stereo_gain_balance,
+				                                             sources[i + 1]->ardour_stereo_gain_balance,
+				                                             seconds (1, sources[i]->edit_rate), common_gain_curve, tagged_balance);
 				bool empty_pair = left.clips.empty () && right.clips.empty () &&
 				                  !sources[i]->timelineItems && !sources[i + 1]->timelineItems &&
 				                  !sources[i]->format && !sources[i + 1]->format;

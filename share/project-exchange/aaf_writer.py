@@ -246,8 +246,6 @@ def stereo_balance_points(points, gain):
 
 def moving_stereo_levels(gains, pans, end):
     """Approximate gain times balance at audio samples, splitting quadratic arcs."""
-    require(all(value > 0 for _, value, _ in gains),
-            "Moving stereo balance with zero gain automation cannot be restored")
     gain_times, pan_times = ([point[0] for point in curve] for curve in (gains, pans))
 
     def value(curve, curve_times, at):
@@ -303,7 +301,10 @@ def moving_stereo_levels(gains, pans, end):
         refine(start, stop)
     output_times = sorted(selected)
     require(len(output_times) <= 100000, "Stereo mixer automation exceeds the event limit")
-    return [[(time, at(time)[channel], True) for time in output_times] for channel in range(2)]
+    silent = [(time, value(pans, pan_times, time)) for time in output_times if at(time) == (0, 0)]
+    tag = "2|" + ",".join(f"{time}={balance:.17g}" for time, balance in silent) if silent else "1"
+    require(len(tag) <= 4 * 1024 * 1024, "Stereo balance metadata exceeds the event limit")
+    return ([[(time, at(time)[channel], True) for time in output_times] for channel in range(2)], tag)
 
 
 def apply_automation(output, segment, definition, parameter, points):
@@ -438,13 +439,13 @@ def write_aaf(root, destination):
             require(0 <= balance <= 1, "Invalid audio pan")
             require(channels == 1 or not pan_points or gain_points or gain > 0,
                     "Moving stereo balance with zero gain is not yet mapped to AAF")
-            combined_curves = moving_stereo_levels(gain_points, pan_points, end) if channels == 2 and gain_points and pan_points else None
-            balance_curves = stereo_balance_points(pan_points, gain) if channels == 2 and pan_points and not combined_curves else None
+            combined = moving_stereo_levels(gain_points, pan_points, end) if channels == 2 and gain_points and pan_points else None
+            balance_curves = stereo_balance_points(pan_points, gain) if channels == 2 and pan_points and not combined else None
             for channel, (slot, sequence) in enumerate(zip(composition_slots, sequences)):
                 sequence.length = end
-                if combined_curves:
-                    sequence = apply_automation(output, sequence, mono_gain, amplitude, combined_curves[channel])
-                    sequence["UserComments"].append(output.create.TaggedValue("Ardour.StereoGainBalance", "1"))
+                if combined:
+                    sequence = apply_automation(output, sequence, mono_gain, amplitude, combined[0][channel])
+                    sequence["UserComments"].append(output.create.TaggedValue("Ardour.StereoGainBalance", combined[1]))
                 elif balance_curves:
                     sequence = apply_automation(output, sequence, mono_gain, amplitude, balance_curves[channel])
                 elif gain_points:

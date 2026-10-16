@@ -525,17 +525,36 @@ class LogicWriterTest(unittest.TestCase):
                 actual = sampled(track["gain_curve"], track["gain_length"], seconds * 48000)
                 self.assertAlmostEqual(actual, expected, delta=2e-5)
 
-    def test_rejects_zero_gain_with_moving_stereo_balance(self):
+    def test_zero_gain_with_moving_stereo_balance(self):
         stereo = self.root.findall("AudioTrack")[1]
         gain = ET.SubElement(stereo, "GainAutomation")
-        ET.SubElement(gain, "Point", time="0", value=".5", linear="true")
-        ET.SubElement(gain, "Point", time="2", value="0", linear="true")
+        for at, value in ((0, .4), (1, 0), (2, 0), (3, .8)):
+            ET.SubElement(gain, "Point", time=str(at), value=str(value), linear="true")
         pan = ET.SubElement(stereo, "PanAutomation")
-        ET.SubElement(pan, "Point", time="0", value=".25", linear="true")
-        ET.SubElement(pan, "Point", time="2", value=".75", linear="true")
+        for at, value in ((0, .25), (1, .3), (2, .7), (3, .75)):
+            ET.SubElement(pan, "Point", time=str(at), value=str(value), linear="true")
         result = self.run_writer()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("zero gain automation", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with aaf2.open(str(self.output / "Project.aaf"), "r") as aaf:
+            slots = [slot for slot in next(aaf.content.toplevel()).slots if slot.name == stereo.attrib["name"]]
+            self.assertEqual(len(slots), 2)
+            tags = [slot.segment["UserComments"].value[0].value for slot in slots]
+            self.assertEqual(tags[0], tags[1])
+            self.assertTrue(tags[0].startswith("2|"))
+            silent = dict((int(at), float(value)) for at, value in
+                          (item.split("=") for item in tags[0][2:].split(",")))
+            self.assertAlmostEqual(silent[48000], .3)
+            self.assertAlmostEqual(silent[96000], .7)
+            self.assertAlmostEqual(silent[72000], .5, delta=1 / 48000)
+        extracted = self.directory / "extracted"
+        extracted.mkdir()
+        probe = subprocess.run([self.probe, str(self.output / "Project.aaf"), str(extracted)],
+                               capture_output=True, text=True, encoding="utf-8", timeout=30)
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        for track in json.loads(probe.stdout)["tracks"][1:]:
+            silent_levels = {round(at * track["gain_length"]): level for at, level in track["gain_curve"]}
+            self.assertEqual(silent_levels[48000], 0)
+            self.assertEqual(silent_levels[96000], 0)
 
     def test_moving_stereo_levels_fractional_center_and_hold_step(self):
         stereo = self.root.findall("AudioTrack")[1]
