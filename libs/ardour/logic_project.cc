@@ -159,9 +159,9 @@ struct LogicProject::Impl {
 		return id;
 	}
 	void pair_stereo_tracks (const std::vector<aafiAudioTrack*>& sources) {
-		/* AS-01 represents stereo composition audio as two mono slots. Only
-		 * regroup a consecutive L/R pair when its clips really select the two
-		 * channels of the same essence and all editable controls agree. */
+		/* AS-01 represents stereo composition audio as two mono slots. Regroup
+		 * consecutive L/R slots only when their channel sources, clip timing
+		 * and editable controls agree. Sources may be interleaved or split. */
 		auto same_curve = [] (const Automation& a, const Automation& b) {
 			if (a.unit != b.unit || a.points.size () != b.points.size ()) { return false; }
 			for (size_t i = 0; i < a.points.size (); ++i) {
@@ -170,7 +170,7 @@ struct LogicProject::Impl {
 			return true;
 		};
 		auto same_clip = [&] (const Clip& a, const Clip& b) {
-			return a.name == b.name && a.kind == b.kind && a.position.unit == b.position.unit && a.position.value == b.position.value &&
+			return a.kind == b.kind && a.position.unit == b.position.unit && a.position.value == b.position.value &&
 			       a.duration == b.duration && a.offset.unit == b.offset.unit && a.offset.value == b.offset.value &&
 			       a.enabled == b.enabled && a.gain == b.gain && same_curve (a.envelope, b.envelope);
 		};
@@ -183,20 +183,30 @@ struct LogicProject::Impl {
 			bool can_pair = i + 1 < sources.size ();
 			if (can_pair) {
 				auto& right = project.tracks[i + 2];
+				bool empty_pair = left.clips.empty () && right.clips.empty () &&
+				                  !sources[i]->timelineItems && !sources[i + 1]->timelineItems &&
+				                  !sources[i]->format && !sources[i + 1]->format;
 				can_pair = sources[i]->number == 1 && sources[i + 1]->number == 2 &&
-				           sources[i]->format == 1 && sources[i + 1]->format == 1 &&
+				           ((sources[i]->format == 1 && sources[i + 1]->format == 1 && !left.clips.empty ()) || empty_pair) &&
 				           left.name == right.name && left.channels == 1 && right.channels == 1 &&
 				           left.volume == right.volume && left.pan == .5 && right.pan == .5 &&
 				           left.mute == right.mute && left.solo == right.solo &&
 				           same_curve (left.volume_automation, right.volume_automation) &&
 				           left.pan_automation.points.empty () && right.pan_automation.points.empty () &&
-				           !left.clips.empty () && left.clips.size () == right.clips.size ();
+				           left.clips.size () == right.clips.size ();
 				if (can_pair) {
 					for (size_t c = 0; c < left.clips.size (); ++c) {
 						auto a = channels.find (left.clips[c].media), b = channels.find (right.clips[c].media);
+						bool compatible_media = false;
+						if (a != channels.end () && b != channels.end () && a->second.size () == 1 && b->second.size () == 1) {
+							auto l = a->second[0], r = b->second[0];
+							compatible_media = (l.first == r.first && l.second == 0 && r.second == 1) ||
+							                   (l.first != r.first && l.first->channels == 1 && r.first->channels == 1 &&
+							                    l.second == 0 && r.second == 0 && l.first->samplerate == r.first->samplerate &&
+							                    l.first->length == r.first->length);
+						}
 						if (!same_clip (left.clips[c], right.clips[c]) || a == channels.end () || b == channels.end () ||
-						    a->second.size () != 1 || b->second.size () != 1 ||
-						    a->second[0].first != b->second[0].first || a->second[0].second != 0 || b->second[0].second != 1) {
+						    !compatible_media) {
 							can_pair = false; break;
 						}
 					}
@@ -205,7 +215,9 @@ struct LogicProject::Impl {
 			if (can_pair) {
 				auto& right = project.tracks[i + 2];
 				left.channels = 2;
+				bool renamed_clip = false;
 				for (size_t c = 0; c < left.clips.size (); ++c) {
+					renamed_clip |= left.clips[c].name != right.clips[c].name;
 					std::vector<Channel> selected {channels.at (left.clips[c].media)[0], channels.at (right.clips[c].media)[0]};
 					auto found = media_ids.find (selected);
 					if (found == media_ids.end ()) {
@@ -216,9 +228,15 @@ struct LogicProject::Impl {
 						left.clips[c].media = id;
 					} else { left.clips[c].media = found->second; }
 				}
+				if (renamed_clip) { project.report.push_back ({Disposition::Transformed, left.name, "Paired mono AAF clip names differed; retained the left-channel names"}); }
 				paired.push_back (std::move (left));
 				++i;
-			} else { paired.push_back (std::move (left)); }
+			} else {
+				if (!sources[i]->format && !sources[i]->timelineItems) {
+					project.report.push_back ({Disposition::Transformed, left.name, "Empty AAF track has no channel layout; imported as mono"});
+				}
+				paired.push_back (std::move (left));
+			}
 		}
 		project.tracks.swap (paired);
 		std::set<std::string> used_media;
@@ -272,7 +290,6 @@ LogicProject::LogicProject (const std::string& path, const std::string& midi, Ca
 		/* An empty sequence has no channel layout from which to infer its width. */
 		if (!output.channels && !track->timelineItems) {
 			output.channels = 1;
-			project.report.push_back ({Disposition::Transformed, output.name, "Empty AAF track has no channel layout; imported as mono"});
 		}
 		require (output.channels == 1 || output.channels == 2, "Unsupported AAF track channel layout");
 		output.volume = self.mixer (track->gain, output.volume_automation, track->edit_rate, output.name + " gain", 1);

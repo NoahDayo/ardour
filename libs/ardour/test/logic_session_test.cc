@@ -89,6 +89,7 @@ struct Fixture {
 class LogicSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST_SUITE (LogicSessionTest);
 	CPPUNIT_TEST (saved_session_export);
+	CPPUNIT_TEST (paired_mono_layout);
 	CPPUNIT_TEST (existing_destination);
 	CPPUNIT_TEST (missing_runtime);
 	CPPUNIT_TEST (writer_failure);
@@ -103,6 +104,7 @@ class LogicSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST_SUITE_END ();
 public:
 	void saved_session_export ();
+	void paired_mono_layout ();
 	void existing_destination ();
 	void missing_runtime ();
 	void writer_failure ();
@@ -116,6 +118,62 @@ public:
 	void aaf_transitions ();
 };
 CPPUNIT_TEST_SUITE_REGISTRATION (LogicSessionTest);
+
+void LogicSessionTest::paired_mono_layout ()
+{
+	Fixture fixture;
+	const char* data = g_getenv ("ARDOUR_TEST_PATH"); CPPUNIT_ASSERT (data);
+	{
+		EnvironmentOverride helper ("ARDOUR_LOGIC_HELPER", Glib::build_filename (data, "aaf_stereo_layout.py"));
+		PX::SessionExchange::export_logic (*fixture.session, fixture.path ("SplitFixtures"), fixture.report);
+	}
+	const std::string source = fixture.path ("SplitFixtures/Project.aaf");
+	PX::LogicProject split (source);
+	CPPUNIT_ASSERT (!PX::has_unsupported_features (split.project ()));
+	CPPUNIT_ASSERT_EQUAL (size_t (3), split.project ().tracks.size ());
+	CPPUNIT_ASSERT_EQUAL (std::string ("Stereo split"), split.project ().tracks[1].name);
+	CPPUNIT_ASSERT_EQUAL (2u, split.project ().tracks[1].channels);
+	CPPUNIT_ASSERT_EQUAL (size_t (1), split.project ().tracks[1].clips.size ());
+	CPPUNIT_ASSERT_EQUAL (std::string ("Empty stereo"), split.project ().tracks[2].name);
+	CPPUNIT_ASSERT_EQUAL (2u, split.project ().tracks[2].channels);
+	CPPUNIT_ASSERT (split.project ().tracks[2].clips.empty ());
+	CPPUNIT_ASSERT_EQUAL (size_t (1), split.project ().media.size ());
+	const std::string pcm = fixture.path ("split.wav");
+	split.copy_media (split.project ().media[0], pcm);
+	SF_INFO info = {};
+	SNDFILE* file = sf_open (pcm.c_str (), SFM_READ, &info);
+	CPPUNIT_ASSERT (file);
+	CPPUNIT_ASSERT_EQUAL (2, info.channels);
+	std::array<float, 2> sample {};
+	CPPUNIT_ASSERT_EQUAL (sf_count_t (1), sf_readf_float (file, sample.data (), 1));
+	CPPUNIT_ASSERT_EQUAL (0, sf_close (file));
+	CPPUNIT_ASSERT_EQUAL (.125f, sample[0]);
+	CPPUNIT_ASSERT_EQUAL (-.25f, sample[1]);
+	PX::LogicProject mismatched (fixture.path ("SplitFixtures/Mismatched.aaf"));
+	CPPUNIT_ASSERT_EQUAL (size_t (3), mismatched.project ().tracks.size ());
+	CPPUNIT_ASSERT_EQUAL (1u, mismatched.project ().tracks[1].channels);
+	CPPUNIT_ASSERT_EQUAL (1u, mismatched.project ().tracks[2].channels);
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_logic (*AudioEngine::instance (), source, "", fixture.path ("SplitImported"), "SplitImported", fixture.report);
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("SplitImported"), "SplitImported", nullptr, "", true));
+	AudioEngine::instance ()->set_session (fixture.session.get ());
+	auto stereo = std::dynamic_pointer_cast<Track> (fixture.session->route_by_name ("Stereo split"));
+	auto empty = std::dynamic_pointer_cast<Track> (fixture.session->route_by_name ("Empty stereo"));
+	CPPUNIT_ASSERT (stereo && empty);
+	CPPUNIT_ASSERT_EQUAL (size_t (1), stereo->playlist ()->region_list ()->size ());
+	CPPUNIT_ASSERT (empty->playlist ()->region_list ()->empty ());
+	auto audio = std::dynamic_pointer_cast<AudioRegion> (*stereo->playlist ()->region_list ()->begin ());
+	CPPUNIT_ASSERT (audio);
+	CPPUNIT_ASSERT_EQUAL (uint32_t (2), audio->n_channels ());
+	for (unsigned channel = 0; channel < 2; ++channel) {
+		auto source = std::dynamic_pointer_cast<AudioSource> (audio->source (channel));
+		std::array<float, 31> samples {};
+		CPPUNIT_ASSERT_EQUAL (samplecnt_t (samples.size ()), source->read (samples.data (), 0, samples.size ()));
+		for (float value : samples) { CPPUNIT_ASSERT_EQUAL (channel ? -.25f : .125f, value); }
+	}
+}
 
 void LogicSessionTest::aaf_transitions ()
 {
