@@ -631,67 +631,52 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active, Time orig
 		if (!controls.empty ()) { diagnostic (node, "MIDI expression around nested clips is not yet converted"); }
 		attributes (content, {"id", "timeUnit"});
 		TimeUnit unit = time_unit (content, "timeUnit", content_unit);
-		if (repeated_loop && (unit != parent_unit || loop_unit != parent_unit)) {
-			throw ExchangeError ("Repeated nested loop needs matching wrapper and timeline time units");
-		}
-		double start = timing->convert (outer.position, TimeUnit::Seconds);
-		double stop = start + timing->duration (Time (outer.duration, parent_unit), outer.position, TimeUnit::Seconds);
-		Time child_origin (timing->convert (outer.position, outer.offset.unit) - outer.offset.value, outer.offset.unit);
-		std::vector<Clip> nested;
-		for (Node item : children (content)) {
-			if (!is (item, "Clip")) { diagnostic (item, "Unknown nested clips element"); continue; }
-			for (Clip& inner : clip (item, unit, active, repeated_loop ? Time () : child_origin)) {
-				if (repeated_loop) {
-					if (inner.position.unit != parent_unit || inner.offset.unit != parent_unit) {
-						throw ExchangeError ("Repeated nested clip needs matching region and source time units");
+		auto append_window = [&] (Time child_origin, double start, double stop) {
+			for (Node item : children (content)) {
+				if (!is (item, "Clip")) { diagnostic (item, "Unknown nested clips element"); continue; }
+				for (Clip& inner : clip (item, unit, active, child_origin)) {
+					double inner_start = timing->convert (inner.position, TimeUnit::Seconds);
+					double inner_stop = inner_start + timing->duration (Time (inner.duration, inner.position.unit), inner.position, TimeUnit::Seconds);
+					double begin = std::max (start, inner_start);
+					double end = std::min (stop, inner_stop);
+					if (end <= begin) { continue; }
+					if (repeated_loop) {
+						size_t objects = 1 + inner.notes.size ();
+						for (auto const& control : inner.midi_controls) { objects += 1 + control.points.size (); }
+						if (objects > 250000 - expanded_objects) { throw ExchangeError ("Project exceeds the expanded object limit"); }
+						expanded_objects += objects;
 					}
-					nested.push_back (std::move (inner));
-					continue;
+					inner.envelope = slice_automation (inner.envelope, begin - inner_start, end - inner_start);
+					inner.offset.value += timing->duration (Time (begin - inner_start, TimeUnit::Seconds), inner.position, inner.offset.unit);
+					inner.position = Time (timing->convert (Time (begin, TimeUnit::Seconds), parent_unit), parent_unit);
+					inner.duration = timing->convert (Time (end, TimeUnit::Seconds), parent_unit) - inner.position.value;
+					inner.enabled = inner.enabled && outer.enabled;
+					if (inner.name.empty ()) { inner.name = outer.name; }
+					if (inner.color.empty ()) { inner.color = outer.color; }
+					result.push_back (std::move (inner));
 				}
-				double inner_start = timing->convert (inner.position, TimeUnit::Seconds);
-				double inner_stop = inner_start + timing->duration (Time (inner.duration, inner.position.unit), inner.position, TimeUnit::Seconds);
-				double begin = std::max (start, inner_start);
-				double end = std::min (stop, inner_stop);
-				if (end <= begin) { continue; }
-				inner.envelope = slice_automation (inner.envelope, begin - inner_start, end - inner_start);
-				inner.offset.value += timing->duration (Time (begin - inner_start, TimeUnit::Seconds), inner.position, inner.offset.unit);
-				inner.position = Time (timing->convert (Time (begin, TimeUnit::Seconds), parent_unit), parent_unit);
-				inner.duration = timing->duration (Time (end - begin, TimeUnit::Seconds), inner.position, parent_unit);
-				inner.enabled = inner.enabled && outer.enabled;
-				if (inner.name.empty ()) { inner.name = outer.name; }
-				if (inner.color.empty ()) { inner.color = outer.color; }
-				result.push_back (std::move (inner));
 			}
-		}
+		};
 		if (repeated_loop) {
 			double elapsed = 0, source = outer.offset.value;
-			while (elapsed < outer.duration - 1e-9) {
+			while (elapsed < clip_length - 1e-9) {
 				expansion ();
-				double span = std::min (loop_end - source, outer.duration - elapsed);
+				double start = clip_start + elapsed;
+				double span = std::min (timing->duration (Time (loop_end - source, loop_unit),
+				                                                Time (start, TimeUnit::Seconds), TimeUnit::Seconds),
+				                        clip_length - elapsed);
 				if (!(span > 0) || !(elapsed + span > elapsed)) { throw ExchangeError ("Clip loop is too short to expand"); }
-				for (auto const& inner : nested) {
-					double begin = std::max (source, inner.position.value);
-					double end = std::min (source + span, inner.position.value + inner.duration);
-					if (end <= begin) { continue; }
-					size_t objects = 1 + inner.notes.size ();
-					for (auto const& control : inner.midi_controls) { objects += 1 + control.points.size (); }
-					if (objects > 250000 - expanded_objects) { throw ExchangeError ("Project exceeds the expanded object limit"); }
-					expanded_objects += objects;
-					Clip part = inner;
-					part.envelope = slice_automation (inner.envelope, begin - inner.position.value, end - inner.position.value);
-					part.offset.value += begin - inner.position.value;
-					part.position = Time (outer.position.value + elapsed + begin - source, parent_unit);
-					part.duration = end - begin;
-					part.enabled = part.enabled && outer.enabled;
-					if (part.name.empty ()) { part.name = outer.name; }
-					if (part.color.empty ()) { part.color = outer.color; }
-					result.push_back (std::move (part));
-				}
+				/* The tempo at each pass can change the position of nested beats relative to source seconds. */
+				Time child_origin (timing->convert (Time (start, TimeUnit::Seconds), loop_unit) - source, loop_unit);
+				append_window (child_origin, start, start + span);
 				elapsed += span;
 				source = loop_start;
 			}
 			expanded_nested_loop = true;
 			diagnostic (node, "Expanded repeated nested clips into editable regions with source offsets", Disposition::Transformed);
+		} else {
+			Time child_origin (timing->convert (outer.position, outer.offset.unit) - outer.offset.value, outer.offset.unit);
+			append_window (child_origin, clip_start, clip_start + clip_length);
 		}
 		diagnostic (node, "Flattened nested clips while preserving audible ranges and source offsets", Disposition::Transformed);
 	} else {
