@@ -406,7 +406,7 @@ static void export_project (Gtk::Window* parent, ExportKind kind)
 	});
 	options_box.pack_start (render_mode, false, false);
 	options_box.pack_start (render_hint, false, false);
-	if (native) { options_box.pack_start (editable_references, false, false); }
+	if (native || dawproject) { options_box.pack_start (editable_references, false, false); }
 	options_box.pack_start (tail_row, false, false);
 	options_box.show_all ();
 	dialog.set_extra_widget (options_box);
@@ -415,7 +415,7 @@ static void export_project (Gtk::Window* parent, ExportKind kind)
 	PX::SessionExchange::ExportOptions options;
 	options.render_mix = render_mode.get_active_row_number () == 1;
 	options.render_stems = render_mode.get_active_row_number () == 2;
-	options.render_editable_references = native && options.rendered () && editable_references.get_active ();
+	options.render_editable_references = (native || dawproject) && options.rendered () && editable_references.get_active ();
 	options.render_tail_seconds = tail.get_value ();
 	if (native && native_format.get_active_row_number () >= 0) { options.studio_one_format_version = 7 + native_format.get_active_row_number (); }
 	dialog.hide ();

@@ -1384,7 +1384,7 @@ Project collect (Session& session, AudioAssets& assets, const CancelCheck& cance
 	return project;
 }
 
-void append_rendered_editable_references (Project& rendered, const Project& editable)
+void append_rendered_editable_references (Project& rendered, const Project& editable, bool native_song)
 {
 	std::set<std::string> referenced_media;
 	for (auto const& item : editable.report) {
@@ -1394,7 +1394,7 @@ void append_rendered_editable_references (Project& rendered, const Project& edit
 	}
 	for (auto const& original : editable.tracks) {
 		if (original.kind != TrackKind::MIDI && original.kind != TrackKind::Audio) { continue; }
-		if (original.channels < 1 || original.channels > 2) {
+		if (native_song && (original.channels < 1 || original.channels > 2)) {
 			throw ExchangeError (original.name + ": native reference tracks require mono or stereo audio");
 		}
 		Track reference;
@@ -1406,13 +1406,13 @@ void append_rendered_editable_references (Project& rendered, const Project& edit
 		reference.destination = "master";
 		reference.mute = true;
 		for (auto clip : original.clips) {
-			if (original.kind == TrackKind::MIDI && !clip.midi_controls.empty ()) {
+			if (native_song && original.kind == TrackKind::MIDI && !clip.midi_controls.empty ()) {
 				rendered.report.push_back ({Disposition::Transformed, clip.name,
 					"MIDI controller events omitted from the native reference track; their audible result is in the rendered audio"});
 				clip.midi_controls.clear ();
 			}
 			if (original.kind == TrackKind::Audio) {
-				if (!clip.envelope.points.empty ()) {
+				if (native_song && !clip.envelope.points.empty ()) {
 					rendered.report.push_back ({Disposition::Transformed, clip.name,
 						"Audio clip envelope omitted from the muted reference; its audible result is in the rendered audio"});
 					clip.envelope.points.clear ();
@@ -1423,8 +1423,10 @@ void append_rendered_editable_references (Project& rendered, const Project& edit
 		}
 		rendered.report.push_back ({Disposition::Rendered, original.name,
 			original.kind == TrackKind::MIDI ?
-			"Editable MIDI notes retained on a muted reference track. Instrument sound and processing are in the rendered audio; assign an instrument and unmute only when replacing that audio" :
-			"Editable audio clips retained on a muted reference track. Mixer processing and routing are in the rendered audio; unmute only when replacing that audio"});
+			(native_song ? "Editable MIDI notes retained on a muted reference track. Instrument sound and processing are in the rendered audio; assign an instrument and unmute only when replacing that audio" :
+			 "Editable MIDI notes and controllers retained on a muted reference track. Instrument sound and processing are in the rendered audio; assign an instrument and unmute only when replacing that audio") :
+			(native_song ? "Editable audio clips retained on a muted reference track. Mixer processing and routing are in the rendered audio; unmute only when replacing that audio" :
+			 "Editable audio clips and their envelopes retained on a muted reference track. Mixer processing and routing are in the rendered audio; unmute only when replacing that audio")});
 		rendered.tracks.push_back (std::move (reference));
 	}
 	for (auto const& media : editable.media) {
@@ -1783,7 +1785,7 @@ void
 SessionExchange::export_dawproject (Session& session, const std::string& destination, std::vector<Diagnostic>& report, const ExportOptions& options, CancelCheck cancel)
 {
 	report.clear ();
-	if (options.render_editable_references) { throw ExchangeError ("Editable reference tracks are supported only by rendered native Studio One song export"); }
+	if (options.render_editable_references && !options.rendered ()) { throw ExchangeError ("Editable reference tracks require a rendered DAWproject export"); }
 	if (session.transport_rolling () || session.actively_recording ()) { throw ExchangeError ("Stop playback and recording before exporting a project"); }
 	if (!Glib::path_is_absolute (destination)) { throw ExchangeError ("Export destination must be absolute"); }
 	FileObject target = file_object (destination);
@@ -1791,14 +1793,20 @@ SessionExchange::export_dawproject (Session& session, const std::string& destina
 	cancelled (cancel);
 	if (options.rendered ()) { check_rendered_stereo_layout (session, report); }
 	AudioAssets assets;
-	Project project = options.rendered () ? collect_rendered (session, options) : collect (session, assets, cancel);
+	Project render_project;
+	Project project;
+	if (options.rendered ()) { render_project = collect_rendered (session, options); project = render_project; }
+	else { project = collect (session, assets, cancel); }
+	if (options.render_editable_references) {
+		append_rendered_editable_references (project, collect (session, assets, cancel), false);
+	}
 	report = project.report;
 	for (auto const& item : project.report) {
 		if (item.disposition == Disposition::Unsupported) { throw ExchangeError (item.object + ": " + item.detail); }
 	}
 	OwnedDirectory stage (Glib::path_get_dirname (destination));
 	std::map<std::string, std::string> files;
-	if (options.rendered ()) { files = render_audio (session, stage, project, options, cancel); }
+	if (options.rendered ()) { files = render_audio (session, stage, render_project, options, cancel); }
 	for (auto const& media : project.media) {
 		if (files.count (media.id)) { continue; }
 		std::string path = Glib::build_filename (stage.path, media.id + ".wav");
@@ -2023,7 +2031,7 @@ SessionExchange::export_studio_one (Session& session, const std::string& destina
 	if (options.rendered ()) { render_project = collect_rendered (session, options); song.project = render_project; }
 	else { song.project = collect (session, assets, cancel); }
 	if (options.render_editable_references) {
-		append_rendered_editable_references (song.project, collect (session, assets, cancel));
+		append_rendered_editable_references (song.project, collect (session, assets, cancel), true);
 	}
 	song.title = session.name (); song.sample_rate = session.sample_rate (); song.format_version = options.studio_one_format_version;
 	song.has_range = true;

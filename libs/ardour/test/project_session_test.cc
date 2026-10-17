@@ -361,7 +361,7 @@ function dsp_run (ins, outs, n)
 end
 )lua";
 
-void make_render_fixture (Fixture& fixture, bool automated = false)
+void make_render_fixture (Fixture& fixture, bool automated = false, bool reference_details = false)
 {
 	auto project = example (fixture);
 	const auto rate = project.media.front ().sample_rate;
@@ -389,7 +389,12 @@ void make_render_fixture (Fixture& fixture, bool automated = false)
 		PX::Track midi; midi.id = "gate"; midi.name = "MIDI gate"; midi.kind = PX::TrackKind::MIDI; midi.destination = "master";
 		PX::Clip clip; clip.kind = PX::ClipKind::MIDI; clip.name = "Gate note";
 		clip.position = PX::Time (.75, PX::TimeUnit::Seconds); clip.duration = .375; clip.offset = PX::Time (0, PX::TimeUnit::Seconds);
-		PX::Note note; note.duration = .125; clip.notes.push_back (note); midi.clips.push_back (clip); project.tracks.push_back (midi);
+		PX::Note note; note.duration = .125; clip.notes.push_back (note);
+		if (reference_details) {
+			PX::MidiControl control; control.number = 74; control.points = {{0, 64, false}, {.1, 127, false}};
+			clip.midi_controls.push_back (control);
+		}
+		midi.clips.push_back (clip); project.tracks.push_back (midi);
 	}
 	package (fixture, project);
 	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"), fixture.path ("Render"), "Render", fixture.report);
@@ -399,6 +404,13 @@ void make_render_fixture (Fixture& fixture, bool automated = false)
 		for (auto const& region : *regions) {
 			auto audio = std::dynamic_pointer_cast<AudioRegion> (region); CPPUNIT_ASSERT (audio);
 			audio->set_fade_in_active (false); audio->set_fade_out_active (false); audio->set_envelope_active (false);
+			if (reference_details) {
+				auto envelope = audio->envelope (); envelope->clear (); envelope->freeze ();
+				envelope->fast_simple_add (Temporal::timepos_t (samplepos_t (0)), .5);
+				envelope->fast_simple_add (Temporal::timepos_t (samplepos_t (rate / 8)), 1);
+				envelope->fast_simple_add (Temporal::timepos_t (samplepos_t (rate / 4)), .75);
+				envelope->thaw (); audio->set_envelope_active (true);
+			}
 		}
 		if (!automated) {
 			std::shared_ptr<Processor> before;
@@ -529,6 +541,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (automation_collision);
 	CPPUNIT_TEST (region_fades_roundtrip);
 	CPPUNIT_TEST (render_mix_roundtrip);
+	CPPUNIT_TEST (dawproject_render_reference);
 	CPPUNIT_TEST (render_mix_automation);
 	CPPUNIT_TEST (render_pending_buffering);
 	CPPUNIT_TEST (render_mix_cancel_and_guards);
@@ -586,6 +599,7 @@ public:
 	void region_fades_roundtrip ();
 	void automation_collision ();
 	void render_mix_roundtrip ();
+	void dawproject_render_reference ();
 	void render_mix_automation ();
 	void render_pending_buffering ();
 	void render_mix_cancel_and_guards ();
@@ -1179,6 +1193,77 @@ void ProjectSessionTest::render_stems_guards ()
 		CPPUNIT_ASSERT (during); CPPUNIT_ASSERT (!Glib::file_test (destination, Glib::FILE_TEST_EXISTS)); status.reset (); original.check (fixture);
 	}
 	std::cout << "Separate stem cancellation, neutral master and mode guards passed" << std::endl;
+}
+
+void ProjectSessionTest::dawproject_render_reference ()
+{
+	Fixture fixture; make_render_fixture (fixture, false, true);
+	const unsigned rate = fixture.session->sample_rate ();
+	PX::SessionExchange::ExportOptions options; options.render_editable_references = true;
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("no-render.dawproject"), fixture.report, options), PX::ExchangeError);
+	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("no-render.dawproject"), Glib::FILE_TEST_EXISTS));
+	options.render_mix = true; options.render_tail_seconds = 1024.0 / rate;
+	RenderSourceState original (fixture);
+	const std::string mix_path = fixture.path ("references.dawproject");
+	PX::SessionExchange::export_dawproject (*fixture.session, mix_path, fixture.report, options);
+	original.check (fixture);
+	CPPUNIT_ASSERT (std::none_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& item) {
+		return item.disposition == PX::Disposition::Unsupported;
+	}));
+	auto mix = PX::DawProject::read (mix_path);
+	CPPUNIT_ASSERT_EQUAL (size_t (4), mix.tracks.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (2), mix.media.size ());
+	auto const& audio = track_named (mix, "Stereo (Audio reference)");
+	auto const& midi = track_named (mix, "MIDI gate (MIDI reference)");
+	CPPUNIT_ASSERT (audio.mute && midi.mute);
+	CPPUNIT_ASSERT_EQUAL (size_t (1), audio.clips.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (1), midi.clips.size ());
+	CPPUNIT_ASSERT (!audio.clips.front ().envelope.points.empty ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (1, PX::automation_value (audio.clips.front ().envelope, .125), 1e-4);
+	CPPUNIT_ASSERT_EQUAL (size_t (1), midi.clips.front ().midi_controls.size ());
+	CPPUNIT_ASSERT_EQUAL (74u, midi.clips.front ().midi_controls.front ().number);
+	CPPUNIT_ASSERT_EQUAL (size_t (1), midi.clips.front ().notes.size ());
+	auto source = std::find_if (mix.media.begin (), mix.media.end (), [&] (const PX::Media& item) {
+		return item.id == audio.clips.front ().media;
+	});
+	CPPUNIT_ASSERT (source != mix.media.end ());
+	std::string source_path = fixture.path ("reference-source.wav");
+	PX::ProjectArchive (mix_path).copy_file (source->path, source_path);
+	auto raw = read_rendered_pcm (source_path, 2 * rate, rate);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.125, raw.front (), 1e-6);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.25, raw.back (), 1e-6);
+	fixture.session->master_out ()->gain_control ()->set_value (1, PBD::Controllable::NoGroup);
+	options.render_mix = false; options.render_stems = true;
+	RenderSourceState stem_original (fixture);
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("reference-stems.dawproject"), fixture.report, options);
+	stem_original.check (fixture);
+	auto stems = PX::DawProject::read (fixture.path ("reference-stems.dawproject"));
+	CPPUNIT_ASSERT_EQUAL (size_t (6), stems.tracks.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (4), stems.media.size ());
+	CPPUNIT_ASSERT (track_named (stems, "Stereo (Audio reference)").mute);
+	CPPUNIT_ASSERT (track_named (stems, "MIDI gate (MIDI reference)").mute);
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), mix_path, fixture.path ("ReferenceReturn"), "ReferenceReturn", fixture.report);
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("ReferenceReturn"), "ReferenceReturn", nullptr, "", true));
+	const std::string return_path = fixture.path ("references-return.dawproject");
+	PX::SessionExchange::export_dawproject (*fixture.session, return_path);
+	auto returned = PX::DawProject::read (return_path);
+	auto const& returned_audio = track_named (returned, "Stereo (Audio reference)");
+	auto const& returned_midi = track_named (returned, "MIDI gate (MIDI reference)");
+	CPPUNIT_ASSERT (returned_audio.mute && returned_midi.mute);
+	CPPUNIT_ASSERT (!returned_audio.clips.front ().envelope.points.empty ());
+	CPPUNIT_ASSERT_EQUAL (74u, returned_midi.clips.front ().midi_controls.front ().number);
+	CPPUNIT_ASSERT_EQUAL (midi.clips.front ().notes.front ().key, returned_midi.clips.front ().notes.front ().key);
+	auto media = std::find_if (returned.media.begin (), returned.media.end (), [&] (const PX::Media& item) {
+		return item.id == returned_audio.clips.front ().media;
+	});
+	CPPUNIT_ASSERT (media != returned.media.end ());
+	std::string copied = fixture.path ("reference-return.wav");
+	PX::ProjectArchive (return_path).copy_file (media->path, copied);
+	CPPUNIT_ASSERT (raw == read_rendered_pcm (copied, 2 * rate, rate));
+	std::cout << "Rendered DAWproject retained muted audio, envelopes, MIDI notes and controllers through save/reopen" << std::endl;
 }
 
 void ProjectSessionTest::render_mix_roundtrip ()
