@@ -510,6 +510,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (native_song_fx_sends_roundtrip);
 	CPPUNIT_TEST (native_song_format_seven_import);
 	CPPUNIT_TEST (native_song_format_eight_import);
+	CPPUNIT_TEST (native_song_format_eight_app_authored);
 	CPPUNIT_TEST (native_song_cancel);
 	CPPUNIT_TEST (native_song_unsupported);
 	CPPUNIT_TEST (native_song_partial_import);
@@ -563,6 +564,7 @@ public:
 	void native_song_fx_sends_roundtrip ();
 	void native_song_format_seven_import ();
 	void native_song_format_eight_import ();
+	void native_song_format_eight_app_authored ();
 	void native_song_cancel ();
 	void native_song_unsupported ();
 	void native_song_partial_import ();
@@ -2488,6 +2490,50 @@ void native_song_older_format_import (unsigned format_version)
 
 void ProjectSessionTest::native_song_format_seven_import () { native_song_older_format_import (7); }
 void ProjectSessionTest::native_song_format_eight_import () { native_song_older_format_import (8); }
+
+void ProjectSessionTest::native_song_format_eight_app_authored ()
+{
+	const char* source = std::getenv ("ARDOUR_STUDIO_ONE_7_TEST_SONG");
+	if (!source || !*source) { return; }
+	Fixture fixture;
+	auto original = PX::StudioOneSong::read (source);
+	CPPUNIT_ASSERT_EQUAL (std::string ("OwlPlug"), original.title);
+	CPPUNIT_ASSERT_EQUAL (std::string ("Studio One/7.2.3.108761"), original.project.application_version);
+	CPPUNIT_ASSERT_EQUAL (44100u, original.sample_rate);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (120, original.project.tempo, 1e-6);
+	CPPUNIT_ASSERT (track_named (original.project, "Synth").kind == PX::TrackKind::MIDI);
+	CPPUNIT_ASSERT (track_named (original.project, "Track").kind == PX::TrackKind::Audio);
+	CPPUNIT_ASSERT (PX::has_unsupported_features (original.project));
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::import_studio_one (*AudioEngine::instance (), source,
+	                     fixture.path ("Strict"), "Strict", fixture.report), PX::ExchangeError);
+	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("Strict"), Glib::FILE_TEST_EXISTS));
+	CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
+	fixture.report.clear ();
+	fixture.session = PX::SessionExchange::import_studio_one (*AudioEngine::instance (), source,
+	                                                          fixture.path ("Partial"), "Partial", fixture.report,
+	                                                          PX::CancelCheck (), true);
+	CPPUNIT_ASSERT (fixture.session);
+	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& d) {
+		return d.disposition == PX::Disposition::Unsupported && d.detail.find ("instrument") != std::string::npos;
+	}));
+	CPPUNIT_ASSERT (fixture.session->route_by_name ("Synth"));
+	CPPUNIT_ASSERT (fixture.session->route_by_name ("Track"));
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("Partial"), "Partial", nullptr, "", true));
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("studio-one-7-return.dawproject"));
+	auto returned = PX::DawProject::read (fixture.path ("studio-one-7-return.dawproject"));
+	CPPUNIT_ASSERT (track_named (returned, "Synth").kind == PX::TrackKind::MIDI);
+	CPPUNIT_ASSERT (track_named (returned, "Track").kind == PX::TrackKind::Audio);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (120, returned.tempo, 1e-6);
+	PX::SessionExchange::ExportOptions options;
+	PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("NativeReturn"), fixture.report, options);
+	auto native_return = PX::StudioOneSong::read (fixture.path ("NativeReturn/Project.song"));
+	CPPUNIT_ASSERT (track_named (native_return.project, "Synth").kind == PX::TrackKind::MIDI);
+	CPPUNIT_ASSERT (track_named (native_return.project, "Track").kind == PX::TrackKind::Audio);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (120, native_return.project.tempo, 1e-6);
+	std::cout << "App-authored Studio One 7 song retained tracks and tempo through partial import, save/reopen, DAWproject and native-song return" << std::endl;
+}
 
 void ProjectSessionTest::native_song_cancel ()
 {
