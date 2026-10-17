@@ -302,10 +302,10 @@ void StudioOneSong::write (const StudioOneSongData& song, const std::string& fil
 	}
 	if (!song.has_range) { end = std::max (end, 1.0); }
 	require (std::isfinite (begin) && std::isfinite (end) && begin >= 0 && end > begin, "Invalid native song range");
-	std::map<std::string, std::string> channels, track_ids, media_ids;
+	std::map<std::string, std::string> channels, channel_names, track_ids, media_ids;
 	std::string master;
 	for (auto const& track : project.tracks) {
-		if (track.kind != TrackKind::Folder) { channels[track.id] = uid (); }
+		if (track.kind != TrackKind::Folder) { channels[track.id] = uid (); channel_names[track.id] = track.name; }
 		if (!track.master) { track_ids[track.id] = uid (); }
 		if (track.master) { master = channels[track.id]; }
 	}
@@ -364,7 +364,9 @@ void StudioOneSong::write (const StudioOneSongData& song, const std::string& fil
 			prop (channel, "gain", track.volume); speaker (channel, "speakerType", track.channels);
 			if (!track.master) {
 				prop (channel, "pan", track.pan); prop (node (channel, "Attributes", "Panner"), "panX1", track.pan);
-				prop (node (channel, "Connection", "destination"), "objectID", channels.at (track.destination) + "/Input");
+				Node destination = node (channel, "Connection", "destination");
+				prop (destination, "objectID", channels.at (track.destination) + "/Input");
+				prop (destination, "friendlyName", channel_names.at (track.destination));
 			}
 		}
 		if (!track.plugins.empty ()) {
