@@ -511,6 +511,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (native_song_cancel);
 	CPPUNIT_TEST (native_song_unsupported);
 	CPPUNIT_TEST (native_song_partial_import);
+	CPPUNIT_TEST (dawproject_partial_import);
 	CPPUNIT_TEST (native_song_instrument_template_import);
 	CPPUNIT_TEST (marker_roundtrip);
 	CPPUNIT_TEST (studio_pro_export);
@@ -561,6 +562,7 @@ public:
 	void native_song_cancel ();
 	void native_song_unsupported ();
 	void native_song_partial_import ();
+	void dawproject_partial_import ();
 	void native_song_instrument_template_import ();
 	void marker_roundtrip ();
 	void studio_pro_export ();
@@ -2456,6 +2458,44 @@ void ProjectSessionTest::native_song_partial_import ()
 	auto returned = PX::DawProject::read (fixture.path ("partial-return.dawproject"));
 	CPPUNIT_ASSERT_EQUAL (size_t (1), track_named (returned, "Native audio").clips.size ());
 	CPPUNIT_ASSERT_EQUAL (std::string ("Native clip"), track_named (returned, "Native audio").clips.front ().name);
+}
+
+void ProjectSessionTest::dawproject_partial_import ()
+{
+	Fixture fixture;
+	auto project = example (fixture);
+	std::string xml = PX::DawProject::write_xml (project);
+	auto root = xml.find ("<Project version=");
+	CPPUNIT_ASSERT (root != std::string::npos);
+	xml.insert (root + std::string ("<Project").size (), " futureFeature=\"unavailable\"");
+	{
+		PX::ProjectArchiveWriter archive (fixture.path ("input.dawproject"));
+		archive.add_text ("project.xml", xml);
+		archive.add_file (project.media.front ().path, fixture.path ("source.wav"));
+		archive.finish ();
+	}
+	auto parsed = PX::DawProject::read (fixture.path ("input.dawproject"));
+	CPPUNIT_ASSERT (PX::has_unsupported_features (parsed));
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"),
+	                     fixture.path ("Strict"), "Strict", fixture.report), PX::ExchangeError);
+	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("Strict"), Glib::FILE_TEST_EXISTS));
+	CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"),
+	                                                           fixture.path ("Partial"), "Partial", fixture.report,
+	                                                           PX::CancelCheck (), true);
+	CPPUNIT_ASSERT (fixture.session);
+	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& item) {
+		return item.disposition == PX::Disposition::Unsupported && item.detail.find ("futureFeature") != std::string::npos;
+	}));
+	CPPUNIT_ASSERT (fixture.session->route_by_name ("Stereo"));
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("Partial"), "Partial", nullptr, "", true));
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("partial-return.dawproject"));
+	auto returned = PX::DawProject::read (fixture.path ("partial-return.dawproject"));
+	CPPUNIT_ASSERT_EQUAL (size_t (2), track_named (returned, "Stereo").clips.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (1), track_named (returned, "Notes").clips.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (2), track_named (returned, "Notes").clips.front ().notes.size ());
 }
 
 void ProjectSessionTest::native_song_instrument_template_import ()

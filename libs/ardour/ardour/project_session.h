@@ -23,11 +23,13 @@ public:
 	/* Requires a running engine with no session attached. Builds in a private
 	 * sibling directory, saves, then moves and reopens the completed session.
 	 * The returned session is attached to the engine and owned by the caller. */
+	/* Unsupported project features are rejected unless the caller explicitly
+	 * accepts a partial import. The returned report still lists every omission. */
 	static std::unique_ptr<Session> import_dawproject (AudioEngine&, const std::string& archive,
 	                                                const std::string& destination, const std::string& snapshot,
-	                                                std::vector<Diagnostic>&, CancelCheck = CancelCheck ());
-	/* Unsupported native-song features are rejected unless the caller explicitly
-	 * accepts a partial import. The returned report still lists every omission. */
+	                                                std::vector<Diagnostic>&, CancelCheck = CancelCheck (),
+	                                                bool allow_unsupported = false);
+	/* The same partial-import rules apply to native Studio One songs. */
 	static std::unique_ptr<Session> import_studio_one (AudioEngine&, const std::string& song,
 	                                                const std::string& destination, const std::string& snapshot,
 	                                                std::vector<Diagnostic>&, CancelCheck = CancelCheck (),

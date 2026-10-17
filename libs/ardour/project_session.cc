@@ -1564,12 +1564,14 @@ SessionExchange::import_logic (AudioEngine& engine, const std::string& aaf, cons
 
 std::unique_ptr<Session>
 SessionExchange::import_dawproject (AudioEngine& engine, const std::string& archive_path, const std::string& destination,
-                                   const std::string& snapshot, std::vector<Diagnostic>& report, CancelCheck cancel)
+                                   const std::string& snapshot, std::vector<Diagnostic>& report, CancelCheck cancel,
+                                   bool allow_unsupported)
 {
 	Project project = DawProject::read (archive_path, cancel);
 	ProjectArchive archive (archive_path, ArchiveLimits (), cancel);
 	return import_session (engine, project, destination, snapshot, report, cancel,
-	                       [&] (const Media& media, const std::string& path) { archive.copy_file (media.path, path); });
+	                       [&] (const Media& media, const std::string& path) { archive.copy_file (media.path, path); },
+	                       std::function<void (Session&)> (), allow_unsupported);
 }
 
 std::unique_ptr<Session>
