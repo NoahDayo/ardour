@@ -652,6 +652,7 @@ ARDOUR_UI::load_session_from_startup_fsm ()
 		request.archive = startup_fsm->session_dawproject;
 		request.destination = startup_fsm->session_path;
 		request.snapshot = startup_fsm->session_name;
+		request.allow_unsupported = startup_fsm->session_dawproject_allow_unsupported ();
 		return ProjectExchangeUI::import_prepared (&_main_window, request, false) ? 0 : -1;
 	}
 	const string     session_path          = startup_fsm->session_path;

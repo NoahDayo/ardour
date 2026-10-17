@@ -84,6 +84,7 @@ StartupFSM::StartupFSM (EngineControl& amd)
 	, session_dialog (0)
 	, pre_release_dialog (0)
 	, plugin_scan_dialog (0)
+	, _session_dawproject_allow_unsupported (false)
 {
 	/* note that our initial state can be any of:
 	 *
@@ -175,6 +176,7 @@ void
 StartupFSM::reset()
 {
 	session_dawproject.clear ();
+	_session_dawproject_allow_unsupported = false;
 	show_session_dialog (new_session_required);
 }
 
@@ -749,6 +751,7 @@ StartupFSM::check_session_parameters (bool must_be_new)
 		ProjectExchangeUI::ImportRequest request;
 		if (!ProjectExchangeUI::prepare_import (session_dialog, session_name, request)) { return 1; }
 		session_dawproject = request.archive;
+		_session_dawproject_allow_unsupported = request.allow_unsupported;
 		session_path = request.destination;
 		session_name = request.snapshot;
 		session_existing_sample_rate = request.sample_rate;
