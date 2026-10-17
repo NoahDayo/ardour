@@ -388,7 +388,8 @@ validate_project (const Project& project)
 	text (project.application_version);
 	for (auto const& marker : project.markers) {
 		text (marker.name);
-		require (nonnegative (marker.position.value), "Invalid marker time");
+		require (nonnegative (marker.position.value) && nonnegative (marker.duration) &&
+		         std::isfinite (marker.position.value + marker.duration), "Invalid marker range");
 	}
 	std::map<std::string, const Media*> media;
 	std::set<std::string> paths;

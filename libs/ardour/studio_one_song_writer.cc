@@ -205,6 +205,9 @@ std::vector<Diagnostic> StudioOneSong::export_report (const Project& project)
 	for (auto const& track : project.tracks) { if (track.kind == TrackKind::Folder) { folders.insert (track.id); } }
 	if (master.empty ()) { unsupported ("Master", "Native song export requires a stereo master output"); }
 	for (auto const& media : project.media) { if (media.channels > 2) { unsupported (media.id, "Native multichannel audio requires the stereo rendered mix option"); } }
+	for (auto const& marker : project.markers) {
+		if (marker.duration > 0) { unsupported (marker.name, "Native song range marker encoding has not been verified; export AAF/MIDI to preserve its duration"); }
+	}
 	for (auto const& track : project.tracks) {
 		if (track.channels > 2) { unsupported (track.name, "Native multichannel tracks require the stereo rendered mix option"); }
 		if (track.master) {

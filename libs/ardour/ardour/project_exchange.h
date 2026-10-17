@@ -121,6 +121,7 @@ struct Track {
 struct Marker {
 	std::string name;
 	Time position;
+	double duration = 0; // Same unit as position; zero denotes a point marker.
 };
 
 struct TempoChange {

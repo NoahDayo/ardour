@@ -1429,7 +1429,7 @@ parse_DescriptiveMarker (AAF_Iface* aafi, aafObject* DescriptiveMarker, td* __pt
 
 	TRACE_OBJ (aafi, DescriptiveMarker, &__td);
 
-	aafPosition_t* length  = aaf_get_propertyValue (DescriptiveMarker, PID_Component_Length, &AAFTypeID_PositionType);
+	aafLength_t*   length  = aaf_get_propertyValue (DescriptiveMarker, PID_Component_Length, &AAFTypeID_LengthType);
 	char*          comment = aaf_get_propertyValue (DescriptiveMarker, PID_Event_Comment, &AAFTypeID_String);
 	char*          name    = aaf_get_propertyValue (DescriptiveMarker, aaf_get_PropertyIDByName (aafi->aafd, "CommentMarkerUser"), &AAFTypeID_String);
 

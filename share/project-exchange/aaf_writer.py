@@ -476,10 +476,16 @@ def write_aaf(root, destination):
             sequence = output.create.Sequence("DescriptiveMetadata")
             for source in sorted(markers, key=lambda m: number(m, "seconds")):
                 seconds = number(source, "seconds")
-                require(0 <= seconds <= (2**63 - 1) / rate, "Invalid AAF marker time")
+                length = float(source.attrib.get("lengthSeconds", "0"))
+                require(math.isfinite(length) and length >= 0 and
+                        0 <= seconds <= (2**63 - 1) / rate - length, "Invalid AAF marker range")
                 position = math.floor(seconds * rate + 0.5)
                 marker = output.create.DescriptiveMarker()
                 marker["Position"].value = position
+                if length:
+                    frames = math.floor(length * rate + 0.5)
+                    require(frames > 0, "AAF marker range is shorter than one sample")
+                    marker["Length"].value = frames
                 marker["Comment"].value = source.attrib["name"]
                 sequence.components.append(marker)
             slot.segment = sequence

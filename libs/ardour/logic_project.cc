@@ -541,11 +541,17 @@ LogicProject::LogicProject (const std::string& path, const std::string& midi, Ca
 	TimeMap timing (project);
 	aafiMarker* marker;
 	AAFI_foreachMarker (self.aaf.get (), marker) {
-		if (marker->length) { project.report.push_back ({Disposition::Unsupported, "AAF markers", "Range markers are not yet supported by project import"}); continue; }
-		Marker value {name (marker->name, name (marker->comment, "Marker")), Time (seconds (marker->start, marker->edit_rate), TimeUnit::Seconds)};
+		Marker value {name (marker->name, name (marker->comment, "Marker")),
+		              Time (seconds (marker->start, marker->edit_rate), TimeUnit::Seconds),
+		              seconds (marker->length, marker->edit_rate)};
 		bool duplicate = false;
-		for (auto const& existing : project.markers) {
-			if (existing.name == value.name && std::fabs (timing.convert (existing.position, TimeUnit::Seconds) - value.position.value) < 1e-6) { duplicate = true; break; }
+		for (auto& existing : project.markers) {
+			if (existing.name == value.name && std::fabs (timing.convert (existing.position, TimeUnit::Seconds) - value.position.value) < 1e-6) {
+				// The companion MIDI carries marker names and positions but no range lengths.
+				if (existing.duration == 0 && value.duration > 0) { existing = value; }
+				else if (std::fabs (existing.duration - value.duration) > 1e-6) { continue; }
+				duplicate = true; break;
+			}
 		}
 		if (!duplicate) { project.markers.push_back (value); }
 	}

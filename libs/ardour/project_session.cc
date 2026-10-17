@@ -685,13 +685,15 @@ void populate (Session& session, const Project& project, const std::map<std::str
 		cancelled (cancel);
 		auto pos = marker.position.unit == TimeUnit::Beats ? Temporal::timepos_t (beats (marker.position.value))
 		           : Temporal::timepos_t (samples (marker.position.value, session.sample_rate ()));
-		auto location = new Location (session, pos, pos, marker.name, Location::IsMark);
+		auto finish = marker.position.unit == TimeUnit::Beats ? Temporal::timepos_t (beats (marker.position.value + marker.duration))
+		              : Temporal::timepos_t (samples (marker.position.value + marker.duration, session.sample_rate ()));
+		auto location = new Location (session, pos, finish, marker.name, marker.duration > 0 ? Location::IsRangeMarker : Location::IsMark);
 		session.locations ()->add (location);
 		if (location->name () != marker.name) { report.push_back ({Disposition::Transformed, "Unnamed marker", "Assigned marker name " + location->name ()}); }
 		if (location->start ().time_domain () != pos.time_domain ()) {
 			report.push_back ({Disposition::Transformed, marker.name, "Marker converted to the session time basis using the tempo map"});
 		}
-		end = std::max (end, pos.samples ());
+		end = std::max (end, finish.samples ());
 	}
 	report.push_back ({Disposition::Transformed, "Panning", "Stereo channels use Ardour's balance panner; pan laws can differ between applications"});
 	session.set_session_extents (Temporal::timepos_t (0), Temporal::timepos_t (std::max (end, samplepos_t (session.sample_rate ()))));
@@ -914,13 +916,20 @@ Project collect_timing (Session& session)
 	}
 	for (auto const& location : session.locations ()->list ()) {
 		if (!location->is_session_range () && !location->is_auto_loop () && !location->is_auto_punch ()) {
-			if (location->flags () != Location::IsMark || !location->cd_info.empty ()) {
-				unsupported (project, location->name (), "Ranges and markers with special playback or CD semantics cannot yet be exchanged");
+			bool range = location->flags () == Location::IsRangeMarker;
+			if ((!range && location->flags () != Location::IsMark) || !location->cd_info.empty ()) {
+				unsupported (project, location->name (), "Markers with special playback or CD semantics cannot yet be exchanged");
 			} else {
 				auto pos = location->start ();
 				Time time = pos.time_domain () == Temporal::BeatTime ? Time (beat_value (pos.beats ()), TimeUnit::Beats)
 				            : Time (double (pos.samples ()) / session.sample_rate (), TimeUnit::Seconds);
-				project.markers.push_back ({location->name (), time});
+				double duration = 0;
+				if (range) {
+					duration = time.unit == TimeUnit::Beats ? beat_value (location->end ().beats ()) - time.value
+					           : double (location->end ().samples () - pos.samples ()) / session.sample_rate ();
+					if (duration <= 0) { unsupported (project, location->name (), "Range marker has no positive duration"); continue; }
+				}
+				project.markers.push_back ({location->name (), time, duration});
 			}
 		}
 	}
@@ -1848,7 +1857,9 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 		item.set_property ("time", timing.convert (marker.position, TimeUnit::Beats));
 		double seconds = timing.convert (marker.position, TimeUnit::Seconds);
 		item.set_property ("seconds", seconds);
-		duration = std::max (duration, seconds);
+		double marker_length = timing.duration (Time (marker.duration, marker.position.unit), marker.position, TimeUnit::Seconds);
+		if (marker.duration > 0) { item.set_property ("lengthSeconds", marker_length); }
+		duration = std::max (duration, seconds + marker_length);
 	}
 	root.set_property ("duration", duration);
 	root.set_property ("durationBeats", timing.convert (Time (duration, TimeUnit::Seconds), TimeUnit::Beats));

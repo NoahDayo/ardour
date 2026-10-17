@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <fstream>
@@ -15,6 +16,7 @@
 #include "ardour/audiosource.h"
 #include "ardour/gain_control.h"
 #include "ardour/logic_project.h"
+#include "ardour/location.h"
 #include "ardour/midi_region.h"
 #include "ardour/midi_model.h"
 #include "ardour/panner_shell.h"
@@ -22,6 +24,7 @@
 #include "ardour/track.h"
 #include "ardour/project_session.h"
 #include "ardour/session.h"
+#include "ardour/studio_one_song.h"
 #include "test_util.h"
 
 using namespace ARDOUR;
@@ -90,6 +93,7 @@ struct Fixture {
 class LogicSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST_SUITE (LogicSessionTest);
 	CPPUNIT_TEST (saved_session_export);
+	CPPUNIT_TEST (range_marker_roundtrip);
 	CPPUNIT_TEST (paired_mono_layout);
 	CPPUNIT_TEST (stereo_balance_roundtrip);
 	CPPUNIT_TEST (stereo_balance_gain_automation_roundtrip);
@@ -112,6 +116,7 @@ class LogicSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST_SUITE_END ();
 public:
 	void saved_session_export ();
+	void range_marker_roundtrip ();
 	void paired_mono_layout ();
 	void stereo_balance_roundtrip ();
 	void stereo_balance_gain_automation_roundtrip ();
@@ -718,6 +723,59 @@ void LogicSessionTest::flat_mixer_automation ()
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (4, output.project ().tracks[1].volume_automation.points.back ().time, 1e-9);
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (.5, output.project ().tracks[1].volume_automation.points.back ().value, 1e-9);
 	control.reset ();
+}
+
+void LogicSessionTest::range_marker_roundtrip ()
+{
+	Fixture fixture;
+	auto rate = fixture.session->sample_rate ();
+	fixture.session->locations ()->add (new Location (*fixture.session,
+	        Temporal::timepos_t (samplepos_t (2 * rate)), Temporal::timepos_t (samplepos_t (3 * rate)),
+	        "Bridge range", Location::IsRangeMarker));
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("range.dawproject"), fixture.report), PX::ExchangeError);
+	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("range.dawproject"), Glib::FILE_TEST_EXISTS));
+	PX::SessionExchange::export_logic (*fixture.session, fixture.path ("Ranges"), fixture.report);
+	std::string aaf_path = fixture.path ("Ranges/Project.aaf"), midi_path = fixture.path ("Ranges/Project.mid");
+	std::unique_ptr<AAF_Iface, void (*) (AAF_Iface*)> aaf (aafi_alloc (nullptr), [] (AAF_Iface* value) { aafi_release (&value); });
+	CPPUNIT_ASSERT (aaf);
+	CPPUNIT_ASSERT_EQUAL (0, aafi_load_file (aaf.get (), aaf_path.c_str ()));
+	unsigned range_count = 0;
+	aafiMarker* marker;
+	AAFI_foreachMarker (aaf.get (), marker) {
+		if (marker->length > 0) {
+			CPPUNIT_ASSERT_EQUAL (std::string ("Bridge range"), std::string (marker->comment));
+			CPPUNIT_ASSERT_DOUBLES_EQUAL (1.0, double (marker->length) / aafRationalToDouble (*marker->edit_rate), 1.0 / rate);
+			++range_count;
+		}
+	}
+	CPPUNIT_ASSERT_EQUAL (1u, range_count);
+	PX::LogicProject parsed (aaf_path, midi_path);
+	CPPUNIT_ASSERT (!PX::has_unsupported_features (parsed.project ()));
+	CPPUNIT_ASSERT_EQUAL (size_t (2), parsed.project ().markers.size ());
+	auto found = std::find_if (parsed.project ().markers.begin (), parsed.project ().markers.end (), [] (const PX::Marker& item) { return item.name == "Bridge range"; });
+	CPPUNIT_ASSERT (found != parsed.project ().markers.end ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (2.0, found->position.value, 1.0 / rate);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (1.0, found->duration, 1.0 / rate);
+	auto native_report = PX::StudioOneSong::export_report (parsed.project ());
+	CPPUNIT_ASSERT (std::any_of (native_report.begin (), native_report.end (), [] (const PX::Diagnostic& item) {
+		return item.disposition == PX::Disposition::Unsupported && item.object == "Bridge range";
+	}));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_logic (*AudioEngine::instance (), aaf_path, midi_path,
+	                  fixture.path ("ImportedRanges"), "ImportedRanges", fixture.report);
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("ImportedRanges"), "ImportedRanges", nullptr, "", true));
+	AudioEngine::instance ()->set_session (fixture.session.get ());
+	unsigned restored = 0;
+	for (auto const& location : fixture.session->locations ()->list ()) {
+		if (location->name () == "Bridge range") {
+			CPPUNIT_ASSERT (location->is_range_marker ());
+			CPPUNIT_ASSERT_EQUAL (samplepos_t (2 * rate), location->start_sample ());
+			CPPUNIT_ASSERT_EQUAL (samplepos_t (3 * rate), location->end_sample ());
+			++restored;
+		}
+	}
+	CPPUNIT_ASSERT_EQUAL (1u, restored);
 }
 
 void LogicSessionTest::saved_session_export ()

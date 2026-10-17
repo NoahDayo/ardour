@@ -1042,6 +1042,7 @@ struct Writer {
 			for (auto const& marker : project.markers) { if (marker.position.unit != unit) { unit = TimeUnit::Seconds; break; } }
 			property (markers, "timeUnit", unit_name (unit));
 			for (auto const& marker : project.markers) {
+				if (marker.duration > 0) { throw ExchangeError ("DAWproject cannot store range marker durations; export AAF/MIDI to preserve them"); }
 				Node item = element (markers, "Marker");
 				property (item, "name", marker.name);
 				property (item, "time", timing.convert (marker.position, unit));
