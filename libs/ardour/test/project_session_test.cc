@@ -481,6 +481,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST_SUITE (ProjectSessionTest);
 	CPPUNIT_TEST (roundtrip);
 	CPPUNIT_TEST (multichannel_audio_roundtrip);
+	CPPUNIT_TEST (surround_aaf_roundtrip);
 	CPPUNIT_TEST (midi_controller_roundtrip);
 	CPPUNIT_TEST (midi_ramp_roundtrip);
 	CPPUNIT_TEST (native_midi_curves_roundtrip);
@@ -536,6 +537,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 public:
 	void roundtrip ();
 	void multichannel_audio_roundtrip ();
+	void surround_aaf_roundtrip ();
 	void midi_controller_roundtrip ();
 	void midi_ramp_roundtrip ();
 	void native_midi_curves_roundtrip ();
@@ -2780,10 +2782,13 @@ void ProjectSessionTest::multichannel_audio_roundtrip ()
 		track->output ()->audio (channel)->get_connections (connections);
 		CPPUNIT_ASSERT (connections.empty ());
 	}
-	for (auto const& region : *track->playlist ()->region_list ()) {
-		auto audio = std::dynamic_pointer_cast<AudioRegion> (region);
-		CPPUNIT_ASSERT (audio);
-		CPPUNIT_ASSERT_EQUAL (uint32_t (4), audio->n_channels ());
+	{
+		auto initial_regions = track->playlist ()->region_list ();
+		for (auto const& region : *initial_regions) {
+			auto audio = std::dynamic_pointer_cast<AudioRegion> (region);
+			CPPUNIT_ASSERT (audio);
+			CPPUNIT_ASSERT_EQUAL (uint32_t (4), audio->n_channels ());
+		}
 	}
 	PX::SessionExchange::ExportOptions rendered;
 	rendered.render_mix = true;
@@ -2829,10 +2834,13 @@ void ProjectSessionTest::multichannel_audio_roundtrip ()
 	track = std::dynamic_pointer_cast<ARDOUR::Track> (fixture.session->route_by_name ("Quad"));
 	CPPUNIT_ASSERT (track);
 	CPPUNIT_ASSERT_EQUAL (4u, track->input ()->n_ports ().n_audio ());
-	for (auto const& region : *track->playlist ()->region_list ()) {
-		auto audio = std::dynamic_pointer_cast<AudioRegion> (region);
-		CPPUNIT_ASSERT (audio);
-		CPPUNIT_ASSERT_EQUAL (uint32_t (4), audio->n_channels ());
+	{
+		auto imported_regions = track->playlist ()->region_list ();
+		for (auto const& region : *imported_regions) {
+			auto audio = std::dynamic_pointer_cast<AudioRegion> (region);
+			CPPUNIT_ASSERT (audio);
+			CPPUNIT_ASSERT_EQUAL (uint32_t (4), audio->n_channels ());
+		}
 	}
 	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("quad-aaf-return.dawproject"));
 	auto aaf_return = PX::DawProject::read (fixture.path ("quad-aaf-return.dawproject"));
@@ -2844,6 +2852,80 @@ void ProjectSessionTest::multichannel_audio_roundtrip ()
 	CPPUNIT_ASSERT_EQUAL (samplecnt_t (rate * 2), aaf_source.length ());
 	CPPUNIT_ASSERT_EQUAL (samplecnt_t (actual.size ()), aaf_source.read (actual.data (), actual.size ()));
 	for (size_t i = 0; i < pcm.size (); ++i) { CPPUNIT_ASSERT_EQUAL (pcm[i], actual[i]); }
+}
+
+void ProjectSessionTest::surround_aaf_roundtrip ()
+{
+	for (unsigned channels : {6u, 8u}) {
+		Fixture fixture;
+		auto project = example (fixture);
+		project.media[0].channels = channels;
+		project.tracks.erase (project.tracks.begin () + 1);
+		project.tracks.pop_back ();
+		auto& surround = project.tracks.back ();
+		surround.name = "Surround"; surround.channels = channels;
+		surround.parent.clear (); surround.destination = "master"; surround.pan = .5;
+		unsigned rate = project.media[0].sample_rate;
+		SF_INFO info = {}; info.channels = channels; info.samplerate = rate; info.format = SF_FORMAT_WAV | SF_FORMAT_FLOAT;
+		SNDFILE* file = sf_open (fixture.path ("source.wav").c_str (), SFM_WRITE, &info);
+		CPPUNIT_ASSERT (file);
+		std::vector<float> pcm (rate * 2 * channels);
+		for (size_t frame = 0; frame < rate * 2; ++frame) {
+			for (unsigned channel = 0; channel < channels; ++channel) {
+				pcm[channels * frame + channel] = float ((int (frame % 17) - 8) * int (channel + 1)) / 256;
+			}
+		}
+		CPPUNIT_ASSERT_EQUAL (sf_count_t (rate * 2), sf_writef_float (file, pcm.data (), rate * 2));
+		CPPUNIT_ASSERT_EQUAL (0, sf_close (file));
+		package (fixture, project);
+		fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"), fixture.path ("SurroundSession"), "SurroundSession", fixture.report);
+		CPPUNIT_ASSERT (fixture.session);
+		AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+		fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("SurroundSession"), "SurroundSession", nullptr, "", true));
+		AudioEngine::instance ()->set_session (fixture.session.get ());
+		auto route = std::dynamic_pointer_cast<ARDOUR::Track> (fixture.session->route_by_name ("Surround"));
+		CPPUNIT_ASSERT (route);
+		CPPUNIT_ASSERT_EQUAL (channels, route->input ()->n_ports ().n_audio ());
+		CPPUNIT_ASSERT_EQUAL (channels, route->output ()->n_ports ().n_audio ());
+		PX::SessionExchange::export_logic (*fixture.session, fixture.path ("SurroundAAF"), fixture.report);
+		PX::LogicProject aaf (fixture.path ("SurroundAAF/Project.aaf"), fixture.path ("SurroundAAF/Project.mid"));
+		auto const& aaf_track = track_named (aaf.project (), "Surround");
+		CPPUNIT_ASSERT_EQUAL (channels, aaf_track.channels);
+		CPPUNIT_ASSERT_EQUAL (size_t (2), aaf_track.clips.size ());
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (.75, aaf_track.volume, 1e-6);
+		CPPUNIT_ASSERT_EQUAL (channels, aaf.project ().media.front ().channels);
+		route.reset ();
+		AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+		fixture.session = PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("SurroundAAF/Project.aaf"), fixture.path ("SurroundAAF/Project.mid"), fixture.path ("SurroundReturn"), "SurroundReturn", fixture.report);
+		CPPUNIT_ASSERT (fixture.session);
+		AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+		fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("SurroundReturn"), "SurroundReturn", nullptr, "", true));
+		AudioEngine::instance ()->set_session (fixture.session.get ());
+		route = std::dynamic_pointer_cast<ARDOUR::Track> (fixture.session->route_by_name ("Surround"));
+		CPPUNIT_ASSERT (route);
+		CPPUNIT_ASSERT_EQUAL (channels, route->input ()->n_ports ().n_audio ());
+		CPPUNIT_ASSERT_EQUAL (size_t (2), route->playlist ()->region_list ()->size ());
+		{
+			auto regions = route->playlist ()->region_list ();
+			for (auto const& region : *regions) {
+				auto audio = std::dynamic_pointer_cast<AudioRegion> (region);
+				CPPUNIT_ASSERT (audio);
+				CPPUNIT_ASSERT_EQUAL (uint32_t (channels), audio->n_channels ());
+			}
+		}
+		PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("surround-return.dawproject"));
+		auto returned = PX::DawProject::read (fixture.path ("surround-return.dawproject"));
+		CPPUNIT_ASSERT_EQUAL (channels, track_named (returned, "Surround").channels);
+		CPPUNIT_ASSERT_EQUAL (channels, returned.media.front ().channels);
+		PX::ProjectArchive (fixture.path ("surround-return.dawproject")).copy_file (returned.media.front ().path, fixture.path ("surround-verify.wav"));
+		SndFileImportableSource source (fixture.path ("surround-verify.wav"));
+		CPPUNIT_ASSERT_EQUAL (uint32_t (channels), source.channels ());
+		CPPUNIT_ASSERT_EQUAL (samplecnt_t (rate * 2), source.length ());
+		std::vector<Sample> actual (pcm.size ());
+		CPPUNIT_ASSERT_EQUAL (samplecnt_t (actual.size ()), source.read (actual.data (), actual.size ()));
+		for (size_t i = 0; i < pcm.size (); ++i) { CPPUNIT_ASSERT_EQUAL (pcm[i], actual[i]); }
+		route.reset ();
+	}
 }
 
 void ProjectSessionTest::bad_media ()
