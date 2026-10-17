@@ -584,6 +584,34 @@ void LogicSessionTest::aaf_transitions ()
 		CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("Invalid"), Glib::FILE_TEST_EXISTS));
 		CPPUNIT_ASSERT (!AudioEngine::instance ()->session ());
 	}
+	{
+		auto source = fixture.path ("Fixtures/spline.aaf");
+		PX::LogicProject checked (source);
+		CPPUNIT_ASSERT (PX::has_unsupported_features (checked.project ()));
+		CPPUNIT_ASSERT (!PX::has_aaf_reader_errors (checked.project ()));
+		fixture.session = PX::SessionExchange::import_logic (*AudioEngine::instance (), source, "",
+		                         fixture.path ("PartialSpline"), "PartialSpline", fixture.report, PX::CancelCheck (), true);
+		CPPUNIT_ASSERT (fixture.session);
+		CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& item) {
+			return item.disposition == PX::Disposition::Unsupported && item.detail.find ("dissolve curve") != std::string::npos;
+		}));
+		CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+		AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+		fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("PartialSpline"), "PartialSpline", nullptr, "", true));
+		AudioEngine::instance ()->set_session (fixture.session.get ());
+		auto track = std::dynamic_pointer_cast<Track> (fixture.session->route_by_name ("Dissolves"));
+		CPPUNIT_ASSERT (track);
+		CPPUNIT_ASSERT_EQUAL (size_t (2), track->playlist ()->region_list ()->size ());
+		PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("partial-spline.dawproject"));
+		auto returned = PX::DawProject::read (fixture.path ("partial-spline.dawproject"));
+		auto found = std::find_if (returned.tracks.begin (), returned.tracks.end (), [] (const PX::Track& value) { return value.name == "Dissolves"; });
+		CPPUNIT_ASSERT (found != returned.tracks.end ());
+		CPPUNIT_ASSERT_EQUAL (size_t (2), found->clips.size ());
+		AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+		CPPUNIT_ASSERT_THROW (PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("Fixtures/bad-level.aaf"),
+		                      "", fixture.path ("InvalidPartial"), "InvalidPartial", fixture.report, PX::CancelCheck (), true), PX::ExchangeError);
+		CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("InvalidPartial"), Glib::FILE_TEST_EXISTS));
+	}
 	unsigned calls = 0;
 	CPPUNIT_ASSERT_THROW (PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("Fixtures/custom.aaf"), "", fixture.path ("Cancelled"), "Cancelled", fixture.report, [&] { return ++calls > 8; }), PX::ArchiveCancelled);
 	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("Cancelled"), Glib::FILE_TEST_EXISTS));

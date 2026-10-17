@@ -439,6 +439,13 @@ struct LogicProject::Impl {
 	}
 };
 
+bool has_aaf_reader_errors (const Project& project)
+{
+	return std::any_of (project.report.begin (), project.report.end (), [] (const Diagnostic& item) {
+		return item.disposition == Disposition::Unsupported && item.object == "AAF reader";
+	});
+}
+
 LogicProject::LogicProject (const std::string& path, const std::string& midi, CancelCheck cancel) : _impl (new Impl (cancel))
 {
 	auto& self = *_impl; self.check ();
@@ -449,7 +456,7 @@ LogicProject::LogicProject (const std::string& path, const std::string& midi, Ca
 	self.check ();
 	auto& project = self.project;
 	project.application = "AAF and Standard MIDI File";
-	if (has_unsupported_features (project)) { return; }
+	if (has_aaf_reader_errors (project)) { return; }
 	Track master; master.id = "aaf-master"; master.name = "Master"; master.kind = TrackKind::Bus; master.master = true;
 	project.tracks.push_back (master);
 	if (self.aaf->Video && self.aaf->Video->Tracks) { project.report.push_back ({Disposition::Unsupported, "AAF video", "Video tracks are not yet supported by project import"}); }

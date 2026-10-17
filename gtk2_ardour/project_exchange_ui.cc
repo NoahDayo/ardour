@@ -239,7 +239,9 @@ bool ProjectExchangeUI::prepare_import (Gtk::Window* parent, std::string const& 
 		}
 		report = project.report;
 		if (PX::has_unsupported_features (project)) {
-			if (aaf_project (dialog.archive ())) { throw PX::ExchangeError (_("This project contains features that cannot yet be imported.")); }
+			if (aaf_project (dialog.archive ()) && PX::has_aaf_reader_errors (project)) {
+				throw PX::ExchangeError (_("AAF reader errors prevent a safe partial import."));
+			}
 			request.allow_unsupported = show_report (*parent, _("Some content cannot be imported"),
 				_("The items listed below will be omitted or changed. Import the supported tracks and clips anyway?"),
 				report, true) == Gtk::RESPONSE_ACCEPT;
@@ -302,7 +304,7 @@ bool ProjectExchangeUI::import_prepared (Gtk::Window* parent, ImportRequest cons
 		ExchangeProgress progress (*parent, _("Importing Project"));
 		auto check = [&] { return progress.check (); };
 		auto session = aaf_project (archive)
-		    ? PX::SessionExchange::import_logic (engine, archive, request.midi, destination, snapshot, report, check)
+		    ? PX::SessionExchange::import_logic (engine, archive, request.midi, destination, snapshot, report, check, request.allow_unsupported)
 		    : native_song (archive)
 		    ? PX::SessionExchange::import_studio_one (engine, archive, destination, snapshot, report, check, request.allow_unsupported)
 		    : PX::SessionExchange::import_dawproject (engine, archive, destination, snapshot, report, check, request.allow_unsupported);

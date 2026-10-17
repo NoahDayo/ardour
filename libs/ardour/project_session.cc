@@ -1557,9 +1557,22 @@ SessionExchange::import_logic (AudioEngine& engine, const std::string& aaf, cons
                               const std::string& destination, const std::string& snapshot,
                               std::vector<Diagnostic>& report, CancelCheck cancel)
 {
+	return import_logic (engine, aaf, midi, destination, snapshot, report, cancel, false);
+}
+
+std::unique_ptr<Session>
+SessionExchange::import_logic (AudioEngine& engine, const std::string& aaf, const std::string& midi,
+                              const std::string& destination, const std::string& snapshot,
+                              std::vector<Diagnostic>& report, CancelCheck cancel, bool allow_unsupported)
+{
 	LogicProject project (aaf, midi, cancel);
+	if (has_aaf_reader_errors (project.project ())) {
+		report = project.project ().report;
+		throw ExchangeError ("AAF reader errors prevent a safe partial import");
+	}
 	return import_session (engine, project.project (), destination, snapshot, report, cancel,
-	                       [&] (const Media& media, const std::string& path) { project.copy_media (media, path); });
+	                       [&] (const Media& media, const std::string& path) { project.copy_media (media, path); },
+	                       std::function<void (Session&)> (), allow_unsupported);
 }
 
 std::unique_ptr<Session>

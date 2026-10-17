@@ -21,6 +21,10 @@ private:
 	std::unique_ptr<Impl> _impl;
 };
 
+/* AAF reader errors can leave the project model incomplete. They must never
+ * be accepted as ordinary, user-approved partial-import omissions. */
+LIBARDOUR_API bool has_aaf_reader_errors (const Project&);
+
 /* Append note tracks and transport information from a bounded type-0/1 SMF.
  * The AAF origin is timecode seconds, while resulting clips start at beat zero. */
 LIBARDOUR_API void read_project_midi (const std::string&, Project&, double aaf_origin, CancelCheck = CancelCheck ());
