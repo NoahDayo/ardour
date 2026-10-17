@@ -72,11 +72,22 @@ struct LogicProject::Impl {
 		}
 		curve.unit = TimeUnit::Seconds;
 		double duration = seconds (gain->length, rate), previous = -1;
+		bool redundant_end_point = false;
 		for (unsigned i = 0; i < gain->pts_cnt; ++i) {
 			double fraction = rational (&gain->time[i]);
+			if (fraction == 1 && previous == 1) {
+				/* Some AAF writers append another control value at the exact end
+				 * of an operation. It spans no audio samples, so retain the first
+				 * endpoint and report the omitted terminal value. */
+				redundant_end_point = true;
+				continue;
+			}
 			require (fraction >= 0 && fraction <= 1 && fraction > previous, "Invalid or unordered AAF automation times");
 			curve.points.push_back ({fraction * duration, rational (&gain->value[i]), interpolation == AAFI_INTERPOL_LINEAR});
 			previous = fraction;
+		}
+		if (redundant_end_point) {
+			project.report.push_back ({Disposition::Transformed, label, "Repeated AAF control points at the operation end have zero duration; retained the first endpoint"});
 		}
 		return curve.points.front ().value;
 	}

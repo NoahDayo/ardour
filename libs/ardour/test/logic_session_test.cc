@@ -236,6 +236,13 @@ void LogicSessionTest::paired_mono_layout ()
 	CPPUNIT_ASSERT_EQUAL (1u, independent.project ().tracks[2].channels);
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (.625, PX::automation_value (independent.project ().tracks[1].volume_automation, .5625), 1e-7);
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (.3125, PX::automation_value (independent.project ().tracks[2].volume_automation, .5625), 1e-7);
+	PX::LogicProject terminal (fixture.path ("SplitFixtures/TerminalDuplicate.aaf"));
+	CPPUNIT_ASSERT (!PX::has_unsupported_features (terminal.project ()));
+	CPPUNIT_ASSERT_EQUAL (size_t (2), terminal.project ().tracks[1].volume_automation.points.size ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.75, terminal.project ().tracks[1].volume_automation.points.back ().value, 1e-7);
+	CPPUNIT_ASSERT (std::any_of (terminal.project ().report.begin (), terminal.project ().report.end (), [] (const PX::Diagnostic& item) {
+		return item.detail.find ("Repeated AAF control points") != std::string::npos;
+	}));
 	PX::LogicProject partial (fixture.path ("SplitFixtures/PartialTag.aaf"));
 	CPPUNIT_ASSERT_EQUAL (size_t (3), partial.project ().tracks.size ());
 	CPPUNIT_ASSERT_EQUAL (1u, partial.project ().tracks[1].channels);
