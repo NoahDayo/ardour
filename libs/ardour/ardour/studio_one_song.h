@@ -16,6 +16,7 @@ struct StudioOneSongData {
 	Project project;
 	std::string title;
 	unsigned sample_rate = 48000;
+	unsigned format_version = 9;
 	std::map<std::string, std::string> audio_files;
 	std::vector<SongMarker> markers;
 	Time start;

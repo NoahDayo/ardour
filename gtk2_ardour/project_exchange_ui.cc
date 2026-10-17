@@ -369,6 +369,16 @@ static void export_project (Gtk::Window* parent, ExportKind kind)
 	native_hint.set_line_wrap (true);
 	native_hint.set_alignment (0, 0.5);
 	if (native) { options_box.pack_start (native_hint, false, false); }
+	Gtk::HBox native_format_row (false, 8);
+	Gtk::Label native_format_label (_("Target song format:"));
+	Gtk::ComboBoxText native_format;
+	native_format.append_text (_("Studio One 6 (format 7)"));
+	native_format.append_text (_("Studio One 7 (format 8)"));
+	native_format.append_text (_("Fender Studio Pro 8 (format 9)"));
+	native_format.set_active (2);
+	native_format_row.pack_start (native_format_label, false, false);
+	native_format_row.pack_start (native_format, true, true);
+	if (native) { options_box.pack_start (native_format_row, false, false); }
 	Gtk::ComboBoxText render_mode;
 	render_mode.append_text (_("Editable project"));
 	render_mode.append_text (_("Render current mix as one stereo audio track"));
@@ -399,6 +409,7 @@ static void export_project (Gtk::Window* parent, ExportKind kind)
 	options.render_mix = render_mode.get_active_row_number () == 1;
 	options.render_stems = render_mode.get_active_row_number () == 2;
 	options.render_tail_seconds = tail.get_value ();
+	if (native && native_format.get_active_row_number () >= 0) { options.studio_one_format_version = 7 + native_format.get_active_row_number (); }
 	dialog.hide ();
 	if (dawproject && (destination.size () < 11 || g_ascii_strcasecmp (destination.c_str () + destination.size () - 11, ".dawproject"))) { destination += ".dawproject"; }
 	std::vector<PX::Diagnostic> report;

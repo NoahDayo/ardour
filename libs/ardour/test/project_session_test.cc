@@ -884,6 +884,10 @@ void ProjectSessionTest::native_song_export_roundtrip ()
 	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
 	const std::string saved = Glib::file_get_contents (fixture.path ("NativeSource/NativeSource.ardour"));
 	PX::SessionExchange::ExportOptions options;
+	options.studio_one_format_version = 6;
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("InvalidVersion"), fixture.report, options), PX::ExchangeError);
+	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("InvalidVersion"), Glib::FILE_TEST_EXISTS));
+	options.studio_one_format_version = 9;
 	PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("Exported Song"), fixture.report, options);
 	CPPUNIT_ASSERT_EQUAL (saved, Glib::file_get_contents (fixture.path ("NativeSource/NativeSource.ardour")));
 	CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
@@ -894,6 +898,7 @@ void ProjectSessionTest::native_song_export_roundtrip ()
 	CPPUNIT_ASSERT_EQUAL (0, g_rename (fixture.path ("Exported Song").c_str (), fixture.path ("Moved Song").c_str ()));
 	auto output = PX::StudioOneSong::read (fixture.path ("Moved Song/Project.song"));
 	CPPUNIT_ASSERT_EQUAL (std::string ("NativeSource"), output.title);
+	CPPUNIT_ASSERT_EQUAL (9u, output.format_version);
 	auto const& exported_folder = track_named (output.project, "Band");
 	CPPUNIT_ASSERT_EQUAL (PX::TrackKind::Folder, exported_folder.kind);
 	CPPUNIT_ASSERT_EQUAL (exported_folder.id, track_named (output.project, "Stereo").parent);
@@ -2471,6 +2476,7 @@ void native_song_older_format_import (unsigned format_version)
 {
 	Fixture fixture; native_package (fixture, false, false, false, format_version);
 	auto original = PX::StudioOneSong::read (fixture.path ("input.song"));
+	CPPUNIT_ASSERT_EQUAL (format_version, original.format_version);
 	CPPUNIT_ASSERT (std::any_of (original.project.report.begin (), original.project.report.end (), [format_version] (const PX::Diagnostic& d) {
 		return d.disposition == PX::Disposition::Transformed && d.detail.find ("format " + std::to_string (format_version)) != std::string::npos;
 	}));
@@ -2482,6 +2488,11 @@ void native_song_older_format_import (unsigned format_version)
 	PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("UpgradedSong"), fixture.report, options);
 	PX::ProjectArchive archive (fixture.path ("UpgradedSong/Project.song"));
 	CPPUNIT_ASSERT (archive.read_text ("metainfo.xml").find ("Document:FormatVersion\" value=\"9") != std::string::npos);
+	options.studio_one_format_version = format_version;
+	PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("VersionMatchedSong"), fixture.report, options);
+	auto matched = PX::StudioOneSong::read (fixture.path ("VersionMatchedSong/Project.song"));
+	CPPUNIT_ASSERT_EQUAL (format_version, matched.format_version);
+	CPPUNIT_ASSERT_EQUAL (size_t (1), track_named (matched.project, "Native audio").clips.size ());
 	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("older-format-return.dawproject"));
 	auto returned = PX::DawProject::read (fixture.path ("older-format-return.dawproject"));
 	CPPUNIT_ASSERT_EQUAL (size_t (1), track_named (returned, "Native audio").clips.size ());
@@ -2529,9 +2540,16 @@ void ProjectSessionTest::native_song_format_eight_app_authored ()
 	PX::SessionExchange::ExportOptions options;
 	PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("NativeReturn"), fixture.report, options);
 	auto native_return = PX::StudioOneSong::read (fixture.path ("NativeReturn/Project.song"));
+	CPPUNIT_ASSERT_EQUAL (9u, native_return.format_version);
 	CPPUNIT_ASSERT (track_named (native_return.project, "Synth").kind == PX::TrackKind::MIDI);
 	CPPUNIT_ASSERT (track_named (native_return.project, "Track").kind == PX::TrackKind::Audio);
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (120, native_return.project.tempo, 1e-6);
+	options.studio_one_format_version = 8;
+	PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("StudioOne7Return"), fixture.report, options);
+	auto version_matched = PX::StudioOneSong::read (fixture.path ("StudioOne7Return/Project.song"));
+	CPPUNIT_ASSERT_EQUAL (8u, version_matched.format_version);
+	CPPUNIT_ASSERT (track_named (version_matched.project, "Synth").kind == PX::TrackKind::MIDI);
+	CPPUNIT_ASSERT (track_named (version_matched.project, "Track").kind == PX::TrackKind::Audio);
 	std::cout << "App-authored Studio One 7 song retained tracks and tempo through partial import, save/reopen, DAWproject and native-song return" << std::endl;
 }
 

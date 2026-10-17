@@ -279,6 +279,7 @@ void StudioOneSong::write (const StudioOneSongData& song, const std::string& fil
 	for (auto const& item : report) { if (item.disposition == Disposition::Unsupported) { throw ExchangeError (item.object + ": " + item.detail); } }
 	require (g_path_is_absolute (filename.c_str ()) && g_path_is_absolute (document_path.c_str ()), "Native song filenames must be absolute");
 	require (song.sample_rate >= 8000 && song.sample_rate <= 768000, "Invalid native song sample rate");
+	require (song.format_version >= 7 && song.format_version <= 9, "Native song export format must be 7, 8 or 9");
 	File output = file (filename), published = file (document_path);
 	File parent (g_file_get_parent (output.get ()), g_object_unref), final_parent (g_file_get_parent (published.get ()), g_object_unref);
 	require (parent && final_parent, "Native song requires a parent folder");
@@ -304,7 +305,7 @@ void StudioOneSong::write (const StudioOneSongData& song, const std::string& fil
 	}
 	Document meta ("MetaInformation"), arrangement ("Song"), pool ("MediaPool"), mixer ("AudioMixer"), midi ("MusicTrackDevice");
 	auto attribute = [&] (const char* id, const std::string& value) { Node a = node (meta.root, "Attribute"); prop (a, "id", id); prop (a, "value", value); };
-	attribute ("Document:MimeType", "application/x.presonus-song"); attribute ("Document:FormatVersion", "9");
+	attribute ("Document:MimeType", "application/x.presonus-song"); attribute ("Document:FormatVersion", number (song.format_version));
 	attribute ("Document:Generator", "Ardour Project Exchange"); attribute ("Document:Title", song.title);
 	attribute ("Media:SampleRate", number (song.sample_rate)); attribute ("Media:Tempo", number (project.tempo));
 	attribute ("Media:TimeSignatureNumerator", number (project.numerator)); attribute ("Media:TimeSignatureDenominator", number (project.denominator));

@@ -18,6 +18,7 @@ public:
 		bool render_mix = false;
 		bool render_stems = false;
 		double render_tail_seconds = 2.0;
+		unsigned studio_one_format_version = 9;
 		bool rendered () const { return render_mix || render_stems; }
 	};
 	/* Inspect plug-in availability before showing the partial-import choice.
@@ -66,7 +67,7 @@ public:
 	static void export_logic (Session&, const std::string& destination,
 	                          std::vector<Diagnostic>& report, const ExportOptions&, CancelCheck = CancelCheck ());
 	/* A new portable folder with Project.song and collected Media. Native
-	 * format version 9 is experimental pending target-application validation. */
+	 * formats 7, 8 and 9 are experimental pending target-application validation. */
 	static void export_studio_one (Session&, const std::string& destination,
 	                               std::vector<Diagnostic>& report, const ExportOptions&, CancelCheck = CancelCheck ());
 };

@@ -658,6 +658,7 @@ StudioOneSongData Reader::read ()
 	require (metadata["Document:MimeType"] == "application/x.presonus-song", "This file is not a Studio One song");
 	std::string format_version = metadata["Document:FormatVersion"];
 	require (format_version == "7" || format_version == "8" || format_version == "9", "This Studio One native format version has not yet been validated (supported: 7, 8, 9)");
+	result.format_version = static_cast<unsigned> (format_version[0] - '0');
 	result.project.application = "Studio One / Studio Pro"; result.project.application_version = metadata["Document:Generator"];
 	result.title = metadata["Document:Title"];
 	Node song = document ("Song/song.xml", "Song"); Node root_node = child (song, "Attributes", "Root"); require (root_node, "Native song has no arrangement");
@@ -729,7 +730,7 @@ StudioOneSongData Reader::read ()
 	validate_project (result.project);
 	if (format_version == "7" || format_version == "8") {
 		result.project.report.push_back ({Disposition::Transformed, "Native Studio One song",
-		                                   "Studio One format " + format_version + " imported; native re-export writes format 9"});
+		                                   "Studio One format " + format_version + " imported; native re-export defaults to format 9 unless an older target format is selected"});
 	}
 	result.project.report.push_back ({Disposition::Preserved, "Native Studio One song", "Audio, MIDI notes, clip positions and gain, track names, colors, static mixer controls, audio-bus routing, ordinary sends and tempo/meter steps read directly from the .song file"});
 	return result;
