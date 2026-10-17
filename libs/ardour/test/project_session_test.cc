@@ -496,6 +496,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (nested_looped_dawproject_roundtrip);
 	CPPUNIT_TEST (mixed_time_looped_dawproject_roundtrip);
 	CPPUNIT_TEST (mixed_time_nested_looped_dawproject_roundtrip);
+	CPPUNIT_TEST (ramped_nested_looped_dawproject_roundtrip);
 	CPPUNIT_TEST (multichannel_audio_roundtrip);
 	CPPUNIT_TEST (surround_aaf_roundtrip);
 	CPPUNIT_TEST (midi_controller_roundtrip);
@@ -558,6 +559,7 @@ public:
 	void nested_looped_dawproject_roundtrip ();
 	void mixed_time_looped_dawproject_roundtrip ();
 	void mixed_time_nested_looped_dawproject_roundtrip ();
+	void ramped_nested_looped_dawproject_roundtrip ();
 	void multichannel_audio_roundtrip ();
 	void surround_aaf_roundtrip ();
 	void midi_controller_roundtrip ();
@@ -3170,6 +3172,95 @@ contentTimeUnit="beats" playStart="1" loopStart="0" loopEnd="3"><Clips timeUnit=
 	CPPUNIT_ASSERT (!audio.front ().envelope.points.empty ());
 	CPPUNIT_ASSERT (!audio.back ().envelope.points.empty ());
 	std::cout << "Nested mixed-time DAWproject loops survived variable-tempo session save/reopen and return" << std::endl;
+}
+
+void ProjectSessionTest::ramped_nested_looped_dawproject_roundtrip ()
+{
+	Fixture fixture;
+	auto source = example (fixture);
+	std::string xml = R"(<Project version="1.0"><Application name="Ramp loop fixture" version="1"/>
+<Transport><Tempo id="tempo-map" unit="bpm" value="60"/><TimeSignature numerator="4" denominator="4"/></Transport>
+<Structure><Track id="audio" name="Ramped nested audio" contentType="audio"><Channel id="ca" audioChannels="2" destination="master"/></Track>
+<Track id="midi" name="Ramped nested MIDI" contentType="notes"><Channel id="cm" audioChannels="2" destination="master"/></Track>
+<Channel id="master" name="Main" role="master" audioChannels="2"/></Structure>
+<Arrangement><Lanes><Lanes track="audio" timeUnit="beats"><Clips><Clip time="1" duration="8" contentTimeUnit="seconds"
+playStart="0" loopStart="0" loopEnd="1"><Clips timeUnit="beats"><Clip time="0" duration="1"
+contentTimeUnit="seconds" playStart="0"><Audio id="source" timeUnit="seconds" duration="2"
+channels="2" sampleRate="RATE"><File path="audio/source.wav"/></Audio></Clip></Clips></Clip></Clips></Lanes>
+<Lanes track="midi" timeUnit="seconds"><Clips><Clip time="1" duration="4" contentTimeUnit="beats"
+playStart="1" loopStart="0" loopEnd="3"><Clips timeUnit="beats"><Clip time="0" duration="3"><Notes timeUnit="beats">
+<Note time="0.1" duration="0.25" key="60" channel="0"/><Note time="1" duration="0.25" key="67" channel="0"/>
+</Notes></Clip></Clips></Clip></Clips></Lanes></Lanes>
+<TempoAutomation timeUnit="beats" unit="bpm"><Target parameter="tempo-map"/>
+<RealPoint time="0" value="60" interpolation="linear"/><RealPoint time="8" value="180"/>
+</TempoAutomation></Arrangement></Project>)";
+	auto rate = source.media.front ().sample_rate;
+	xml.replace (xml.find ("RATE"), 4, std::to_string (rate));
+	{
+		PX::ProjectArchiveWriter archive (fixture.path ("ramped-nested.dawproject"));
+		archive.add_text ("project.xml", xml);
+		archive.add_text ("metadata.xml", "<MetaData/>");
+		archive.add_file ("audio/source.wav", fixture.path ("source.wav"));
+		archive.finish ();
+	}
+	auto parsed = PX::DawProject::read (fixture.path ("ramped-nested.dawproject"));
+	auto const& original_audio = track_named (parsed, "Ramped nested audio").clips;
+	auto const& original_midi = track_named (parsed, "Ramped nested MIDI").clips;
+	CPPUNIT_ASSERT_EQUAL (size_t (4), original_audio.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (4), original_midi.size ());
+	const double boundary = 4 * std::log (3);
+	auto seconds_at = [boundary] (double beat) { return beat <= 8 ? 4 * std::log1p (beat / 4) : boundary + (beat - 8) / 3; };
+	auto beats_at = [boundary] (double second) { return second <= boundary ? 4 * std::expm1 (second / 4) : 8 + 3 * (second - boundary); };
+	double start = seconds_at (1), stop = seconds_at (9);
+	for (auto const& clip : original_audio) {
+		CPPUNIT_ASSERT (clip.position.unit == PX::TimeUnit::Beats && clip.offset.unit == PX::TimeUnit::Seconds);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (beats_at (start), clip.position.value, 1e-8);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (1, clip.duration, 1e-8);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (0, clip.offset.value, 1e-8);
+		start = std::min (start + 1, stop);
+	}
+	double elapsed = 0, source_offset = 1;
+	for (auto const& clip : original_midi) {
+		start = 1 + elapsed;
+		stop = std::min (5.0, seconds_at (beats_at (start) + 3 - source_offset));
+		CPPUNIT_ASSERT (clip.position.unit == PX::TimeUnit::Seconds && clip.offset.unit == PX::TimeUnit::Beats);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (start, clip.position.value, 1e-8);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (stop - start, clip.duration, 1e-8);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (source_offset, clip.offset.value, 1e-8);
+		elapsed = stop - 1; source_offset = 0;
+	}
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("ramped-nested.dawproject"),
+	                                                        fixture.path ("RampedNested"), "RampedNested", fixture.report);
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("RampedNested"), "RampedNested", nullptr, "", true));
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("ramped-nested-return.dawproject"));
+	auto returned = PX::DawProject::read (fixture.path ("ramped-nested-return.dawproject"));
+	auto const& audio = track_named (returned, "Ramped nested audio").clips;
+	auto const& midi = track_named (returned, "Ramped nested MIDI").clips;
+	CPPUNIT_ASSERT_EQUAL (original_audio.size (), audio.size ());
+	CPPUNIT_ASSERT_EQUAL (original_midi.size (), midi.size ());
+	PX::TimeMap original_timing (parsed), returned_timing (returned);
+	for (size_t i = 0; i < audio.size (); ++i) {
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (original_timing.convert (original_audio[i].position, PX::TimeUnit::Seconds),
+		                               returned_timing.convert (audio[i].position, PX::TimeUnit::Seconds), 5.0 / rate);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (original_timing.convert (PX::Time (original_audio[i].position.value + original_audio[i].duration,
+		                                                               original_audio[i].position.unit), PX::TimeUnit::Seconds),
+		                               returned_timing.convert (PX::Time (audio[i].position.value + audio[i].duration,
+		                                                               audio[i].position.unit), PX::TimeUnit::Seconds), 5.0 / rate);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (original_audio[i].offset.value, audio[i].offset.value, 5.0 / rate);
+	}
+	for (size_t i = 0; i < midi.size (); ++i) {
+		const double musical_resolution = 1.0 / Temporal::Beats::PPQN + 5.0 / rate;
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (original_timing.convert (original_midi[i].position, PX::TimeUnit::Seconds),
+		                               returned_timing.convert (midi[i].position, PX::TimeUnit::Seconds), musical_resolution);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (original_timing.convert (PX::Time (original_midi[i].position.value + original_midi[i].duration,
+		                                                               original_midi[i].position.unit), PX::TimeUnit::Seconds),
+		                               returned_timing.convert (PX::Time (midi[i].position.value + midi[i].duration,
+		                                                               midi[i].position.unit), PX::TimeUnit::Seconds), musical_resolution);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (original_midi[i].offset.value, midi[i].offset.value, 1.0 / Temporal::Beats::PPQN);
+	}
+	std::cout << "Nested mixed-unit loops follow continuous tempo ramps through session save/reopen and return" << std::endl;
 }
 
 void ProjectSessionTest::multichannel_audio_roundtrip ()

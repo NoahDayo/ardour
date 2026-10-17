@@ -334,6 +334,77 @@ class DawProjectTest(unittest.TestCase):
             self.assertAlmostEqual(clip['position'][0], position, places=8)
             self.assertAlmostEqual(clip['duration'], duration, places=8)
 
+    def test_mixed_nested_loops_follow_continuous_tempo_ramp(self):
+        # Integrate 60/(60+15*beat) independently of the parser's tempo map.
+        boundary = 4 * math.log(3)
+
+        def seconds(beat):
+            return 4 * math.log1p(beat / 4) if beat <= 8 else boundary + (beat - 8) / 3
+
+        def beats(second):
+            return 4 * math.expm1(second / 4) if second <= boundary else 8 + 3 * (second - boundary)
+
+        transport = '<Transport><Tempo id="tempo" unit="bpm" value="60"/><TimeSignature numerator="4" denominator="4"/></Transport>'
+        automation = ('<TempoAutomation timeUnit="beats" unit="bpm"><Target parameter="tempo"/>'
+                      '<RealPoint time="0" value="60" interpolation="linear"/>'
+                      '<RealPoint time="8" value="180"/></TempoAutomation>')
+        midi = (f'<Project version="1.0"><Application name="Ramp fixture" version="1"/>{transport}'
+                '<Structure><Track id="m" contentType="notes" name="Ramp MIDI"/></Structure>'
+                '<Arrangement><Lanes timeUnit="seconds"><Clips track="m"><Clip time="1" duration="4" '
+                'contentTimeUnit="beats" playStart="1" loopStart="0" loopEnd="3">'
+                '<Clips timeUnit="beats"><Clip time="0" duration="3"><Notes timeUnit="beats">'
+                '<Note time="0" duration="0.5" key="60" channel="0"/></Notes></Clip></Clips>'
+                f'</Clip></Clips></Lanes>{automation}</Arrangement></Project>')
+        parsed = self.parse(midi)
+        self.assert_schema(self.input)
+        expected = []
+        elapsed, source = 0, 1
+        while elapsed < 4 - 1e-9:
+            start = 1 + elapsed
+            stop = min(5, seconds(beats(start) + 3 - source))
+            expected.append((start, stop - start, source))
+            elapsed, source = stop - 1, 0
+        clips = parsed['tracks'][0]['clips']
+        self.assertEqual(len(clips), len(expected))
+        for clip, (position, duration, offset) in zip(clips, expected):
+            self.assertEqual((clip['position'][1], clip['offset'][1]), ('seconds', 'beats'))
+            self.assertAlmostEqual(clip['position'][0], position, places=9)
+            self.assertAlmostEqual(clip['duration'], duration, places=9)
+            self.assertAlmostEqual(clip['offset'][0], offset, places=9)
+        output = self.root / 'ramp-nested-midi.xml'
+        self.command('rewrite', self.input, output)
+        self.assert_schema(output)
+        self.assertEqual(self.semantic(parsed), self.semantic(json.loads(self.command('parse', output).stdout)))
+
+        audio = (f'<Project version="1.0"><Application name="Ramp fixture" version="1"/>{transport}'
+                 '<Structure><Track id="a" contentType="audio" name="Ramp Audio"/></Structure>'
+                 '<Arrangement><Lanes timeUnit="beats"><Clips track="a"><Clip time="1" duration="8" '
+                 'contentTimeUnit="seconds" playStart="0" loopStart="0" loopEnd="1">'
+                 '<Clips timeUnit="beats"><Clip time="0" duration="1" contentTimeUnit="seconds" playStart="0">'
+                 '<Audio id="source" timeUnit="seconds" duration="4" channels="2" sampleRate="48000">'
+                 '<File path="audio/ramp.wav"/></Audio></Clip></Clips></Clip></Clips></Lanes>'
+                 f'{automation}</Arrangement></Project>')
+        parsed = self.parse(audio)
+        self.assert_schema(self.input)
+        expected = []
+        start, stop = seconds(1), seconds(9)
+        while start < stop - 1e-9:
+            window_end = min(start + 1, stop)
+            inner_end = seconds(beats(start) + 1)
+            expected.append((beats(start), beats(min(inner_end, window_end)) - beats(start)))
+            start = window_end
+        clips = parsed['tracks'][0]['clips']
+        self.assertEqual(len(clips), len(expected))
+        for clip, (position, duration) in zip(clips, expected):
+            self.assertEqual((clip['position'][1], clip['offset'][1]), ('beats', 'seconds'))
+            self.assertAlmostEqual(clip['offset'][0], 0, places=9)
+            self.assertAlmostEqual(clip['position'][0], position, places=9)
+            self.assertAlmostEqual(clip['duration'], duration, places=9)
+        output = self.root / 'ramp-nested-audio.xml'
+        self.command('rewrite', self.input, output)
+        self.assert_schema(output)
+        self.assertEqual(self.semantic(parsed), self.semantic(json.loads(self.command('parse', output).stdout)))
+
     def test_midi_controller_lanes_schema_roundtrip(self):
         lanes = ''
         for expression, extra, maximum in [('channelController', 'controller="64"', 127), ('pitchBend', '', 16383), ('channelPressure', '', 127), ('polyPressure', 'key="60"', 127)]:
