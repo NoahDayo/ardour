@@ -17,6 +17,7 @@ public:
 	struct ExportOptions {
 		bool render_mix = false;
 		bool render_stems = false;
+		bool render_midi_reference = false;
 		double render_tail_seconds = 2.0;
 		unsigned studio_one_format_version = 9;
 		bool rendered () const { return render_mix || render_stems; }

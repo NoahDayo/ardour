@@ -1020,9 +1020,11 @@ Project collect_rendered (Session& session, const SessionExchange::ExportOptions
 		clip.duration = media.duration; clip.media = media.id;
 		mix.clips.push_back (clip); project.media.push_back (media); project.tracks.push_back (mix);
 	}
-	project.report.push_back ({Disposition::Rendered, options.render_stems ? "Separate stems" : "Current master mix", options.render_stems ?
-		"Each stereo track or bus feeding the master becomes a separate audio track. Upstream tracks and shared processing are combined inside their bus stem. Effects, instruments, automation, mute and solo are baked into the audio. Master processing must be neutral; MIDI notes and processors are no longer editable." :
-		"All audible tracks, MIDI instruments, effects, automation and bus routing become one stereo audio clip. Individual tracks, notes and processors are no longer editable; current mute and solo states are included."});
+	std::string render_detail = options.render_stems ?
+		"Each stereo track or bus feeding the master becomes a separate audio track. Upstream tracks and shared processing are combined inside their bus stem. Effects, instruments, automation, mute and solo are baked into the audio. Master processing must be neutral; source track structure and processors are no longer editable." :
+		"All audible tracks, MIDI instruments, effects, automation and bus routing become one stereo audio clip. Individual source tracks and processors are no longer editable; current mute and solo states are included.";
+	render_detail += options.render_midi_reference ? " MIDI notes are retained on muted reference tracks." : " MIDI notes are no longer editable.";
+	project.report.push_back ({Disposition::Rendered, options.render_stems ? "Separate stems" : "Current master mix", render_detail});
 
 	std::ostringstream range;
 	range << "Rendered from timeline zero to session end (" << double (end) / session.sample_rate ()
@@ -1381,6 +1383,33 @@ Project collect (Session& session, AudioAssets& assets, const CancelCheck& cance
 	return project;
 }
 
+void append_rendered_midi_references (Project& rendered, const Project& editable)
+{
+	for (auto const& original : editable.tracks) {
+		if (original.kind != TrackKind::MIDI) { continue; }
+		Track reference;
+		reference.id = "midi-reference-" + original.id;
+		reference.name = original.name + " (MIDI reference)";
+		reference.color = original.color;
+		reference.kind = TrackKind::MIDI;
+		reference.destination = "master";
+		reference.mute = true;
+		for (auto clip : original.clips) {
+			if (clip.kind != ClipKind::MIDI) { continue; }
+			if (!clip.midi_controls.empty ()) {
+				rendered.report.push_back ({Disposition::Transformed, clip.name,
+					"MIDI controller events omitted from the native reference track; their audible result is in the rendered audio"});
+				clip.midi_controls.clear ();
+			}
+			reference.clips.push_back (std::move (clip));
+		}
+		rendered.report.push_back ({Disposition::Rendered, original.name,
+			"Editable MIDI notes retained on a muted reference track. Instrument sound and processing are in the rendered audio; assign an instrument and unmute only when replacing that audio"});
+		rendered.tracks.push_back (std::move (reference));
+	}
+	validate_project (rendered);
+}
+
 void write_audio (const SourceList& sources, const std::string& path, const CancelCheck& cancel, bool pcm24 = false)
 {
 	SF_INFO info = {};
@@ -1729,6 +1758,7 @@ void
 SessionExchange::export_dawproject (Session& session, const std::string& destination, std::vector<Diagnostic>& report, const ExportOptions& options, CancelCheck cancel)
 {
 	report.clear ();
+	if (options.render_midi_reference) { throw ExchangeError ("MIDI reference tracks are supported only by rendered native Studio One song export"); }
 	if (session.transport_rolling () || session.actively_recording ()) { throw ExchangeError ("Stop playback and recording before exporting a project"); }
 	if (!Glib::path_is_absolute (destination)) { throw ExchangeError ("Export destination must be absolute"); }
 	FileObject target = file_object (destination);
@@ -1763,6 +1793,7 @@ void
 SessionExchange::export_logic (Session& session, const std::string& destination, std::vector<Diagnostic>& report, const ExportOptions& options, CancelCheck cancel)
 {
 	report.clear ();
+	if (options.render_midi_reference) { throw ExchangeError ("MIDI reference tracks are supported only by rendered native Studio One song export"); }
 	if (session.transport_rolling () || session.actively_recording ()) { throw ExchangeError ("Stop playback and recording before exporting a project"); }
 	if (!Glib::path_is_absolute (destination)) { throw ExchangeError ("Export destination must be absolute"); }
 	FileObject target = file_object (destination);
@@ -1957,6 +1988,7 @@ SessionExchange::export_studio_one (Session& session, const std::string& destina
 {
 	report.clear ();
 	if (options.studio_one_format_version < 7 || options.studio_one_format_version > 9) { throw ExchangeError ("Native song export format must be 7, 8 or 9"); }
+	if (options.render_midi_reference && !options.rendered ()) { throw ExchangeError ("MIDI reference tracks require a rendered native song export"); }
 	if (session.transport_rolling () || session.actively_recording ()) { throw ExchangeError ("Stop playback and recording before exporting a project"); }
 	if (!Glib::path_is_absolute (destination)) { throw ExchangeError ("Export destination must be absolute"); }
 	FileObject target = file_object (destination);
@@ -1964,6 +1996,10 @@ SessionExchange::export_studio_one (Session& session, const std::string& destina
 	if (options.rendered ()) { check_rendered_stereo_layout (session, report); }
 	cancelled (cancel); AudioAssets assets; StudioOneSongData song;
 	song.project = options.rendered () ? collect_rendered (session, options) : collect (session, assets, cancel);
+	if (options.render_midi_reference) {
+		AudioAssets reference_assets;
+		append_rendered_midi_references (song.project, collect (session, reference_assets, cancel));
+	}
 	song.title = session.name (); song.sample_rate = session.sample_rate (); song.format_version = options.studio_one_format_version;
 	song.has_range = true;
 	song.start = Time (options.rendered () ? 0 : double (session.current_start_sample ()) / session.sample_rate (), TimeUnit::Seconds);

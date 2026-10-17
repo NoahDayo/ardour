@@ -508,6 +508,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (native_song_export_roundtrip);
 	CPPUNIT_TEST (native_song_export_guards);
 	CPPUNIT_TEST (native_song_render_export);
+	CPPUNIT_TEST (native_song_render_reference);
 	CPPUNIT_TEST (bus_sends_roundtrip);
 	CPPUNIT_TEST (native_song_fx_sends_roundtrip);
 	CPPUNIT_TEST (native_song_format_seven_import);
@@ -564,6 +565,7 @@ public:
 	void native_song_export_roundtrip ();
 	void native_song_export_guards ();
 	void native_song_render_export ();
+	void native_song_render_reference ();
 	void bus_sends_roundtrip ();
 	void native_song_fx_sends_roundtrip ();
 	void native_song_format_seven_import ();
@@ -986,6 +988,43 @@ void ProjectSessionTest::native_song_render_export ()
 	assert_graph_pcm (read_rendered_pcm (song.audio_files.at (song.project.media.front ().id), frames, rate), rate, 1e-6);
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (0, song.start.value, 1e-9); CPPUNIT_ASSERT_DOUBLES_EQUAL (double (frames) / rate, song.end.value, 1.0 / rate);
 	std::cout << "Native song rendered master graph PCM and source restoration passed" << std::endl;
+}
+
+void ProjectSessionTest::native_song_render_reference ()
+{
+	Fixture fixture; make_render_fixture (fixture); const unsigned rate = fixture.session->sample_rate ();
+	const samplecnt_t frames = fixture.session->current_end_sample () + 1024;
+	PX::SessionExchange::ExportOptions options; options.render_midi_reference = true;
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("NoRender"), fixture.report, options), PX::ExchangeError);
+	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("NoRender"), Glib::FILE_TEST_EXISTS));
+	options.render_mix = true; options.render_tail_seconds = 1024.0 / rate;
+	RenderSourceState original (fixture);
+	PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("WithNotes"), fixture.report, options);
+	original.check (fixture);
+	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& d) {
+		return d.disposition == PX::Disposition::Rendered && d.detail.find ("muted reference track") != std::string::npos;
+	}));
+	auto song = PX::StudioOneSong::read (fixture.path ("WithNotes/Project.song"));
+	CPPUNIT_ASSERT_EQUAL (size_t (1), song.project.media.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (3), song.project.tracks.size ());
+	auto const& notes = track_named (song.project, "MIDI gate (MIDI reference)");
+	CPPUNIT_ASSERT_EQUAL (PX::TrackKind::MIDI, notes.kind); CPPUNIT_ASSERT (notes.mute);
+	CPPUNIT_ASSERT (notes.plugins.empty ()); CPPUNIT_ASSERT_EQUAL (size_t (1), notes.clips.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (1), notes.clips.front ().notes.size ());
+	CPPUNIT_ASSERT (notes.clips.front ().notes.front ().duration > 0);
+	assert_graph_pcm (read_rendered_pcm (song.audio_files.at (song.project.media.front ().id), frames, rate), rate, 1e-6);
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_studio_one (*AudioEngine::instance (), fixture.path ("WithNotes/Project.song"), fixture.path ("NotesReturn"), "NotesReturn", fixture.report);
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("NotesReturn"), "NotesReturn", nullptr, "", true));
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("notes-return.dawproject"));
+	auto returned = PX::DawProject::read (fixture.path ("notes-return.dawproject"));
+	auto const& editable = track_named (returned, "MIDI gate (MIDI reference)");
+	CPPUNIT_ASSERT (editable.mute); CPPUNIT_ASSERT_EQUAL (size_t (1), editable.clips.front ().notes.size ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (notes.clips.front ().notes.front ().duration, editable.clips.front ().notes.front ().duration, 1e-5);
+	CPPUNIT_ASSERT_EQUAL (notes.clips.front ().notes.front ().key, editable.clips.front ().notes.front ().key);
+	std::cout << "Rendered native song retained muted editable MIDI notes and audible mix through import and reopen" << std::endl;
 }
 
 void ProjectSessionTest::render_stems_roundtrip ()
