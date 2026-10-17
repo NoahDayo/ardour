@@ -20,6 +20,9 @@ public:
 		double render_tail_seconds = 2.0;
 		bool rendered () const { return render_mix || render_stems; }
 	};
+	/* Inspect plug-in availability before showing the partial-import choice.
+	 * Each returned item describes processing that would be omitted. */
+	static std::vector<Diagnostic> unavailable_vst3_plugins (const Project&);
 	/* Requires a running engine with no session attached. Builds in a private
 	 * sibling directory, saves, then moves and reopens the completed session.
 	 * The returned session is attached to the engine and owned by the caller. */

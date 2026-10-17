@@ -424,7 +424,7 @@ void populate_automation (Session& session, const Automation& curve, std::shared
 
 void populate (Session& session, const Project& project, const std::map<std::string, std::string>& assets,
                 std::vector<Diagnostic>& report, const CancelCheck& cancel,
-                std::map<std::string, std::string>& route_ids)
+                std::map<std::string, std::string>& route_ids, bool allow_unsupported)
 {
 	session.config.set_native_file_data_format (FormatFloat);
 	TimeMap timing (project);
@@ -533,9 +533,13 @@ void populate (Session& session, const Project& project, const std::map<std::str
 			for (auto const& candidate : PluginManager::instance ().vst3_plugin_info ()) {
 				if (canonical_vst3_id (candidate->unique_id) == device.id) { info = candidate; break; }
 			}
-			if (!info) { throw ExchangeError (track.name + ": VST3 plugin is not installed: " + device.name + " (" + device.id + "); provide a rendered track fallback"); }
+			if (!info) {
+				if (allow_unsupported) { continue; }
+				throw ExchangeError (track.name + ": VST3 plugin is not installed: " + device.name + " (" + device.id + "); provide a rendered track fallback");
+			}
 			if ((device.role == "instrument" && (!info->is_instrument () || track.kind != TrackKind::MIDI)) ||
 			    (device.role == "audioFX" && !info->is_effect ())) {
+				if (allow_unsupported) { continue; }
 				throw ExchangeError (track.name + ": VST3 role or track type differs from the installed plugin: " + device.name);
 			}
 			PluginPtr plugin = info->load (session);
@@ -1464,6 +1468,8 @@ import_session (AudioEngine& engine, const Project& project, const std::string& 
 	FileObject final = file_object (destination);
 	if (g_file_query_exists (final.get (), NULL)) { throw ExchangeError ("Import destination already exists"); }
 	report = project.report;
+	auto unavailable = SessionExchange::unavailable_vst3_plugins (project);
+	report.insert (report.end (), unavailable.begin (), unavailable.end ());
 	for (auto const& item : report) {
 		if (!allow_unsupported && item.disposition == Disposition::Unsupported) { throw ExchangeError (item.object + ": " + item.detail); }
 	}
@@ -1482,7 +1488,7 @@ import_session (AudioEngine& engine, const Project& project, const std::string& 
 		/* Ardour recognizes a new session by the absence of its directory. */
 		session.reset (new Session (engine, Glib::build_filename (stage.path, "session"), snapshot, &profile, "", true));
 		engine.set_session (session.get ());
-		populate (*session, project, assets, report, cancel, route_ids);
+		populate (*session, project, assets, report, cancel, route_ids, allow_unsupported);
 		if (finish) { finish (*session); }
 		/* Suppress recent-session registration while staging, but publish a
 		 * named session so saving or closing it does not prompt for a rename. */
@@ -1551,6 +1557,30 @@ void copy_native_audio (const std::string& source, const std::string& destinatio
 }
 
 } // namespace
+
+std::vector<Diagnostic>
+SessionExchange::unavailable_vst3_plugins (const Project& project)
+{
+	std::vector<Diagnostic> report;
+	if (std::none_of (project.tracks.begin (), project.tracks.end (), [] (const Track& track) { return !track.plugins.empty (); })) { return report; }
+	auto installed = PluginManager::instance ().vst3_plugin_info ();
+	for (auto const& track : project.tracks) {
+		for (auto const& device : track.plugins) {
+			auto found = std::find_if (installed.begin (), installed.end (), [&] (const PluginInfoPtr& info) {
+				return canonical_vst3_id (info->unique_id) == device.id;
+			});
+			if (found == installed.end ()) {
+				report.push_back ({Disposition::Unsupported, track.name + ": " + device.name,
+				                   "VST3 plugin is not installed (" + device.id + "); processing will be omitted. Render this track in the source DAW for audible fidelity"});
+			} else if ((device.role == "instrument" && (!(*found)->is_instrument () || track.kind != TrackKind::MIDI)) ||
+			           (device.role == "audioFX" && !(*found)->is_effect ())) {
+				report.push_back ({Disposition::Unsupported, track.name + ": " + device.name,
+				                   "Installed VST3 role does not match this project; processing will be omitted. Render this track in the source DAW for audible fidelity"});
+			}
+		}
+	}
+	return report;
+}
 
 std::unique_ptr<Session>
 SessionExchange::import_logic (AudioEngine& engine, const std::string& aaf, const std::string& midi,

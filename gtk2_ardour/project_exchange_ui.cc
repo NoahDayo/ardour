@@ -237,6 +237,8 @@ bool ProjectExchangeUI::prepare_import (Gtk::Window* parent, std::string const& 
 			project = aaf_project (dialog.archive ()) ? PX::LogicProject (dialog.archive (), dialog.midi (), check).project () :
 			          native_song (dialog.archive ()) ? PX::StudioOneSong::read (dialog.archive (), check).project : PX::DawProject::read (dialog.archive (), check);
 		}
+		auto unavailable = PX::SessionExchange::unavailable_vst3_plugins (project);
+		project.report.insert (project.report.end (), unavailable.begin (), unavailable.end ());
 		report = project.report;
 		if (PX::has_unsupported_features (project)) {
 			if (aaf_project (dialog.archive ()) && PX::has_aaf_reader_errors (project)) {

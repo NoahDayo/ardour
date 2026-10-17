@@ -1346,10 +1346,29 @@ void ProjectSessionTest::vst3_plugin_exchange ()
 		missing.state.append (8, '\0');
 		project.tracks[2].plugins.push_back (missing);
 		package (fixture, project);
+		auto unavailable = PX::SessionExchange::unavailable_vst3_plugins (PX::DawProject::read (fixture.path ("input.dawproject")));
+		CPPUNIT_ASSERT_EQUAL (size_t (1), unavailable.size ());
+		CPPUNIT_ASSERT (unavailable.front ().disposition == PX::Disposition::Unsupported);
+		CPPUNIT_ASSERT (unavailable.front ().detail.find ("Render this track") != std::string::npos);
 		CPPUNIT_ASSERT_THROW (PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"),
 		                                                            fixture.path ("Unavailable"), "Exchange", fixture.report), PX::ExchangeError);
 		CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
 		CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("Unavailable"), Glib::FILE_TEST_EXISTS));
+		fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"),
+		                                                           fixture.path ("Partial"), "Partial", fixture.report,
+		                                                           PX::CancelCheck (), true);
+		CPPUNIT_ASSERT (fixture.session);
+		CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& item) {
+			return item.disposition == PX::Disposition::Unsupported && item.detail.find ("VST3 plugin is not installed") != std::string::npos;
+		}));
+		CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+		AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+		fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("Partial"), "Partial", nullptr, "", true));
+		PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("partial-no-plugin.dawproject"));
+		auto returned = PX::DawProject::read (fixture.path ("partial-no-plugin.dawproject"));
+		CPPUNIT_ASSERT (track_named (returned, "Stereo").plugins.empty ());
+		CPPUNIT_ASSERT_EQUAL (size_t (2), track_named (returned, "Stereo").clips.size ());
+		CPPUNIT_ASSERT_EQUAL (size_t (1), track_named (returned, "Notes").clips.size ());
 	}
 
 	/* Set this only in a private run with an installed VST3 effect. The normal
