@@ -423,7 +423,8 @@ void populate_automation (Session& session, const Automation& curve, std::shared
 }
 
 void populate (Session& session, const Project& project, const std::map<std::string, std::string>& assets,
-               std::vector<Diagnostic>& report, const CancelCheck& cancel)
+                std::vector<Diagnostic>& report, const CancelCheck& cancel,
+                std::map<std::string, std::string>& route_ids)
 {
 	session.config.set_native_file_data_format (FormatFloat);
 	TimeMap timing (project);
@@ -509,6 +510,7 @@ void populate (Session& session, const Project& project, const std::map<std::str
 		}
 		if (!route) { throw ExchangeError ("Cannot create track: " + track.name); }
 		routes[track.id] = route;
+		route_ids[track.id] = route->id ().to_s ();
 		if (route->name () != track.name) { report.push_back ({Disposition::Transformed, track.name, "Track renamed to " + route->name ()}); }
 		if (!track.color.empty ()) { route->presentation_info ().set_color (color_value (track.color)); }
 		if (track.volume > route->gain_control ()->upper ()) { throw ExchangeError (track.name + ": gain exceeds Ardour's supported range"); }
@@ -1451,7 +1453,8 @@ std::unique_ptr<Session>
 import_session (AudioEngine& engine, const Project& project, const std::string& destination,
                 const std::string& snapshot, std::vector<Diagnostic>& report, const CancelCheck& cancel,
                 const std::function<void (const Media&, const std::string&)>& copy_media,
-                const std::function<void (Session&)>& finish = std::function<void (Session&)> ())
+                const std::function<void (Session&)>& finish = std::function<void (Session&)> (),
+                bool allow_unsupported = false)
 {
 	if (!engine.running () || engine.session ()) { throw ExchangeError ("Import requires a running engine with no session attached"); }
 	if (!Glib::path_is_absolute (destination) || snapshot.empty () || snapshot == "." || snapshot == ".." ||
@@ -1462,7 +1465,7 @@ import_session (AudioEngine& engine, const Project& project, const std::string& 
 	if (g_file_query_exists (final.get (), NULL)) { throw ExchangeError ("Import destination already exists"); }
 	report = project.report;
 	for (auto const& item : report) {
-		if (item.disposition == Disposition::Unsupported) { throw ExchangeError (item.object + ": " + item.detail); }
+		if (!allow_unsupported && item.disposition == Disposition::Unsupported) { throw ExchangeError (item.object + ": " + item.detail); }
 	}
 	OwnedDirectory stage (Glib::path_get_dirname (destination));
 	std::map<std::string, std::string> assets;
@@ -1472,13 +1475,14 @@ import_session (AudioEngine& engine, const Project& project, const std::string& 
 		assets[project.media[i].id] = path;
 	}
 	std::unique_ptr<Session> session;
+	std::map<std::string, std::string> route_ids;
 	try {
 		BusProfile profile;
 		profile.master_out_channels = 2;
 		/* Ardour recognizes a new session by the absence of its directory. */
 		session.reset (new Session (engine, Glib::build_filename (stage.path, "session"), snapshot, &profile, "", true));
 		engine.set_session (session.get ());
-		populate (*session, project, assets, report, cancel);
+		populate (*session, project, assets, report, cancel, route_ids);
 		if (finish) { finish (*session); }
 		/* Suppress recent-session registration while staging, but publish a
 		 * named session so saving or closing it does not prompt for a rename. */
@@ -1495,6 +1499,19 @@ import_session (AudioEngine& engine, const Project& project, const std::string& 
 		session.reset (new Session (engine, destination, snapshot, NULL, "", true));
 		engine.set_session (session.get ());
 		cancelled (cancel);
+		for (auto const& track : project.tracks) {
+			auto routes = session->get_routes ();
+			auto match = std::find_if (routes->begin (), routes->end (), [&] (const std::shared_ptr<Route>& route) {
+				return route->id ().to_s () == route_ids.at (track.id);
+			});
+			if (match == routes->end ()) { throw ExchangeError ("Imported track did not survive save/reopen: " + track.name); }
+			if ((*match)->name () != track.name) {
+				std::string detail = "Track renamed to " + (*match)->name ();
+				if (std::none_of (report.begin (), report.end (), [&] (const Diagnostic& item) {
+					return item.disposition == Disposition::Transformed && item.object == track.name && item.detail == detail;
+				})) { report.push_back ({Disposition::Transformed, track.name, detail}); }
+			}
+		}
 		store_recent_sessions (session->name (), session->path ());
 		stage.published.clear ();
 		return session;
@@ -1557,7 +1574,8 @@ SessionExchange::import_dawproject (AudioEngine& engine, const std::string& arch
 
 std::unique_ptr<Session>
 SessionExchange::import_studio_one (AudioEngine& engine, const std::string& filename, const std::string& destination,
-                                   const std::string& snapshot, std::vector<Diagnostic>& report, CancelCheck cancel)
+	                                const std::string& snapshot, std::vector<Diagnostic>& report, CancelCheck cancel,
+	                                bool allow_unsupported)
 {
 	auto song = StudioOneSong::read (filename, cancel);
 	TimeMap timing (song.project);
@@ -1566,7 +1584,7 @@ SessionExchange::import_studio_one (AudioEngine& engine, const std::string& file
 	                       [&] (Session& session) {
 		                       auto position = [&] (Time t) { return Temporal::timepos_t (samples (timing.convert (t, TimeUnit::Seconds), session.sample_rate ())); };
 		                       if (song.has_range) { session.set_session_extents (position (song.start), position (song.end)); }
-	                       });
+	                       }, allow_unsupported);
 }
 
 std::vector<Diagnostic>

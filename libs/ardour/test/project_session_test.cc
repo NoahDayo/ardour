@@ -510,6 +510,8 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (native_song_format_seven_import);
 	CPPUNIT_TEST (native_song_cancel);
 	CPPUNIT_TEST (native_song_unsupported);
+	CPPUNIT_TEST (native_song_partial_import);
+	CPPUNIT_TEST (native_song_instrument_template_import);
 	CPPUNIT_TEST (marker_roundtrip);
 	CPPUNIT_TEST (studio_pro_export);
 	CPPUNIT_TEST (variable_timing);
@@ -558,6 +560,8 @@ public:
 	void native_song_format_seven_import ();
 	void native_song_cancel ();
 	void native_song_unsupported ();
+	void native_song_partial_import ();
+	void native_song_instrument_template_import ();
 	void marker_roundtrip ();
 	void studio_pro_export ();
 	void variable_timing ();
@@ -2430,6 +2434,63 @@ void ProjectSessionTest::native_song_unsupported ()
 	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("Native"), Glib::FILE_TEST_EXISTS));
 	CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
 	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& d) { return d.disposition == PX::Disposition::Unsupported; }));
+}
+
+void ProjectSessionTest::native_song_partial_import ()
+{
+	Fixture fixture;
+	native_package (fixture, true);
+	fixture.session = PX::SessionExchange::import_studio_one (*AudioEngine::instance (), fixture.path ("input.song"),
+	                                                          fixture.path ("Partial"), "Partial", fixture.report,
+	                                                          PX::CancelCheck (), true);
+	CPPUNIT_ASSERT (fixture.session);
+	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& d) {
+		return d.disposition == PX::Disposition::Unsupported && d.detail.find ("speed") != std::string::npos;
+	}));
+	CPPUNIT_ASSERT (fixture.session->route_by_name ("Native audio"));
+	CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("Partial"), "Partial", nullptr, "", true));
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("partial-return.dawproject"));
+	auto returned = PX::DawProject::read (fixture.path ("partial-return.dawproject"));
+	CPPUNIT_ASSERT_EQUAL (size_t (1), track_named (returned, "Native audio").clips.size ());
+	CPPUNIT_ASSERT_EQUAL (std::string ("Native clip"), track_named (returned, "Native audio").clips.front ().name);
+}
+
+void ProjectSessionTest::native_song_instrument_template_import ()
+{
+	const char* source = std::getenv ("ARDOUR_STUDIO_PRO_INSTRUMENT_TEMPLATE");
+	if (!source) { return; }
+	Fixture fixture;
+	std::ifstream input (source, std::ios::binary);
+	std::ofstream output (fixture.path ("input.song"), std::ios::binary);
+	CPPUNIT_ASSERT (input && output);
+	output << input.rdbuf ();
+	output.close ();
+	CPPUNIT_ASSERT (output.good ());
+	auto project = PX::StudioOneSong::read (fixture.path ("input.song")).project;
+	CPPUNIT_ASSERT (PX::has_unsupported_features (project));
+	fixture.session = PX::SessionExchange::import_studio_one (*AudioEngine::instance (), fixture.path ("input.song"),
+	                                                          fixture.path ("Template"), "Template", fixture.report,
+	                                                          PX::CancelCheck (), true);
+	CPPUNIT_ASSERT (fixture.session);
+	for (const char* name : {"Drum Pattern", "Bassline", "Chord _ Arp"}) {
+		CPPUNIT_ASSERT (fixture.session->route_by_name (name));
+	}
+	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& d) {
+		return d.disposition == PX::Disposition::Transformed && d.object == "Chord / Arp" &&
+		       d.detail.find ("Chord _ Arp") != std::string::npos;
+	}));
+	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& d) {
+		return d.disposition == PX::Disposition::Unsupported && d.detail.find ("instrument") != std::string::npos;
+	}));
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("Template"), "Template", nullptr, "", true));
+	for (const char* name : {"Drum Pattern", "Bassline", "Chord _ Arp"}) {
+		CPPUNIT_ASSERT (fixture.session->route_by_name (name));
+	}
 }
 
 void ProjectSessionTest::roundtrip ()

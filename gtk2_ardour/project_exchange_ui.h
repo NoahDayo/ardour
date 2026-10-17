@@ -11,6 +11,7 @@ struct ImportRequest {
 	std::string destination;
 	std::string snapshot;
 	double sample_rate = 48000;
+	bool allow_unsupported = false;
 };
 bool is_importable_project (std::string const& path);
 bool prepare_import (Gtk::Window*, std::string const& archive, ImportRequest&);

@@ -44,8 +44,8 @@ bool exchange_active = false;
 bool native_song (const std::string& path) { return path.size () >= 5 && !g_ascii_strcasecmp (path.c_str () + path.size () - 5, ".song"); }
 bool aaf_project (const std::string& path) { return path.size () >= 4 && !g_ascii_strcasecmp (path.c_str () + path.size () - 4, ".aaf"); }
 
-void show_report (Gtk::Window& parent, const std::string& title, const std::string& message,
-                  const std::vector<PX::Diagnostic>& report = {})
+int show_report (Gtk::Window& parent, const std::string& title, const std::string& message,
+	             const std::vector<PX::Diagnostic>& report = {}, bool offer_partial_import = false)
 {
 	ArdourDialog dialog (parent, title, true);
 	Gtk::TextView text;
@@ -68,9 +68,11 @@ void show_report (Gtk::Window& parent, const std::string& title, const std::stri
 	scroll.add (text);
 	dialog.get_vbox ()->pack_start (scroll);
 	dialog.set_default_size (640, 360);
-	dialog.add_button (Gtk::Stock::CLOSE, Gtk::RESPONSE_CLOSE);
+	dialog.add_button (offer_partial_import ? Gtk::Stock::CANCEL : Gtk::Stock::CLOSE,
+	                   offer_partial_import ? Gtk::RESPONSE_CANCEL : Gtk::RESPONSE_CLOSE);
+	if (offer_partial_import) { dialog.add_button (_("Import Supported Content"), Gtk::RESPONSE_ACCEPT); }
 	dialog.show_all_children ();
-	dialog.run ();
+	return dialog.run ();
 }
 
 class ImportDialog : public ArdourDialog {
@@ -228,12 +230,21 @@ bool ProjectExchangeUI::prepare_import (Gtk::Window* parent, std::string const& 
 	std::vector<PX::Diagnostic> report;
 	try {
 		if (Glib::file_test (dialog.destination (), Glib::FILE_TEST_EXISTS)) { throw PX::ExchangeError (_("That session folder already exists. Choose another session name.")); }
-		ExchangeProgress progress (*parent, _("Checking Project"));
-		auto check = [&] { return progress.check (); };
-		auto project = aaf_project (dialog.archive ()) ? PX::LogicProject (dialog.archive (), dialog.midi (), check).project () :
-		               native_song (dialog.archive ()) ? PX::StudioOneSong::read (dialog.archive (), check).project : PX::DawProject::read (dialog.archive (), check);
+		PX::Project project;
+		{
+			ExchangeProgress progress (*parent, _("Checking Project"));
+			auto check = [&] { return progress.check (); };
+			project = aaf_project (dialog.archive ()) ? PX::LogicProject (dialog.archive (), dialog.midi (), check).project () :
+			          native_song (dialog.archive ()) ? PX::StudioOneSong::read (dialog.archive (), check).project : PX::DawProject::read (dialog.archive (), check);
+		}
 		report = project.report;
-		if (PX::has_unsupported_features (project)) { throw PX::ExchangeError (_("This project contains features that cannot yet be imported.")); }
+		if (PX::has_unsupported_features (project)) {
+			if (!native_song (dialog.archive ())) { throw PX::ExchangeError (_("This project contains features that cannot yet be imported.")); }
+			request.allow_unsupported = show_report (*parent, _("Some content cannot be imported"),
+				_("The items listed below will be omitted or changed. Import the supported tracks and clips anyway?"),
+				report, true) == Gtk::RESPONSE_ACCEPT;
+			if (!request.allow_unsupported) { return false; }
+		}
 		request.archive = dialog.archive ();
 		request.midi = dialog.midi ();
 		request.destination = dialog.destination ();
@@ -293,7 +304,7 @@ bool ProjectExchangeUI::import_prepared (Gtk::Window* parent, ImportRequest cons
 		auto session = aaf_project (archive)
 		    ? PX::SessionExchange::import_logic (engine, archive, request.midi, destination, snapshot, report, check)
 		    : native_song (archive)
-		    ? PX::SessionExchange::import_studio_one (engine, archive, destination, snapshot, report, check)
+		    ? PX::SessionExchange::import_studio_one (engine, archive, destination, snapshot, report, check, request.allow_unsupported)
 		    : PX::SessionExchange::import_dawproject (engine, archive, destination, snapshot, report, check);
 		engine.remove_session ();
 		session.reset ();

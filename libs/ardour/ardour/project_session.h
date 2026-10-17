@@ -26,9 +26,12 @@ public:
 	static std::unique_ptr<Session> import_dawproject (AudioEngine&, const std::string& archive,
 	                                                const std::string& destination, const std::string& snapshot,
 	                                                std::vector<Diagnostic>&, CancelCheck = CancelCheck ());
+	/* Unsupported native-song features are rejected unless the caller explicitly
+	 * accepts a partial import. The returned report still lists every omission. */
 	static std::unique_ptr<Session> import_studio_one (AudioEngine&, const std::string& song,
 	                                                const std::string& destination, const std::string& snapshot,
-	                                                std::vector<Diagnostic>&, CancelCheck = CancelCheck ());
+	                                                std::vector<Diagnostic>&, CancelCheck = CancelCheck (),
+	                                                bool allow_unsupported = false);
 	/* Same engine and transaction requirements as import_dawproject. */
 	static std::unique_ptr<Session> import_logic (AudioEngine&, const std::string& aaf, const std::string& midi,
 	                                            const std::string& destination, const std::string& snapshot,
