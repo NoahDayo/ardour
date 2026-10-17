@@ -39,7 +39,10 @@ TestUI::TestUI ()
 
 	set_event_loop_for_thread (this);
 
-	SessionEvent::create_per_thread_pool ("test", 512);
+	/* The exchange suite repeatedly creates sessions and cancels renders on
+	 * this test-only UI thread. It has no production GUI idle loop to drain
+	 * events between cases, so retain enough event slots for a complete run. */
+	SessionEvent::create_per_thread_pool ("test", 4096);
 
 	m_test_receiver.listen_to (PBD::warning);
 	m_test_receiver.listen_to (PBD::error);
