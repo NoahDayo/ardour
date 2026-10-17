@@ -542,6 +542,53 @@ class NativeSongTest(unittest.TestCase):
         self.entries["Devices/audiomixer.xml"] = self.entries["Devices/audiomixer.xml"].replace('name="FX01"', 'name="FX01" bypass="1"')
         self.assertTrue(any(d["disposition"] == 3 for d in self.read()["project"]["report"]))
 
+    def test_native_bus_and_master_vst3_state_round_trip(self):
+        class_id = "00112233445566778899AABBCCDDEEFF"
+        native_id = "{00112233-4455-6677-8899-AABBCCDDEEFF}"
+        state = (b"VST3" + struct.pack("<I", 1) + class_id.encode() + struct.pack("<Q", 48) + b"List"
+                 + struct.pack("<I", 1) + b"Comp" + struct.pack("<QQ", 48, 0))
+
+        def inserts(name):
+            member = f"Presets/Channels/Stereo/{name}.vstpreset"
+            self.entries[member] = state
+            return ('<Attributes x:id="Inserts"><Attributes name="FX01">'
+                    f'<UID x:id="deviceClassID" uid="{native_id}"/>'
+                    f'<Attributes x:id="deviceData" name="{name}"/>'
+                    '<Attributes x:id="ghostData" presetType="vstpreset">'
+                    f'<Attributes x:id="classInfo" classID="{native_id}" name="{name}" '
+                    'category="AudioEffect" subCategory="VST3"/></Attributes>'
+                    f'<String x:id="presetPath" text="{member}"/></Attributes>'
+                    '<Attributes x:id="Presets" pname="default" dirty="0"/></Attributes>')
+
+        bus = ('<ChannelGroup name="AudioGroup"><AudioGroupChannel label="Mix Bus" gain="1">'
+               '<UID x:id="uniqueID" uid="mix-bus"/>'
+               '<Connection x:id="destination" objectID="master/Input"/>'
+               + inserts("Bus Effect") + '</AudioGroupChannel></ChannelGroup>')
+        mixer = MIXER.replace('objectID="master/Input"', 'objectID="mix-bus/Input"', 1)
+        mixer = mixer.replace('<ChannelGroup name="AudioOutput">', bus + '<ChannelGroup name="AudioOutput">')
+        mixer = mixer.replace('</AudioOutputChannel>', inserts("Master Effect") + '</AudioOutputChannel>')
+        self.entries["Devices/audiomixer.xml"] = mixer
+        before = self.read()["project"]
+        by_name = {track["name"]: track for track in before["tracks"]}
+        self.assertEqual([by_name[name]["plugins"][0]["name"] for name in ("Mix Bus", "Main")],
+                         ["Bus Effect", "Master Effect"])
+        self.assertFalse(any(d["disposition"] == 3 for d in before["report"]))
+        self.writable_fixture()
+        output, _ = self.export()
+        with zipfile.ZipFile(output) as archive:
+            exported = self.native_xml(archive, "Devices/audiomixer.xml")
+            for channel, name in (("AudioGroupChannel", "Bus Effect"),
+                                  ("AudioOutputChannel", "Master Effect")):
+                slot = exported.find(f".//{channel}/Attributes[@id='Inserts']/Attributes[@name='FX01']")
+                self.assertIsNotNone(slot)
+                self.assertEqual(slot.find("UID[@id='deviceClassID']").get("uid"), native_id)
+                self.assertEqual(archive.read(slot.find("String[@id='presetPath']").get("text")), state)
+        returned = {track["name"]: track for track in self.read(path=output)["project"]["tracks"]}
+        for track_name in ("Mix Bus", "Main"):
+            plugin = returned[track_name]["plugins"][0]
+            self.assertEqual((plugin["id"], plugin["state_size"], plugin["enabled"]),
+                             (class_id, len(state), True))
+
     def test_folder_content_and_unknown_parent_are_not_discarded(self):
         folder = '<FolderTrack trackID="band" name="Band"><Attributes x:id="AutomationRegionList"/></FolderTrack>'
         self.entries["Song/song.xml"] = SONG.replace('<MediaTrack trackID="audio"', folder + '<MediaTrack trackID="audio" parentFolder="band"')

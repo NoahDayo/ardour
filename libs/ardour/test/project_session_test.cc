@@ -1502,6 +1502,46 @@ void ProjectSessionTest::vst3_plugin_exchange ()
 	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("native-plugin-return.dawproject"));
 	auto native_returned = PX::DawProject::read (fixture.path ("native-plugin-return.dawproject"));
 	CPPUNIT_ASSERT_EQUAL (devices[0].state, track_named (native_returned, "Stereo").plugins.at (0).state);
+	/* Studio Pro saves the same insert rack on bus and main-output channels.
+	 * Prove that an actual installed VST3 survives both routes, Ardour's
+	 * session save/reopen, and return to the neutral exchange format. */
+	auto stereo_track = std::find_if (native.project.tracks.begin (), native.project.tracks.end (), [] (const PX::Track& t) { return t.name == "Stereo"; });
+	auto master_track = std::find_if (native.project.tracks.begin (), native.project.tracks.end (), [] (const PX::Track& t) { return t.master; });
+	CPPUNIT_ASSERT (stereo_track != native.project.tracks.end () && master_track != native.project.tracks.end ());
+	PX::PluginDevice bus_device = native_devices[0];
+	bus_device.state_path = "plugins/bus.vstpreset";
+	PX::PluginDevice master_device = bus_device;
+	master_device.state_path = "plugins/master.vstpreset";
+	std::string master_id = master_track->id, master_name = master_track->name;
+	stereo_track->destination = "vst3-bus";
+	master_track->plugins.push_back (master_device);
+	PX::Track bus; bus.id = "vst3-bus"; bus.name = "VST3 Bus"; bus.kind = PX::TrackKind::Bus;
+	bus.destination = master_id; bus.plugins.push_back (bus_device);
+	native.project.tracks.push_back (bus);
+	std::string bus_song = fixture.path ("bus-master-plugins.song");
+	PX::StudioOneSong::write (native, bus_song, bus_song);
+	auto bus_native = PX::StudioOneSong::read (bus_song);
+	CPPUNIT_ASSERT_EQUAL (bus_device.state, track_named (bus_native.project, "VST3 Bus").plugins.at (0).state);
+	CPPUNIT_ASSERT_EQUAL (bus_device.state, track_named (bus_native.project, master_name).plugins.at (0).state);
+	AudioEngine::instance ()->remove_session ();
+	fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_studio_one (*AudioEngine::instance (), bus_song,
+	                                                        fixture.path ("BusMasterPluginReturn"), "Exchange", fixture.report);
+	CPPUNIT_ASSERT (fixture.session->route_by_name ("VST3 Bus"));
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state ("Exchange"));
+	AudioEngine::instance ()->remove_session ();
+	fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("BusMasterPluginReturn"), "Exchange", nullptr, "", true));
+	AudioEngine::instance ()->set_session (fixture.session.get ());
+	fixture.report.clear ();
+	PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("bus-master-native-return"), fixture.report, native_options);
+	auto native_bus_returned = PX::StudioOneSong::read (fixture.path ("bus-master-native-return/Project.song"));
+	CPPUNIT_ASSERT_EQUAL (bus_device.state, track_named (native_bus_returned.project, "VST3 Bus").plugins.at (0).state);
+	CPPUNIT_ASSERT_EQUAL (bus_device.state, track_named (native_bus_returned.project, master_name).plugins.at (0).state);
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("bus-master-plugin-return.dawproject"));
+	auto bus_returned = PX::DawProject::read (fixture.path ("bus-master-plugin-return.dawproject"));
+	CPPUNIT_ASSERT_EQUAL (bus_device.state, track_named (bus_returned, "VST3 Bus").plugins.at (0).state);
+	CPPUNIT_ASSERT_EQUAL (bus_device.state, track_named (bus_returned, master_name).plugins.at (0).state);
 	if (const char* external = std::getenv ("ARDOUR_STUDIO_PRO_VST3_TEST_PROJECT")) {
 		if (!*external) { return; }
 		auto assert_supported = [] (const std::vector<PX::Diagnostic>& report) {

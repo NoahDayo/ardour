@@ -1054,7 +1054,10 @@ Project collect (Session& session, AudioAssets& assets, const CancelCheck& cance
 				}
 				auto plugin = insert->plugin (0);
 				auto info = plugin ? plugin->get_info () : PluginInfoPtr ();
-				if (!info || info->type != VST3 || insert->get_count () != 1 || insert->has_sidechain () || insert->custom_cfg () || insert->strict_io ()) {
+				/* Ardour's stereo master uses strict I/O by default. The pin-map
+				 * check below still rejects any nonstandard signal routing. */
+				if (!info || info->type != VST3 || insert->get_count () != 1 || insert->has_sidechain () || insert->custom_cfg () ||
+				    (insert->strict_io () && !route->is_master ())) {
 					unsupported (project, track.name, "Plugin configuration requires a compatible VST3 instance or rendered fallback: " + processor->display_name ());
 					return;
 				}

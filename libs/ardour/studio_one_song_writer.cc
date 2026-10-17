@@ -215,9 +215,9 @@ std::vector<Diagnostic> StudioOneSong::export_report (const Project& project)
 			unsupported (track.name, "Native sends require an audio track or stereo bus");
 		}
 		for (auto const& plugin : track.plugins) {
-			if (track.master || track.kind != TrackKind::Audio || track.channels != 2 || plugin.role != "audioFX" ||
+			if ((track.kind != TrackKind::Audio && track.kind != TrackKind::Bus) || track.channels != 2 || plugin.role != "audioFX" ||
 			    !plugin.enabled || plugin.state.empty ()) {
-				unsupported (track.name, "Native VST3 export supports enabled, stereo audio-track effects with embedded preset state");
+				unsupported (track.name, "Native VST3 export supports enabled, stereo audio-track, bus, and master effects with embedded preset state");
 			} else {
 				report.push_back ({Disposition::Transformed, plugin.name, "VST3 state embedded in the native song; Studio Pro opening and playback are not yet validated"});
 			}
