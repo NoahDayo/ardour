@@ -272,9 +272,9 @@ std::vector<Diagnostic> StudioOneSong::export_report (const Project& project)
 		report.push_back ({Disposition::Transformed, "Tempo", "Tempo curves become native steps with at most 10 microseconds of timeline error"});
 	}
 	if (std::any_of (project.tracks.begin (), project.tracks.end (), [] (const Track& t) { return t.kind == TrackKind::MIDI; })) {
-		report.push_back ({Disposition::Transformed, "MIDI", "MIDI notes retain musical timing without a target instrument; release velocity uses Studio One's default"});
+		report.push_back ({Disposition::Transformed, "MIDI", "MIDI notes retain musical timing and release velocity without a target instrument; target playback is not yet validated"});
 	}
-	report.push_back ({Disposition::Transformed, "Native Studio One song", "Experimental format-version-9 export. Target-application opening and playback have not yet been validated. Audio clips use absolute time; copy the complete song folder when moving it."});
+	report.push_back ({Disposition::Transformed, "Native Studio One song", "Experimental native export for format versions 7, 8 and 9. Target-application opening and playback have not yet been validated. Audio clips use absolute time; copy the complete song folder when moving it."});
 	report.push_back ({Disposition::Transformed, "Audio device", "Hardware assignments are not transferred; choose the target computer's main outputs in Studio One or Studio Pro"});
 	return report;
 }
