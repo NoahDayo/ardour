@@ -134,6 +134,10 @@ struct Reader {
 	{
 		if (!handle) { throw ArchiveError ("Cannot allocate ZIP reader"); }
 		check_archive (archive_read_support_format_zip (handle.get ()), handle.get ());
+		/* ZIP names without the UTF-8 flag use CP437. The libarchive locale
+		 * fallback otherwise maps Studio Pro's native member names differently
+		 * from the UTF-8 media URLs in its song XML. */
+		check_archive (archive_read_set_options (handle.get (), "zip:hdrcharset=CP437"), handle.get ());
 		check_archive (archive_read_open_FILE (handle.get (), file.get ()), handle.get ());
 	}
 	bool next (struct archive_entry*& entry)

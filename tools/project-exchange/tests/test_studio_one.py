@@ -470,6 +470,20 @@ class NativeSongTest(unittest.TestCase):
         self.assertIn("automation member is missing", error)
         self.assertFalse(output.exists())
 
+    def test_native_automation_member_with_cp437_zip_name(self):
+        automation = ('<Attributes x:id="AutomationRegionList"><AutomationRegion title="Volume">'
+                      '<Url x:id="points" url="media:///Envelopes/Lautstärke.envelopex"/>'
+                      '</AutomationRegion></Attributes>')
+        self.entries["Song/song.xml"] = SONG.replace('<List x:id="Events">', automation + '<List x:id="Events">', 1)
+        self.entries["Envelopes/LautstXrke.envelopex"] = ubj({"events": []})
+        self.save()
+        data = self.song.read_bytes()
+        self.assertEqual(data.count(b"Envelopes/LautstXrke.envelopex"), 2)
+        self.song.write_bytes(data.replace(b"Envelopes/LautstXrke.envelopex",
+                                           b"Envelopes/Lautst\x84rke.envelopex"))
+        project = self.read(path=self.song)["project"]
+        self.assertFalse(any("automation member is missing" in d["detail"] for d in project["report"]))
+
     def test_format_seven_audio_song_converts_to_format_nine(self):
         self.entries["metainfo.xml"] = META.replace('value="9"', 'value="7"')
         before = self.read()["project"]
@@ -492,6 +506,7 @@ class NativeSongTest(unittest.TestCase):
         self.assertEqual(by_name["Voiceover 1"]["sends"][0]["destination"], by_name["Room"]["id"])
         self.assertEqual(by_name["Voiceover 2"]["sends"][0]["destination"], by_name["Room"]["id"])
         self.assertTrue(any(d["disposition"] == 3 and "sidechain" in d["detail"] for d in project["report"]))
+        self.assertFalse(any("automation member is missing" in d["detail"] for d in project["report"]))
 
     def test_native_vst3_insert_reads_embedded_state_without_silent_loss(self):
         class_id = "00112233445566778899AABBCCDDEEFF"
