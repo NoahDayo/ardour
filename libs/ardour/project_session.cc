@@ -91,6 +91,37 @@ bool default_plugin_mapping (const PluginInsert& insert)
 	return input == insert.input_map (0) && output == insert.output_map (0);
 }
 
+/* validate_vst3_state() is called before reading these offsets.  A host may
+ * omit an empty controller chunk or metadata when saving its own preset. */
+uint64_t vst3_unsigned_at (const std::string& state, size_t offset, unsigned bytes)
+{
+	uint64_t value = 0;
+	for (unsigned i = 0; i < bytes; ++i) { value |= uint64_t (uint8_t (state[offset + i])) << (8 * i); }
+	return value;
+}
+
+std::pair<size_t, size_t> vst3_chunk (const std::string& state, const char* type)
+{
+	size_t list = size_t (vst3_unsigned_at (state, 40, 8));
+	size_t count = size_t (vst3_unsigned_at (state, list + 4, 4));
+	for (size_t i = 0; i < count; ++i) {
+		size_t entry = list + 8 + i * 20;
+		if (state.compare (entry, 4, type) == 0) {
+			return {size_t (vst3_unsigned_at (state, entry + 4, 8)), size_t (vst3_unsigned_at (state, entry + 12, 8))};
+		}
+	}
+	return {0, 0};
+}
+
+bool vst3_transferable_state_equal (const std::string& original, const std::string& current)
+{
+	for (const char* type : {"Comp", "Cont"}) {
+		auto a = vst3_chunk (original, type), b = vst3_chunk (current, type);
+		if (a.second != b.second || (a.second && original.compare (a.first, a.second, current, b.first, b.second) != 0)) { return false; }
+	}
+	return true;
+}
+
 typedef std::unique_ptr<GFile, void (*) (gpointer)> FileObject;
 FileObject file_object (const std::string& path) { return FileObject (g_file_new_for_path (path.c_str ()), g_object_unref); }
 
@@ -523,6 +554,19 @@ void populate (Session& session, const Project& project, const std::map<std::str
 			state.add_child_nocopy (*chunk);
 			if (plugin->set_state (state, PBD::Stateful::current_state_version)) {
 				throw ExchangeError (track.name + ": cannot apply VST3 preset state for " + device.name);
+			}
+			if (vst3_chunk (device.state, "Info").first || vst3_chunk (device.state, "Cont").first) {
+				/* The plugin API may return only component bytes.  Keep the
+				 * original preset wrapper in the session, but reuse it only while
+				 * the live component/controller state is unchanged. */
+				XMLNode* metadata = new XMLNode ("ProjectExchangeVST3");
+				XMLNode* preset = new XMLNode ("Preset");
+				gchar* original = g_base64_encode (reinterpret_cast<const guchar*> (device.state.data ()), device.state.size ());
+				if (!original) { delete preset; delete metadata; throw ExchangeError ("Cannot retain VST3 preset metadata"); }
+				preset->add_content (original);
+				g_free (original);
+				metadata->add_child_nocopy (*preset);
+				insert->add_extra_xml (*metadata);
 			}
 			if (!device.enabled) { insert->deactivate (); }
 			report.push_back ({Disposition::Preserved, device.name, "Matched VST3 class ID and restored embedded preset state"});
@@ -1089,6 +1133,32 @@ Project collect (Session& session, AudioAssets& assets, const CancelCheck& cance
 				g_free (decoded);
 				try { validate_vst3_state (device.id, device.state); }
 				catch (const ExchangeError& e) { unsupported (project, track.name, std::string ("VST3 preset needs a rendered fallback: ") + e.what ()); return; }
+				if (const XMLNode* metadata = insert->extra_xml ("ProjectExchangeVST3")) {
+					bool retained = false;
+					auto presets = metadata->children ("Preset");
+					if (presets.size () == 1 && presets.front ()->children ().size () == 1 && presets.front ()->children ().front ()->is_content ()) {
+						std::string original_encoded = presets.front ()->children ().front ()->content ();
+						if (original_encoded.size () <= 90 * 1024 * 1024) {
+							gsize original_size = 0;
+							guchar* original_bytes = g_base64_decode (original_encoded.c_str (), &original_size);
+							if (original_bytes) {
+								std::string original (reinterpret_cast<const char*> (original_bytes), original_size);
+								g_free (original_bytes);
+								try {
+									validate_vst3_state (device.id, original);
+									if (vst3_transferable_state_equal (original, device.state)) {
+										device.state = std::move (original);
+										retained = true;
+									}
+								} catch (const ExchangeError&) { /* Session metadata may be damaged; live plugin state remains valid. */ }
+							}
+						}
+					}
+					if (!retained) {
+						project.report.push_back ({Disposition::Transformed, device.name,
+						                           "VST3 preset wrapper metadata differs from the current plugin state; exported current component/controller state"});
+					}
+				}
 				track.plugins.push_back (std::move (device));
 				return;
 			}

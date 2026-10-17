@@ -485,6 +485,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (native_midi_curves_roundtrip);
 	CPPUNIT_TEST (native_midi_curves_limit);
 	CPPUNIT_TEST (vst3_plugin_exchange);
+	CPPUNIT_TEST (native_song_app_authored_roundtrip);
 	CPPUNIT_TEST (bad_media);
 	CPPUNIT_TEST (corrupt_media);
 	CPPUNIT_TEST (existing_destination);
@@ -532,6 +533,7 @@ public:
 	void native_midi_curves_roundtrip ();
 	void native_midi_curves_limit ();
 	void vst3_plugin_exchange ();
+	void native_song_app_authored_roundtrip ();
 	void bad_media ();
 	void corrupt_media ();
 	void existing_destination ();
@@ -1582,6 +1584,107 @@ void ProjectSessionTest::vst3_plugin_exchange ()
 		CPPUNIT_ASSERT_EQUAL (external_devices[0].enabled, studio_devices[0].enabled);
 		std::cout << "Studio Pro VST3 return: import/save/reopen/export passed" << std::endl;
 	}
+}
+
+void ProjectSessionTest::native_song_app_authored_roundtrip ()
+{
+	const char* source = std::getenv ("ARDOUR_STUDIO_PRO_VST3_TEST_SONG");
+	if (!source || !*source) { return; }
+	Fixture fixture;
+	PluginManager::instance ().refresh (false);
+	auto supported = [] (const std::vector<PX::Diagnostic>& report) {
+		std::string details;
+		for (auto const& item : report) {
+			if (item.disposition == PX::Disposition::Unsupported) { details += "\n" + item.object + ": " + item.detail; }
+		}
+		CPPUNIT_ASSERT_MESSAGE ("Unsupported app-authored song content:" + details, details.empty ());
+	};
+	auto original = PX::StudioOneSong::read (source);
+	supported (original.project.report);
+	auto const& source_audio = track_named (original.project, "Stereo");
+	auto const& source_midi = track_named (original.project, "Notes");
+	CPPUNIT_ASSERT_EQUAL (size_t (1), source_audio.plugins.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (1), source_audio.clips.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (1), source_midi.clips.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (2), source_midi.clips[0].notes.size ());
+	PX::PluginDevice original_plugin = source_audio.plugins[0];
+	auto verify = [&] (const PX::Project& project) {
+		auto const& folder = track_named (project, "Band");
+		auto const& audio = track_named (project, "Stereo");
+		auto const& midi = track_named (project, "Notes");
+		CPPUNIT_ASSERT_EQUAL (folder.id, audio.parent);
+		CPPUNIT_ASSERT_EQUAL (folder.id, midi.parent);
+		CPPUNIT_ASSERT_EQUAL (size_t (1), audio.plugins.size ());
+		CPPUNIT_ASSERT_EQUAL (original_plugin.id, audio.plugins[0].id);
+		CPPUNIT_ASSERT_EQUAL (original_plugin.state, audio.plugins[0].state);
+		CPPUNIT_ASSERT_EQUAL (size_t (1), audio.clips.size ());
+		CPPUNIT_ASSERT_EQUAL (size_t (1), midi.clips.size ());
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (source_audio.clips[0].duration, audio.clips[0].duration, 1e-6);
+		CPPUNIT_ASSERT_EQUAL (size_t (2), midi.clips[0].notes.size ());
+		for (size_t i = 0; i < 2; ++i) {
+			CPPUNIT_ASSERT_EQUAL (source_midi.clips[0].notes[i].key, midi.clips[0].notes[i].key);
+			CPPUNIT_ASSERT_DOUBLES_EQUAL (source_midi.clips[0].notes[i].time, midi.clips[0].notes[i].time, 1e-6);
+		}
+	};
+	fixture.session = PX::SessionExchange::import_studio_one (*AudioEngine::instance (), source,
+	                                                        fixture.path ("AppAuthored"), "AppAuthored", fixture.report);
+	supported (fixture.report);
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state ("AppAuthored"));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("AppAuthored"), "AppAuthored", nullptr, "", true));
+	AudioEngine::instance ()->set_session (fixture.session.get ());
+	PX::SessionExchange::ExportOptions options;
+	fixture.report.clear ();
+	PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("NativeReturn"), fixture.report, options);
+	supported (fixture.report);
+	auto native_return = PX::StudioOneSong::read (fixture.path ("NativeReturn/Project.song"));
+	supported (native_return.project.report);
+	verify (native_return.project);
+	fixture.report.clear ();
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("app-authored-return.dawproject"), fixture.report);
+	supported (fixture.report);
+	auto neutral_return = PX::DawProject::read (fixture.path ("app-authored-return.dawproject"));
+	supported (neutral_return.report);
+	verify (neutral_return);
+	std::shared_ptr<PluginInsert> live_insert;
+	for (auto const& route : *fixture.session->get_routes ()) {
+		if (route->name () != "Stereo") { continue; }
+		route->foreach_processor ([&] (std::weak_ptr<Processor> weak) {
+			if (auto insert = std::dynamic_pointer_cast<PluginInsert> (weak.lock ())) { live_insert = insert; }
+		});
+	}
+	CPPUNIT_ASSERT (live_insert);
+	auto live_plugin = live_insert->plugin (0);
+	bool changed = false;
+	for (uint32_t index = 0; index < live_plugin->parameter_count (); ++index) {
+		bool ok = false;
+		uint32_t parameter = live_plugin->nth_parameter (index, ok);
+		ParameterDescriptor descriptor;
+		if (!ok || !live_plugin->parameter_is_input (parameter) || live_plugin->get_parameter_descriptor (parameter, descriptor) ||
+		    descriptor.toggled || descriptor.enumeration || descriptor.integer_step || descriptor.upper <= descriptor.lower) { continue; }
+		auto control = live_insert->automation_control (Evoral::Parameter (PluginAutomation, 0, parameter));
+		if (!control) { continue; }
+		float before = live_plugin->get_parameter (parameter);
+		float target = descriptor.lower + (descriptor.upper - descriptor.lower) * (descriptor.to_interface (before) < .5 ? .73 : .27);
+		control->set_value (target, PBD::Controllable::NoGroup);
+		if (std::fabs (live_plugin->get_parameter (parameter) - before) > 1e-5) { changed = true; break; }
+	}
+	CPPUNIT_ASSERT_MESSAGE ("App-authored VST3 needs an editable continuous parameter", changed);
+	g_usleep (100000);
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state ("AppAuthored"));
+	live_plugin.reset (); live_insert.reset ();
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("AppAuthored"), "AppAuthored", nullptr, "", true));
+	AudioEngine::instance ()->set_session (fixture.session.get ());
+	fixture.report.clear ();
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("app-authored-edited.dawproject"), fixture.report);
+	supported (fixture.report);
+	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& item) {
+		return item.disposition == PX::Disposition::Transformed && item.detail.find ("VST3 preset wrapper metadata differs") != std::string::npos;
+	}));
+	auto edited_return = PX::DawProject::read (fixture.path ("app-authored-edited.dawproject"));
+	CPPUNIT_ASSERT (track_named (edited_return, "Stereo").plugins.at (0).state != original_plugin.state);
+	std::cout << "App-authored Studio Pro song survived import, save/reopen and both native and neutral return exports" << std::endl;
 }
 
 void ProjectSessionTest::region_fades_roundtrip ()
