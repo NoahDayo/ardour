@@ -3418,7 +3418,7 @@ aafi_dump_obj (AAF_Iface* aafi, aafObject* Obj, struct trace_dump* __td, int sta
 			return;
 		}
 
-		laaf_write_log (aafi->log, aafi, LOG_SRC_ID_AAF_IFACE, VERB_ERROR, __FILENAME__, func, line, buf);
+		laaf_write_log (aafi->log, aafi, LOG_SRC_ID_AAF_IFACE, verbtype, __FILENAME__, func, line, buf);
 
 		free (buf);
 

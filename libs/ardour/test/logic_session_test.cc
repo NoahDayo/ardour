@@ -243,6 +243,21 @@ void LogicSessionTest::paired_mono_layout ()
 	CPPUNIT_ASSERT (std::any_of (terminal.project ().report.begin (), terminal.project ().report.end (), [] (const PX::Diagnostic& item) {
 		return item.detail.find ("Repeated AAF control points") != std::string::npos;
 	}));
+	PX::LogicProject rounded (fixture.path ("SplitFixtures/RoundedDuplicate.aaf"));
+	CPPUNIT_ASSERT (!PX::has_unsupported_features (rounded.project ()));
+	const auto& rounded_curve = rounded.project ().tracks[1].volume_automation;
+	CPPUNIT_ASSERT_EQUAL (size_t (2), rounded_curve.points.size ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (0, rounded_curve.points.front ().time, 1e-7);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.75, rounded_curve.points.back ().time, 1e-7);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.25, rounded_curve.points.front ().value, 1e-7);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.75, rounded_curve.points.back ().value, 1e-7);
+	CPPUNIT_ASSERT (std::any_of (rounded.project ().report.begin (), rounded.project ().report.end (), [] (const PX::Diagnostic& item) {
+		return item.detail.find ("Repeated identical AAF control points") != std::string::npos;
+	}));
+	CPPUNIT_ASSERT (std::any_of (rounded.project ().report.begin (), rounded.project ().report.end (), [] (const PX::Diagnostic& item) {
+		return item.detail.find ("one operation tick beyond the end") != std::string::npos;
+	}));
+	CPPUNIT_ASSERT_THROW (PX::LogicProject (fixture.path ("SplitFixtures/ConflictingDuplicate.aaf")), PX::ExchangeError);
 	PX::LogicProject partial (fixture.path ("SplitFixtures/PartialTag.aaf"));
 	CPPUNIT_ASSERT_EQUAL (size_t (3), partial.project ().tracks.size ());
 	CPPUNIT_ASSERT_EQUAL (1u, partial.project ().tracks[1].channels);

@@ -72,9 +72,16 @@ struct LogicProject::Impl {
 		}
 		curve.unit = TimeUnit::Seconds;
 		double duration = seconds (gain->length, rate), previous = -1;
-		bool redundant_end_point = false;
+		bool redundant_end_point = false, redundant_equal_point = false, rounded_end_point = false;
 		for (unsigned i = 0; i < gain->pts_cnt; ++i) {
 			double fraction = rational (&gain->time[i]);
+			double value = rational (&gain->value[i]);
+			if (fraction > 1 && fraction <= 1 + 1.0 / gain->length) {
+				/* Some AAF writers round the last point one operation tick beyond
+				 * the end. It has no later audio to affect. */
+				fraction = 1;
+				rounded_end_point = true;
+			}
 			if (fraction == 1 && previous == 1) {
 				/* Some AAF writers append another control value at the exact end
 				 * of an operation. It spans no audio samples, so retain the first
@@ -82,9 +89,20 @@ struct LogicProject::Impl {
 				redundant_end_point = true;
 				continue;
 			}
+			if (fraction == previous && !curve.points.empty () && value == curve.points.back ().value) {
+				/* Repeated identical points do not change the envelope. */
+				redundant_equal_point = true;
+				continue;
+			}
 			require (fraction >= 0 && fraction <= 1 && fraction > previous, "Invalid or unordered AAF automation times");
-			curve.points.push_back ({fraction * duration, rational (&gain->value[i]), interpolation == AAFI_INTERPOL_LINEAR});
+			curve.points.push_back ({fraction * duration, value, interpolation == AAFI_INTERPOL_LINEAR});
 			previous = fraction;
+		}
+		if (redundant_equal_point) {
+			project.report.push_back ({Disposition::Transformed, label, "Repeated identical AAF control points were omitted"});
+		}
+		if (rounded_end_point) {
+			project.report.push_back ({Disposition::Transformed, label, "AAF control point one operation tick beyond the end was placed at the end"});
 		}
 		if (redundant_end_point) {
 			project.report.push_back ({Disposition::Transformed, label, "Repeated AAF control points at the operation end have zero duration; retained the first endpoint"});

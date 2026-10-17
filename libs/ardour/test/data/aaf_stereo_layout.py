@@ -12,7 +12,8 @@ import aaf2
 
 
 def make_fixture(path, rate=48000, right_position=12000, empty_pair=True, independent_levels=False,
-                 proportional_levels=False, one_tag=False, terminal_duplicate=False):
+                 proportional_levels=False, one_tag=False, terminal_duplicate=False,
+                 rounded_duplicate=False, conflicting_duplicate=False):
     sources = []
     for name, sample in (("Left", 4096), ("Right", -8192)):
         source = path.with_name(path.stem + "-" + name + ".wav")
@@ -63,17 +64,26 @@ def make_fixture(path, rate=48000, right_position=12000, empty_pair=True, indepe
                     curve = output.create.VaryingValue(amplitude, "Linear")
                     levels = (("2/5", "4/5") if channel == 1 else ("1/5", "2/5")) if proportional_levels else (
                         ("1/4", "3/4") if channel == 1 else ("1/2", "1/4"))
-                    for at, value in enumerate(levels):
-                        curve.add_keyframe(at, value)
+                    def append_point(at, value):
+                        point = output.create.ControlPoint()
+                        point.time = at
+                        point["Value"].add_pid_entry()
+                        point["Value"].data = point["Value"].typedef.encode(value, curve.typedef)
+                        point["Value"].mark_modified()
+                        curve["PointList"].append(point)
+
+                    if rounded_duplicate or conflicting_duplicate:
+                        curve.add_keyframe(0, levels[0])
+                        append_point(0, "1/8" if conflicting_duplicate else levels[0])
+                        append_point(1 if conflicting_duplicate else
+                                     f"{group.length + 1}/{group.length}", levels[1])
+                    else:
+                        for at, value in enumerate(levels):
+                            curve.add_keyframe(at, value)
                     if terminal_duplicate:
                         # add_keyframe replaces an equal-time key, so append a
                         # raw ControlPoint as seen in app-authored AAF files.
-                        point = output.create.ControlPoint()
-                        point.time = 1
-                        point["Value"].add_pid_entry()
-                        point["Value"].data = point["Value"].typedef.encode("1/8", curve.typedef)
-                        point["Value"].mark_modified()
-                        curve["PointList"].append(point)
+                        append_point(1, "1/8")
                     group.parameters.append(curve)
                     if one_tag and channel == 1:
                         group["UserComments"].append(output.create.TaggedValue("Ardour.StereoGainBalance", "1"))
@@ -99,6 +109,10 @@ if __name__ == "__main__":
                  proportional_levels=True, one_tag=True)
     make_fixture(destination / "TerminalDuplicate.aaf", empty_pair=False, independent_levels=True,
                  terminal_duplicate=True)
+    make_fixture(destination / "RoundedDuplicate.aaf", empty_pair=False, independent_levels=True,
+                 rounded_duplicate=True)
+    make_fixture(destination / "ConflictingDuplicate.aaf", empty_pair=False, independent_levels=True,
+                 conflicting_duplicate=True)
     (destination / "Project.mid").write_bytes(bytes.fromhex(
         "4d54686400000006000000014b004d54726b0000000400ff2f00"))
     (destination / "Metadata.xml").write_text("<IndependentFixture/>", encoding="utf-8")
