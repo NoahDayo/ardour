@@ -509,6 +509,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (bus_sends_roundtrip);
 	CPPUNIT_TEST (native_song_fx_sends_roundtrip);
 	CPPUNIT_TEST (native_song_format_seven_import);
+	CPPUNIT_TEST (native_song_format_eight_import);
 	CPPUNIT_TEST (native_song_cancel);
 	CPPUNIT_TEST (native_song_unsupported);
 	CPPUNIT_TEST (native_song_partial_import);
@@ -561,6 +562,7 @@ public:
 	void bus_sends_roundtrip ();
 	void native_song_fx_sends_roundtrip ();
 	void native_song_format_seven_import ();
+	void native_song_format_eight_import ();
 	void native_song_cancel ();
 	void native_song_unsupported ();
 	void native_song_partial_import ();
@@ -2463,12 +2465,12 @@ void ProjectSessionTest::native_song_fx_sends_roundtrip ()
 	std::cout << "Native song FX/bus sends survived Ardour import, save/reopen and DAWproject return" << std::endl;
 }
 
-void ProjectSessionTest::native_song_format_seven_import ()
+void native_song_older_format_import (unsigned format_version)
 {
-	Fixture fixture; native_package (fixture, false, false, false, 7);
+	Fixture fixture; native_package (fixture, false, false, false, format_version);
 	auto original = PX::StudioOneSong::read (fixture.path ("input.song"));
-	CPPUNIT_ASSERT (std::any_of (original.project.report.begin (), original.project.report.end (), [] (const PX::Diagnostic& d) {
-		return d.disposition == PX::Disposition::Transformed && d.detail.find ("format 7") != std::string::npos;
+	CPPUNIT_ASSERT (std::any_of (original.project.report.begin (), original.project.report.end (), [format_version] (const PX::Diagnostic& d) {
+		return d.disposition == PX::Disposition::Transformed && d.detail.find ("format " + std::to_string (format_version)) != std::string::npos;
 	}));
 	fixture.session = PX::SessionExchange::import_studio_one (*AudioEngine::instance (), fixture.path ("input.song"), fixture.path ("OlderSong"), "OlderSong", fixture.report);
 	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
@@ -2478,11 +2480,14 @@ void ProjectSessionTest::native_song_format_seven_import ()
 	PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("UpgradedSong"), fixture.report, options);
 	PX::ProjectArchive archive (fixture.path ("UpgradedSong/Project.song"));
 	CPPUNIT_ASSERT (archive.read_text ("metainfo.xml").find ("Document:FormatVersion\" value=\"9") != std::string::npos);
-	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("format-seven-return.dawproject"));
-	auto returned = PX::DawProject::read (fixture.path ("format-seven-return.dawproject"));
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("older-format-return.dawproject"));
+	auto returned = PX::DawProject::read (fixture.path ("older-format-return.dawproject"));
 	CPPUNIT_ASSERT_EQUAL (size_t (1), track_named (returned, "Native audio").clips.size ());
-	std::cout << "Format-7 native song imported, saved/reopened and returned through format 9 and DAWproject" << std::endl;
+	std::cout << "Format-" << format_version << " native song imported, saved/reopened and returned through format 9 and DAWproject" << std::endl;
 }
+
+void ProjectSessionTest::native_song_format_seven_import () { native_song_older_format_import (7); }
+void ProjectSessionTest::native_song_format_eight_import () { native_song_older_format_import (8); }
 
 void ProjectSessionTest::native_song_cancel ()
 {
