@@ -144,7 +144,7 @@ struct LogicProject::Impl {
 			} else {
 				for (unsigned channel = 0; channel < source->channels; ++channel) { selected.push_back ({source, channel}); }
 			}
-			require (selected.size () <= 2, "AAF audio with more than two channels is not yet supported");
+			require (selected.size () <= 8, "AAF audio with more than eight channels is not yet supported");
 		}
 		require (!selected.empty () && selected.size () == size_t (clip->channels), "AAF clip channel mapping is inconsistent");
 		auto found = media_ids.find (selected);
@@ -472,7 +472,7 @@ LogicProject::LogicProject (const std::string& path, const std::string& midi, Ca
 		if (!output.channels && !track->timelineItems) {
 			output.channels = 1;
 		}
-		require (output.channels == 1 || output.channels == 2, "Unsupported AAF track channel layout");
+		require (output.channels == 1 || output.channels == 2 || output.channels == 4 || output.channels == 6 || output.channels == 8, "Unsupported AAF track channel layout");
 		output.volume = self.mixer (track->gain, output.volume_automation, track->edit_rate, output.name + " gain", 1);
 		output.pan = self.mixer (track->pan, output.pan_automation, track->edit_rate, output.name + " pan", .5);
 		output.mute = track->mute; output.solo = track->solo;

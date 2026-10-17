@@ -1789,6 +1789,14 @@ parse_OperationGroup (AAF_Iface* aafi, aafObject* OpGroup, td* __ptd)
 
 		aafObject* InputSegment  = NULL;
 		aafObject* InputSegments = aaf_get_propertyValue (OpGroup, PID_OperationGroup_InputSegments, &AAFTypeID_SegmentStrongReferenceVector);
+		if (!InputSegments || !InputSegments->Header || !InputSegments->Header->_entryCount) {
+			TRACE_OBJ_ERROR (aafi, OpGroup, &__td, "AudioChannelCombiner has no input segments");
+			return -1;
+		}
+		if (!aafi->ctx.current_track) {
+			TRACE_OBJ_ERROR (aafi, OpGroup, &__td, "AudioChannelCombiner has no audio track");
+			return -1;
+		}
 
 		aafi->ctx.current_clip_is_combined            = 1;
 		aafi->ctx.current_combined_clip_total_channel = InputSegments->Header->_entryCount;
@@ -1821,6 +1829,8 @@ parse_OperationGroup (AAF_Iface* aafi, aafObject* OpGroup, td* __ptd)
 
 		if (aafi->ctx.current_combined_clip_total_channel == 2) {
 			track_format = AAFI_TRACK_FORMAT_STEREO;
+		} else if (aafi->ctx.current_combined_clip_total_channel == 4) {
+			track_format = AAFI_TRACK_FORMAT_QUAD;
 		} else if (aafi->ctx.current_combined_clip_total_channel == 6) {
 			track_format = AAFI_TRACK_FORMAT_5_1;
 		} else if (aafi->ctx.current_combined_clip_total_channel == 8) {

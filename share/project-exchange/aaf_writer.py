@@ -343,6 +343,7 @@ def write_aaf(root, destination):
         dissolve = operation(output, "0c3bea41-fc05-11d2-8a29-0050040ef7d2", "MonoAudioDissolve", 2, level)
         mono_gain = operation(output, "9d2ea894-0968-11d3-8a38-0050040ef7d2", "MonoAudioGain", 1, amplitude)
         mono_pan = operation(output, "9d2ea893-0968-11d3-8a38-0050040ef7d2", "MonoAudioPan", 1, pan)
+        combiner = operation(output, "6b46dd7a-132d-4856-ab21-8b751d8462ec", "AudioChannelCombiner", -1)
         output.dictionary.register_def(output.create.TaggedValueDef(
             "21a8ae63-2486-43b5-a6f2-54132481bcf3", "Ardour.StereoGainBalance",
             "Paired mono channel levels encode Ardour stereo gain and balance automation"))
@@ -356,7 +357,7 @@ def write_aaf(root, destination):
             with WaveReader(str(path)) as wave:
                 channels = integer(source, "channels")
                 frames = integer(source, "frames")
-                require(channels in (1, 2) and wave.getnchannels() == channels
+                require(channels in (1, 2, 4, 6, 8) and wave.getnchannels() == channels
                         and wave.getframerate() == rate and wave.getnframes() == frames
                         and wave.getsampwidth() == 3, "Prepared 24-bit audio does not match manifest")
             master = output.create.MasterMob(source.attrib["id"])
@@ -364,18 +365,18 @@ def write_aaf(root, destination):
             slot = master.import_audio_essence(str(path), edit_rate=rate)
             slot["PhysicalTrackNumber"].value = 1
             slots = [slot]
-            if channels == 2:
-                right = master.create_timeline_slot(rate)
-                right.segment = slot.segment.copy()
-                right["PhysicalTrackNumber"].value = 2
-                slots.append(right)
+            for channel in range(2, channels + 1):
+                extra = master.create_timeline_slot(rate)
+                extra.segment = slot.segment.copy()
+                extra["PhysicalTrackNumber"].value = channel
+                slots.append(extra)
             require(source.attrib["id"] not in media, "Duplicate audio ID")
             media[source.attrib["id"]] = (master, slots, frames)
         duration = math.ceil(number(root, "duration") * rate)
         for track in root.findall("AudioTrack"):
             channels = integer(track, "channels")
-            require(channels in (1, 2), "Unsupported audio track channels")
-            composition_slots = [composition.create_sound_slot(rate) for _ in range(channels)]
+            require(channels in (1, 2, 4, 6, 8), "Unsupported audio track channels")
+            composition_slots = [composition.create_sound_slot(rate) for _ in range(channels if channels <= 2 else 1)]
             sequences = [output.create.Sequence("sound") for _ in composition_slots]
             for channel, slot in enumerate(composition_slots, 1):
                 slot.name = track.attrib["name"]
@@ -388,6 +389,7 @@ def write_aaf(root, destination):
                 master, slots, frames = media[clip.attrib["media"]]
                 require(len(slots) == channels and offset + length <= frames, "Invalid audio clip source range")
                 if position < end:
+                    require(channels <= 2, "Overlapping multichannel AAF clips need explicit crossfade conversion")
                     require(position > previous_position and position + length > end and position >= preceding_end,
                             "Overlapping audio requires pairwise, non-nested overlaps")
                     overlap = end - position
@@ -416,6 +418,10 @@ def write_aaf(root, destination):
                 if clip_points:
                     require(clip_points[-1][0] <= length, "Clip automation extends outside clip")
                     clip_points = [(at, value * clip_gain, linear) for at, value, linear in clip_points]
+                if channels > 2:
+                    group = output.create.OperationGroup(combiner, length, media_kind="sound")
+                    group.segments.extend(references)
+                    references = [group]
                 for sequence, segment in zip(sequences, references):
                     if clip_points:
                         segment = apply_automation(output, segment, mono_gain, amplitude, clip_points)
@@ -437,6 +443,7 @@ def write_aaf(root, destination):
             require(gain >= 0, "Invalid audio gain")
             balance = number(track, "pan")
             require(0 <= balance <= 1, "Invalid audio pan")
+            require(channels <= 2 or (balance == .5 and not pan_points), "Multichannel AAF pan is not supported")
             combined = None
             if channels == 2 and pan_points and (gain_points or gain == 0):
                 combined = moving_stereo_levels(gain_points or [(0, 0, True)], pan_points, end)

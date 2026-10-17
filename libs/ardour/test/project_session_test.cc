@@ -2785,11 +2785,6 @@ void ProjectSessionTest::multichannel_audio_roundtrip ()
 		CPPUNIT_ASSERT (audio);
 		CPPUNIT_ASSERT_EQUAL (uint32_t (4), audio->n_channels ());
 	}
-	CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_logic (*fixture.session, fixture.path ("QuadAAF"), fixture.report), PX::ExchangeError);
-	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& item) {
-		return item.disposition == PX::Disposition::Unsupported && item.detail.find ("AAF/MIDI preserves mono and stereo media") != std::string::npos;
-	}));
-	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("QuadAAF"), Glib::FILE_TEST_EXISTS));
 	PX::SessionExchange::ExportOptions rendered;
 	rendered.render_mix = true;
 	CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("quad-rendered.dawproject"), fixture.report, rendered), PX::ExchangeError);
@@ -2818,6 +2813,36 @@ void ProjectSessionTest::multichannel_audio_roundtrip ()
 	CPPUNIT_ASSERT_EQUAL (samplecnt_t (rate * 2), source.length ());
 	std::vector<Sample> actual (pcm.size ());
 	CPPUNIT_ASSERT_EQUAL (samplecnt_t (actual.size ()), source.read (actual.data (), actual.size ()));
+	for (size_t i = 0; i < pcm.size (); ++i) { CPPUNIT_ASSERT_EQUAL (pcm[i], actual[i]); }
+	PX::SessionExchange::export_logic (*fixture.session, fixture.path ("QuadAAF"), fixture.report);
+	PX::LogicProject logic (fixture.path ("QuadAAF/Project.aaf"), fixture.path ("QuadAAF/Project.mid"));
+	CPPUNIT_ASSERT_EQUAL (4u, track_named (logic.project (), "Quad").channels);
+	CPPUNIT_ASSERT_EQUAL (size_t (2), track_named (logic.project (), "Quad").clips.size ());
+	CPPUNIT_ASSERT_EQUAL (4u, logic.project ().media.front ().channels);
+	track.reset ();
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_logic (*AudioEngine::instance (), fixture.path ("QuadAAF/Project.aaf"), fixture.path ("QuadAAF/Project.mid"), fixture.path ("QuadAAFReturn"), "QuadAAFReturn", fixture.report);
+	CPPUNIT_ASSERT (fixture.session);
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("QuadAAFReturn"), "QuadAAFReturn", nullptr, "", true));
+	AudioEngine::instance ()->set_session (fixture.session.get ());
+	track = std::dynamic_pointer_cast<ARDOUR::Track> (fixture.session->route_by_name ("Quad"));
+	CPPUNIT_ASSERT (track);
+	CPPUNIT_ASSERT_EQUAL (4u, track->input ()->n_ports ().n_audio ());
+	for (auto const& region : *track->playlist ()->region_list ()) {
+		auto audio = std::dynamic_pointer_cast<AudioRegion> (region);
+		CPPUNIT_ASSERT (audio);
+		CPPUNIT_ASSERT_EQUAL (uint32_t (4), audio->n_channels ());
+	}
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("quad-aaf-return.dawproject"));
+	auto aaf_return = PX::DawProject::read (fixture.path ("quad-aaf-return.dawproject"));
+	CPPUNIT_ASSERT_EQUAL (4u, track_named (aaf_return, "Quad").channels);
+	CPPUNIT_ASSERT_EQUAL (4u, aaf_return.media.front ().channels);
+	PX::ProjectArchive (fixture.path ("quad-aaf-return.dawproject")).copy_file (aaf_return.media.front ().path, fixture.path ("quad-aaf-verify.wav"));
+	SndFileImportableSource aaf_source (fixture.path ("quad-aaf-verify.wav"));
+	CPPUNIT_ASSERT_EQUAL (uint32_t (4), aaf_source.channels ());
+	CPPUNIT_ASSERT_EQUAL (samplecnt_t (rate * 2), aaf_source.length ());
+	CPPUNIT_ASSERT_EQUAL (samplecnt_t (actual.size ()), aaf_source.read (actual.data (), actual.size ()));
 	for (size_t i = 0; i < pcm.size (); ++i) { CPPUNIT_ASSERT_EQUAL (pcm[i], actual[i]); }
 }
 

@@ -14,6 +14,8 @@ import tempfile
 import unittest
 import wave
 import importlib.util
+import sys
+import xml.etree.ElementTree as ET
 
 import aaf2
 
@@ -86,6 +88,68 @@ def make_fixture(directory):
 
 class AafWriterTest(unittest.TestCase):
     probe = None
+
+    def test_multichannel_writer_embeds_ordered_audio(self):
+        writer = Path(__file__).resolve().parents[3] / "share/project-exchange/aaf_writer.py"
+        for channels in (4, 6, 8):
+            with self.subTest(channels=channels), tempfile.TemporaryDirectory(prefix="ardour-aaf-multichannel-") as work:
+                directory = Path(work)
+                source = directory / "source.wav"
+                samples = b"".join(struct.pack("<i", ((frame * (channel + 3) * 29) % 40001 - 20000) << 8)[:3]
+                                   for frame in range(24000) for channel in range(channels))
+                with wave.open(str(source), "wb") as output:
+                    output.setparams((channels, 3, 48000, 24000, "NONE", "not compressed"))
+                    output.writeframes(samples)
+                root = ET.Element("LogicExchange", version="2", name="Multichannel", rate="48000",
+                                  tempo="120", numerator="4", denominator="4", duration="0.5")
+                ET.SubElement(root, "Media", id="source", path=str(source), channels=str(channels), frames="24000")
+                track = ET.SubElement(root, "AudioTrack", name="Multichannel", channels=str(channels), gain="0.8", pan="0.5")
+                ET.SubElement(track, "Clip", name="Clip", media="source", time="2000", offset="3000",
+                              length="12000", gain="0.75", enabled="true")
+                manifest = directory / "manifest.xml"
+                ET.ElementTree(root).write(manifest, encoding="utf-8", xml_declaration=True)
+                target = directory / "output"
+                target.mkdir()
+                result = subprocess.run([sys.executable, str(writer), str(manifest), str(target)],
+                                        capture_output=True, text=True, encoding="utf-8", timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                source.unlink()
+                extracted = directory / "extracted"
+                extracted.mkdir()
+                result = subprocess.run([self.probe, str(target / "Project.aaf"), str(extracted)],
+                                        capture_output=True, text=True, encoding="utf-8", timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                parsed = json.loads(result.stdout)
+                self.assertEqual(parsed["tracks"], [{"name": "Multichannel", "gain": 0.8,
+                    "channels": channels, "rate": [48000, 1], "clips": [
+                    {"position": 2000, "length": 12000, "offset": 3000, "channels": channels, "gain": 0.75}]}])
+                self.assertEqual(len(parsed["media"]), 1)
+                with wave.open(parsed["media"][0]["path"], "rb") as embedded:
+                    self.assertEqual((embedded.getnchannels(), embedded.getnframes(), embedded.getsampwidth()),
+                                     (channels, 24000, 3))
+                    self.assertEqual(embedded.readframes(24000), samples)
+
+    def test_empty_channel_combiner_is_rejected_without_crash(self):
+        with tempfile.TemporaryDirectory(prefix="ardour-aaf-empty-combiner-") as work:
+            directory = Path(work)
+            target = directory / "empty.aaf"
+            with aaf2.open(str(target), "w") as output:
+                combiner = output.create.OperationDef(
+                    "6b46dd7a-132d-4856-ab21-8b751d8462ec", "AudioChannelCombiner")
+                combiner.media_kind = "sound"
+                combiner.number_inputs = -1
+                combiner["IsTimeWarp"].value = False
+                output.dictionary.register_def(combiner)
+                composition = output.create.CompositionMob("Empty combiner")
+                composition.usage = "Usage_TopLevel"
+                output.content.mobs.append(composition)
+                slot = composition.create_sound_slot(edit_rate=48000)
+                slot.segment.components.append(output.create.OperationGroup(combiner, 12000, media_kind="sound"))
+                slot.segment.length = 12000
+            result = subprocess.run([self.probe, str(target), str(directory)],
+                                    capture_output=True, text=True, encoding="utf-8", timeout=30)
+            self.assertEqual(result.returncode, 4, result.stderr)
+            self.assertIn("AudioChannelCombiner has no input segments", result.stderr)
 
     def test_dissolve_default_and_explicit_points(self):
         for mode in ("default", "custom", "hold", "constant"):

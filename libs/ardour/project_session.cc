@@ -1772,7 +1772,9 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 	AudioAssets assets;
 	Project project = options.rendered () ? collect_rendered (session, options) : collect (session, assets, cancel);
 	for (auto const& media : project.media) {
-		if (media.channels > 2) { unsupported (project, media.id, "AAF/MIDI preserves mono and stereo media; render multichannel audio to a stereo mix or stems"); }
+		if (media.channels != 1 && media.channels != 2 && media.channels != 4 && media.channels != 6 && media.channels != 8) {
+			unsupported (project, media.id, "AAF/MIDI supports mono, stereo, quad, 5.1, and 7.1 audio media");
+		}
 	}
 	std::string master;
 	for (auto const& track : project.tracks) { if (track.master) { master = track.id; } }
@@ -1787,8 +1789,11 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 		if (track.kind == TrackKind::Bus || track.kind == TrackKind::Folder || !track.parent.empty () || track.destination != master) {
 			unsupported (project, track.name, "AAF/MIDI export currently requires tracks connected directly to the master, without folders or buses");
 		}
-		if (track.kind == TrackKind::Audio && track.channels > 2) {
-			unsupported (project, track.name, "AAF/MIDI supports mono and stereo tracks; render multichannel audio to a stereo mix or stems");
+		if (track.kind == TrackKind::Audio && track.channels > 2 && track.channels != 4 && track.channels != 6 && track.channels != 8) {
+			unsupported (project, track.name, "AAF/MIDI supports mono, stereo, quad, 5.1, and 7.1 audio tracks");
+		}
+		if (track.kind == TrackKind::Audio && track.channels > 2 && (track.pan != .5 || !track.pan_automation.points.empty ())) {
+			unsupported (project, track.name, "Multichannel AAF pan has no editable exchange mapping; reset pan or render audio");
 		}
 		if (!track.sends.empty ()) { unsupported (project, track.name, "AAF/MIDI export cannot preserve bus sends; render or remove them first"); }
 		if (!track.plugins.empty ()) { unsupported (project, track.name, "AAF/MIDI cannot preserve VST3 plugin state; render processing first"); }
