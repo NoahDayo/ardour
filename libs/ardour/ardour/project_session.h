@@ -27,8 +27,10 @@ public:
 	 * accepts a partial import. The returned report still lists every omission. */
 	static std::unique_ptr<Session> import_dawproject (AudioEngine&, const std::string& archive,
 	                                                const std::string& destination, const std::string& snapshot,
-	                                                std::vector<Diagnostic>&, CancelCheck = CancelCheck (),
-	                                                bool allow_unsupported = false);
+	                                                std::vector<Diagnostic>&, CancelCheck = CancelCheck ());
+	static std::unique_ptr<Session> import_dawproject (AudioEngine&, const std::string& archive,
+	                                                const std::string& destination, const std::string& snapshot,
+	                                                std::vector<Diagnostic>&, CancelCheck, bool allow_unsupported);
 	/* The same partial-import rules apply to native Studio One songs. */
 	static std::unique_ptr<Session> import_studio_one (AudioEngine&, const std::string& song,
 	                                                const std::string& destination, const std::string& snapshot,
