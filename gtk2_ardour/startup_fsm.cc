@@ -176,6 +176,7 @@ void
 StartupFSM::reset()
 {
 	session_dawproject.clear ();
+	_session_companion_midi.clear ();
 	_session_dawproject_allow_unsupported = false;
 	show_session_dialog (new_session_required);
 }
@@ -582,6 +583,7 @@ bool
 StartupFSM::get_session_parameters_from_path (string const & path_, string const & template_name, bool new_session_required)
 {
 	session_dawproject.clear ();
+	_session_companion_midi.clear ();
 	if (path_.empty()) {
 		/* use GUI to ask the user */
 		return false;
@@ -737,6 +739,7 @@ StartupFSM::check_session_parameters (bool must_be_new)
 	bool requested_new = false;
 	session_loaded     = false;
 	session_dawproject.clear ();
+	_session_companion_midi.clear ();
 
 	session_name        = session_dialog->session_name (requested_new);
 	session_path        = session_dialog->session_folder ();
@@ -751,6 +754,7 @@ StartupFSM::check_session_parameters (bool must_be_new)
 		ProjectExchangeUI::ImportRequest request;
 		if (!ProjectExchangeUI::prepare_import (session_dialog, session_name, request)) { return 1; }
 		session_dawproject = request.archive;
+		_session_companion_midi = request.midi;
 		_session_dawproject_allow_unsupported = request.allow_unsupported;
 		session_path = request.destination;
 		session_name = request.snapshot;

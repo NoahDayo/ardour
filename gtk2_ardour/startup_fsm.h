@@ -81,6 +81,7 @@ class StartupFSM : public sigc::trackable
 	bool                 session_name_edited;
 	bool                 session_loaded;
 	bool session_dawproject_allow_unsupported () const { return _session_dawproject_allow_unsupported; }
+	std::string const& session_companion_midi () const { return _session_companion_midi; }
 
 	ARDOUR::BusProfile bus_profile;
 
@@ -140,6 +141,7 @@ class StartupFSM : public sigc::trackable
 	sigc::signal1<void,Result> _signal_response;
 	/* Keep the prepared import choice across the audio-engine setup step. */
 	bool _session_dawproject_allow_unsupported;
+	std::string _session_companion_midi;
 
 	void dialog_hidden (Gtk::Window*);
 };

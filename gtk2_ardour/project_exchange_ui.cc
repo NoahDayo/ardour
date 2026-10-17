@@ -215,9 +215,7 @@ private:
 
 bool ProjectExchangeUI::is_importable_project (std::string const& path)
 {
-	/* Keep Open's existing AAF workflow available while advanced AAF features
-	 * are being added to the coordinated Session > Import Project workflow. */
-	return native_song (path) || (path.size () >= 11 && !g_ascii_strcasecmp (path.c_str () + path.size () - 11, ".dawproject"));
+	return aaf_project (path) || native_song (path) || (path.size () >= 11 && !g_ascii_strcasecmp (path.c_str () + path.size () - 11, ".dawproject"));
 }
 
 bool ProjectExchangeUI::prepare_import (Gtk::Window* parent, std::string const& archive, ImportRequest& request)

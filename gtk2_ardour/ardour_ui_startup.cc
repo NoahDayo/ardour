@@ -650,6 +650,7 @@ ARDOUR_UI::load_session_from_startup_fsm ()
 	if (!startup_fsm->session_dawproject.empty ()) {
 		ProjectExchangeUI::ImportRequest request;
 		request.archive = startup_fsm->session_dawproject;
+		request.midi = startup_fsm->session_companion_midi ();
 		request.destination = startup_fsm->session_path;
 		request.snapshot = startup_fsm->session_name;
 		request.allow_unsupported = startup_fsm->session_dawproject_allow_unsupported ();
