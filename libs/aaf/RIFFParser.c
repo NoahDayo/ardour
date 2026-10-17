@@ -236,19 +236,34 @@ laaf_riff_parseAudioFile (struct RIFFAudioFile* RIFFAudioFile, enum RIFF_PARSER_
 			           chunk.ckid[1] == 'S' &&
 			           chunk.ckid[2] == 'N' &&
 			           chunk.ckid[3] == 'D') {
+				struct aiffSSNDChunk aiffSSNDChunk;
+				bytesRead = readerCallback ((unsigned char*)&aiffSSNDChunk, pos, sizeof (aiffSSNDChunk), user1, user2, user3);
+				if (bytesRead == RIFF_READER_ERROR || bytesRead < sizeof (aiffSSNDChunk)) {
+					error ("Could not read AIFF SSND chunk @ %" PRIu64, pos);
+					return -1;
+				}
+
+				const uint32_t ssndHeaderSize = sizeof (struct aiffSSNDChunk) - sizeof (struct riffChunk);
+				const uint32_t offset = BE2LE32 (aiffSSNDChunk.offset);
+				if (chunk.cksz < ssndHeaderSize || offset > chunk.cksz - ssndHeaderSize ||
+				    RIFFAudioFile->channels == 0 || RIFFAudioFile->sampleSize == 0 || RIFFAudioFile->sampleSize % 8 != 0) {
+					error ("Invalid AIFF SSND chunk or audio format");
+					return -1;
+				}
+
 				/*
 				 * Samplecount should be already set with numSampleFrames in COMM chunk.
 				 * However in AAF (AIFCDescriptor::Summary), numSampleFrames is often null,
 				 * so we must extract samplecount out of SSND chunk, like we do with wav DATA chunk.
 				 */
-				uint64_t sampleCount = chunk.cksz / RIFFAudioFile->channels / (RIFFAudioFile->sampleSize / 8);
+				uint64_t sampleCount = (chunk.cksz - ssndHeaderSize - offset) / RIFFAudioFile->channels / (RIFFAudioFile->sampleSize / 8);
 
 				if (RIFFAudioFile->sampleCount > 0 && RIFFAudioFile->sampleCount != sampleCount) {
 					debug ("Sample count retrieved from COMM chunk (%" PRIu64 ") does not match SSND chunk (%" PRIu64 ")", RIFFAudioFile->sampleCount, sampleCount);
 				}
 
 				RIFFAudioFile->sampleCount            = sampleCount;
-				RIFFAudioFile->pcm_audio_start_offset = pos + sizeof (struct aiffSSNDChunk);
+				RIFFAudioFile->pcm_audio_start_offset = pos + sizeof (struct aiffSSNDChunk) + offset;
 
 				if (flags & RIFF_PARSE_AAF_SUMMARY) {
 					return 0;
