@@ -1021,9 +1021,10 @@ Project collect_rendered (Session& session, const SessionExchange::ExportOptions
 		mix.clips.push_back (clip); project.media.push_back (media); project.tracks.push_back (mix);
 	}
 	std::string render_detail = options.render_stems ?
-		"Each stereo track or bus feeding the master becomes a separate audio track. Upstream tracks and shared processing are combined inside their bus stem. Effects, instruments, automation, mute and solo are baked into the audio. Master processing must be neutral; source track structure and processors are no longer editable." :
-		"All audible tracks, MIDI instruments, effects, automation and bus routing become one stereo audio clip. Individual source tracks and processors are no longer editable; current mute and solo states are included.";
-	render_detail += options.render_midi_reference ? " MIDI notes are retained on muted reference tracks." : " MIDI notes are no longer editable.";
+		"Each stereo track or bus feeding the master becomes a separate audio track. Upstream tracks and shared processing are combined inside their bus stem. Effects, instruments, automation, mute and solo are baked into the audio. Master processing must be neutral; original routing and processors are no longer editable." :
+		"All audible tracks, MIDI instruments, effects, automation and bus routing become one stereo audio clip. Original routing and processors are no longer editable; current mute and solo states are included.";
+	render_detail += options.render_editable_references ? " Source audio and MIDI clips are retained on muted reference tracks." :
+		" Source clips, including MIDI notes, are no longer editable.";
 	project.report.push_back ({Disposition::Rendered, options.render_stems ? "Separate stems" : "Current master mix", render_detail});
 
 	std::ostringstream range;
@@ -1383,30 +1384,54 @@ Project collect (Session& session, AudioAssets& assets, const CancelCheck& cance
 	return project;
 }
 
-void append_rendered_midi_references (Project& rendered, const Project& editable)
+void append_rendered_editable_references (Project& rendered, const Project& editable)
 {
+	std::set<std::string> referenced_media;
+	for (auto const& item : editable.report) {
+		if (item.disposition != Disposition::Unsupported) { continue; }
+		rendered.report.push_back ({Disposition::Rendered, item.object,
+			"Not retained as editable data: " + item.detail + ". Rendered audio captures the session's audible output within the export range"});
+	}
 	for (auto const& original : editable.tracks) {
-		if (original.kind != TrackKind::MIDI) { continue; }
+		if (original.kind != TrackKind::MIDI && original.kind != TrackKind::Audio) { continue; }
+		if (original.channels < 1 || original.channels > 2) {
+			throw ExchangeError (original.name + ": native reference tracks require mono or stereo audio");
+		}
 		Track reference;
-		reference.id = "midi-reference-" + original.id;
-		reference.name = original.name + " (MIDI reference)";
+		reference.id = "reference-" + original.id;
+		reference.name = original.name + (original.kind == TrackKind::MIDI ? " (MIDI reference)" : " (Audio reference)");
 		reference.color = original.color;
-		reference.kind = TrackKind::MIDI;
+		reference.kind = original.kind;
+		reference.channels = original.channels;
 		reference.destination = "master";
 		reference.mute = true;
 		for (auto clip : original.clips) {
-			if (clip.kind != ClipKind::MIDI) { continue; }
-			if (!clip.midi_controls.empty ()) {
+			if (original.kind == TrackKind::MIDI && !clip.midi_controls.empty ()) {
 				rendered.report.push_back ({Disposition::Transformed, clip.name,
 					"MIDI controller events omitted from the native reference track; their audible result is in the rendered audio"});
 				clip.midi_controls.clear ();
 			}
+			if (original.kind == TrackKind::Audio) {
+				if (!clip.envelope.points.empty ()) {
+					rendered.report.push_back ({Disposition::Transformed, clip.name,
+						"Audio clip envelope omitted from the muted reference; its audible result is in the rendered audio"});
+					clip.envelope.points.clear ();
+				}
+				referenced_media.insert (clip.media);
+			}
 			reference.clips.push_back (std::move (clip));
 		}
 		rendered.report.push_back ({Disposition::Rendered, original.name,
-			"Editable MIDI notes retained on a muted reference track. Instrument sound and processing are in the rendered audio; assign an instrument and unmute only when replacing that audio"});
+			original.kind == TrackKind::MIDI ?
+			"Editable MIDI notes retained on a muted reference track. Instrument sound and processing are in the rendered audio; assign an instrument and unmute only when replacing that audio" :
+			"Editable audio clips retained on a muted reference track. Mixer processing and routing are in the rendered audio; unmute only when replacing that audio"});
 		rendered.tracks.push_back (std::move (reference));
 	}
+	for (auto const& media : editable.media) {
+		if (referenced_media.count (media.id)) { rendered.media.push_back (media); }
+	}
+	rendered.report.push_back ({Disposition::Transformed, "Source routing",
+		"Folders, buses, sends and processors are baked into the rendered audio; editable reference tracks connect directly to the master"});
 	validate_project (rendered);
 }
 
@@ -1758,7 +1783,7 @@ void
 SessionExchange::export_dawproject (Session& session, const std::string& destination, std::vector<Diagnostic>& report, const ExportOptions& options, CancelCheck cancel)
 {
 	report.clear ();
-	if (options.render_midi_reference) { throw ExchangeError ("MIDI reference tracks are supported only by rendered native Studio One song export"); }
+	if (options.render_editable_references) { throw ExchangeError ("Editable reference tracks are supported only by rendered native Studio One song export"); }
 	if (session.transport_rolling () || session.actively_recording ()) { throw ExchangeError ("Stop playback and recording before exporting a project"); }
 	if (!Glib::path_is_absolute (destination)) { throw ExchangeError ("Export destination must be absolute"); }
 	FileObject target = file_object (destination);
@@ -1793,7 +1818,7 @@ void
 SessionExchange::export_logic (Session& session, const std::string& destination, std::vector<Diagnostic>& report, const ExportOptions& options, CancelCheck cancel)
 {
 	report.clear ();
-	if (options.render_midi_reference) { throw ExchangeError ("MIDI reference tracks are supported only by rendered native Studio One song export"); }
+	if (options.render_editable_references) { throw ExchangeError ("Editable reference tracks are supported only by rendered native Studio One song export"); }
 	if (session.transport_rolling () || session.actively_recording ()) { throw ExchangeError ("Stop playback and recording before exporting a project"); }
 	if (!Glib::path_is_absolute (destination)) { throw ExchangeError ("Export destination must be absolute"); }
 	FileObject target = file_object (destination);
@@ -1988,17 +2013,17 @@ SessionExchange::export_studio_one (Session& session, const std::string& destina
 {
 	report.clear ();
 	if (options.studio_one_format_version < 7 || options.studio_one_format_version > 9) { throw ExchangeError ("Native song export format must be 7, 8 or 9"); }
-	if (options.render_midi_reference && !options.rendered ()) { throw ExchangeError ("MIDI reference tracks require a rendered native song export"); }
+	if (options.render_editable_references && !options.rendered ()) { throw ExchangeError ("Editable reference tracks require a rendered native song export"); }
 	if (session.transport_rolling () || session.actively_recording ()) { throw ExchangeError ("Stop playback and recording before exporting a project"); }
 	if (!Glib::path_is_absolute (destination)) { throw ExchangeError ("Export destination must be absolute"); }
 	FileObject target = file_object (destination);
 	if (g_file_query_exists (target.get (), NULL)) { throw ExchangeError ("Export destination already exists"); }
 	if (options.rendered ()) { check_rendered_stereo_layout (session, report); }
-	cancelled (cancel); AudioAssets assets; StudioOneSongData song;
-	song.project = options.rendered () ? collect_rendered (session, options) : collect (session, assets, cancel);
-	if (options.render_midi_reference) {
-		AudioAssets reference_assets;
-		append_rendered_midi_references (song.project, collect (session, reference_assets, cancel));
+	cancelled (cancel); AudioAssets assets; StudioOneSongData song; Project render_project;
+	if (options.rendered ()) { render_project = collect_rendered (session, options); song.project = render_project; }
+	else { song.project = collect (session, assets, cancel); }
+	if (options.render_editable_references) {
+		append_rendered_editable_references (song.project, collect (session, assets, cancel));
 	}
 	song.title = session.name (); song.sample_rate = session.sample_rate (); song.format_version = options.studio_one_format_version;
 	song.has_range = true;
@@ -2011,11 +2036,12 @@ SessionExchange::export_studio_one (Session& session, const std::string& destina
 	std::string output = Glib::build_filename (stage.path, "session"), media_directory = Glib::build_filename (output, "Media");
 	if (g_mkdir (output.c_str (), 0700) || g_mkdir (media_directory.c_str (), 0700)) { throw ExchangeError ("Cannot create native song staging folder"); }
 	std::map<std::string, std::string> rendered;
-	if (options.rendered ()) { rendered = render_audio (session, stage, song.project, options, cancel); }
+	if (options.rendered ()) { rendered = render_audio (session, stage, render_project, options, cancel); }
 	for (size_t i = 0; i < song.project.media.size (); ++i) {
 		cancelled (cancel); auto const& media = song.project.media[i];
-		std::string path = Glib::build_filename (media_directory, options.render_mix ? "mix.wav" : "source-" + std::to_string (i + 1) + ".wav");
-		if (options.rendered ()) {
+		bool is_rendered = rendered.count (media.id);
+		std::string path = Glib::build_filename (media_directory, options.render_mix && is_rendered ? "mix.wav" : "source-" + std::to_string (i + 1) + ".wav");
+		if (is_rendered) {
 			if (g_rename (rendered.at (media.id).c_str (), path.c_str ())) { throw ExchangeError ("Cannot collect rendered native song audio"); }
 		} else { write_audio (assets.at (media.id), path, cancel); }
 		song.audio_files[media.id] = path;

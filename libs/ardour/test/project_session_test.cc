@@ -994,7 +994,7 @@ void ProjectSessionTest::native_song_render_reference ()
 {
 	Fixture fixture; make_render_fixture (fixture); const unsigned rate = fixture.session->sample_rate ();
 	const samplecnt_t frames = fixture.session->current_end_sample () + 1024;
-	PX::SessionExchange::ExportOptions options; options.render_midi_reference = true;
+	PX::SessionExchange::ExportOptions options; options.render_editable_references = true;
 	CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("NoRender"), fixture.report, options), PX::ExchangeError);
 	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("NoRender"), Glib::FILE_TEST_EXISTS));
 	options.render_mix = true; options.render_tail_seconds = 1024.0 / rate;
@@ -1004,15 +1004,35 @@ void ProjectSessionTest::native_song_render_reference ()
 	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& d) {
 		return d.disposition == PX::Disposition::Rendered && d.detail.find ("muted reference track") != std::string::npos;
 	}));
+	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& d) {
+		return d.disposition == PX::Disposition::Rendered && d.detail.find ("Not retained as editable data") != std::string::npos;
+	}));
 	auto song = PX::StudioOneSong::read (fixture.path ("WithNotes/Project.song"));
-	CPPUNIT_ASSERT_EQUAL (size_t (1), song.project.media.size ());
-	CPPUNIT_ASSERT_EQUAL (size_t (3), song.project.tracks.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (2), song.project.media.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (4), song.project.tracks.size ());
+	auto const& audio_reference = track_named (song.project, "Stereo (Audio reference)");
+	CPPUNIT_ASSERT_EQUAL (PX::TrackKind::Audio, audio_reference.kind); CPPUNIT_ASSERT (audio_reference.mute);
+	CPPUNIT_ASSERT (audio_reference.plugins.empty ()); CPPUNIT_ASSERT_EQUAL (size_t (1), audio_reference.clips.size ());
+	auto raw_pcm = read_rendered_pcm (song.audio_files.at (audio_reference.clips.front ().media), 2 * rate, rate);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.125, raw_pcm.front (), 1e-6);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.25, raw_pcm.back (), 1e-6);
 	auto const& notes = track_named (song.project, "MIDI gate (MIDI reference)");
 	CPPUNIT_ASSERT_EQUAL (PX::TrackKind::MIDI, notes.kind); CPPUNIT_ASSERT (notes.mute);
 	CPPUNIT_ASSERT (notes.plugins.empty ()); CPPUNIT_ASSERT_EQUAL (size_t (1), notes.clips.size ());
 	CPPUNIT_ASSERT_EQUAL (size_t (1), notes.clips.front ().notes.size ());
 	CPPUNIT_ASSERT (notes.clips.front ().notes.front ().duration > 0);
 	assert_graph_pcm (read_rendered_pcm (song.audio_files.at (song.project.media.front ().id), frames, rate), rate, 1e-6);
+	fixture.session->master_out ()->gain_control ()->set_value (1, PBD::Controllable::NoGroup);
+	options.render_mix = false; options.render_stems = true;
+	RenderSourceState stem_original (fixture);
+	PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("WithStems"), fixture.report, options);
+	stem_original.check (fixture);
+	auto stems = PX::StudioOneSong::read (fixture.path ("WithStems/Project.song"));
+	CPPUNIT_ASSERT_EQUAL (size_t (4), stems.project.media.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (6), stems.project.tracks.size ());
+	auto const& stem_reference = track_named (stems.project, "Stereo (Audio reference)");
+	CPPUNIT_ASSERT (stem_reference.mute);
+	CPPUNIT_ASSERT (raw_pcm == read_rendered_pcm (stems.audio_files.at (stem_reference.clips.front ().media), 2 * rate, rate));
 	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
 	fixture.session = PX::SessionExchange::import_studio_one (*AudioEngine::instance (), fixture.path ("WithNotes/Project.song"), fixture.path ("NotesReturn"), "NotesReturn", fixture.report);
 	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
@@ -1024,7 +1044,16 @@ void ProjectSessionTest::native_song_render_reference ()
 	CPPUNIT_ASSERT (editable.mute); CPPUNIT_ASSERT_EQUAL (size_t (1), editable.clips.front ().notes.size ());
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (notes.clips.front ().notes.front ().duration, editable.clips.front ().notes.front ().duration, 1e-5);
 	CPPUNIT_ASSERT_EQUAL (notes.clips.front ().notes.front ().key, editable.clips.front ().notes.front ().key);
-	std::cout << "Rendered native song retained muted editable MIDI notes and audible mix through import and reopen" << std::endl;
+	auto const& returned_audio = track_named (returned, "Stereo (Audio reference)");
+	CPPUNIT_ASSERT (returned_audio.mute); CPPUNIT_ASSERT_EQUAL (size_t (1), returned_audio.clips.size ());
+	auto media = std::find_if (returned.media.begin (), returned.media.end (), [&] (const PX::Media& item) {
+		return item.id == returned_audio.clips.front ().media;
+	});
+	CPPUNIT_ASSERT (media != returned.media.end ());
+	std::string copied = fixture.path ("audio-reference-return.wav");
+	PX::ProjectArchive (fixture.path ("notes-return.dawproject")).copy_file (media->path, copied);
+	CPPUNIT_ASSERT (raw_pcm == read_rendered_pcm (copied, 2 * rate, rate));
+	std::cout << "Rendered native song retained muted editable audio and MIDI clips through import and reopen" << std::endl;
 }
 
 void ProjectSessionTest::render_stems_roundtrip ()

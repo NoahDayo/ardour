@@ -384,8 +384,8 @@ static void export_project (Gtk::Window* parent, ExportKind kind)
 	render_mode.append_text (_("Render current mix as one stereo audio track"));
 	render_mode.append_text (_("Render tracks and buses feeding the master as separate stems"));
 	render_mode.set_active (0);
-	Gtk::CheckButton midi_reference (_("Keep muted editable MIDI notes with rendered audio"));
-	midi_reference.set_sensitive (false);
+	Gtk::CheckButton editable_references (_("Keep muted editable audio and MIDI tracks with rendered audio"));
+	editable_references.set_sensitive (false);
 	Gtk::Label render_hint (_("Rendered audio includes instruments, effects, automation, mute and solo. Separate stems combine upstream tracks within each bus and require a neutral master without effects or active automation. Rendering starts at timeline zero and includes all content through session end plus the extra time below."));
 	render_hint.set_line_wrap (true);
 	render_hint.set_alignment (0, 0.5);
@@ -402,11 +402,11 @@ static void export_project (Gtk::Window* parent, ExportKind kind)
 	render_mode.signal_changed ().connect ([&] {
 		const bool rendered = render_mode.get_active_row_number () != 0;
 		tail_row.set_sensitive (rendered);
-		midi_reference.set_sensitive (rendered);
+		editable_references.set_sensitive (rendered);
 	});
 	options_box.pack_start (render_mode, false, false);
 	options_box.pack_start (render_hint, false, false);
-	if (native) { options_box.pack_start (midi_reference, false, false); }
+	if (native) { options_box.pack_start (editable_references, false, false); }
 	options_box.pack_start (tail_row, false, false);
 	options_box.show_all ();
 	dialog.set_extra_widget (options_box);
@@ -415,7 +415,7 @@ static void export_project (Gtk::Window* parent, ExportKind kind)
 	PX::SessionExchange::ExportOptions options;
 	options.render_mix = render_mode.get_active_row_number () == 1;
 	options.render_stems = render_mode.get_active_row_number () == 2;
-	options.render_midi_reference = native && options.rendered () && midi_reference.get_active ();
+	options.render_editable_references = native && options.rendered () && editable_references.get_active ();
 	options.render_tail_seconds = tail.get_value ();
 	if (native && native_format.get_active_row_number () >= 0) { options.studio_one_format_version = 7 + native_format.get_active_row_number (); }
 	dialog.hide ();
