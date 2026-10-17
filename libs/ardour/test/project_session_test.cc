@@ -494,6 +494,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (roundtrip);
 	CPPUNIT_TEST (looped_dawproject_roundtrip);
 	CPPUNIT_TEST (nested_looped_dawproject_roundtrip);
+	CPPUNIT_TEST (mixed_time_looped_dawproject_roundtrip);
 	CPPUNIT_TEST (multichannel_audio_roundtrip);
 	CPPUNIT_TEST (surround_aaf_roundtrip);
 	CPPUNIT_TEST (midi_controller_roundtrip);
@@ -554,6 +555,7 @@ public:
 	void roundtrip ();
 	void looped_dawproject_roundtrip ();
 	void nested_looped_dawproject_roundtrip ();
+	void mixed_time_looped_dawproject_roundtrip ();
 	void multichannel_audio_roundtrip ();
 	void surround_aaf_roundtrip ();
 	void midi_controller_roundtrip ();
@@ -3013,6 +3015,83 @@ loopStart="0" loopEnd="3"><Clips timeUnit="beats"><Clip time="0" duration="1"><N
 	CPPUNIT_ASSERT (!audio.front ().envelope.points.empty ());
 	CPPUNIT_ASSERT (!audio.back ().envelope.points.empty ());
 	std::cout << "Nested repeated DAWproject audio and MIDI clips survived session save/reopen and return" << std::endl;
+}
+
+void ProjectSessionTest::mixed_time_looped_dawproject_roundtrip ()
+{
+	Fixture fixture;
+	auto source = example (fixture);
+	std::string xml = R"(<Project version="1.0"><Application name="Mixed loop fixture" version="1"/>
+<Transport><Tempo id="tempo-map" unit="bpm" value="100"/><TimeSignature numerator="4" denominator="4"/></Transport>
+<Structure><Track id="audio" name="Beat audio loop" contentType="audio"><Channel id="ca" audioChannels="2" destination="master"/></Track>
+<Track id="midi" name="Second MIDI loop" contentType="notes"><Channel id="cm" audioChannels="2" destination="master"/></Track>
+<Channel id="master" name="Main" role="master" audioChannels="2"/></Structure>
+<Arrangement><Lanes><Lanes track="audio" timeUnit="beats"><Clips><Clip time="8" duration="4" contentTimeUnit="seconds"
+playStart="0.5" loopStart="0" loopEnd="1" fadeTimeUnit="seconds" fadeInTime="0.2" fadeOutTime="0.2">
+<Audio id="source" timeUnit="seconds" duration="2" channels="2" sampleRate="RATE"><File path="audio/source.wav"/></Audio>
+</Clip></Clips></Lanes><Lanes track="midi" timeUnit="seconds"><Clips><Clip time="0" duration="4"
+contentTimeUnit="beats" playStart="1" loopStart="0" loopEnd="3"><Notes timeUnit="beats">
+<Note time="0" duration="0.5" channel="0" key="60"/><Note time="1" duration="0.5" channel="0" key="67"/>
+</Notes></Clip></Clips></Lanes></Lanes><TempoAutomation timeUnit="beats" unit="bpm">
+<Target parameter="tempo-map"/><RealPoint time="9" value="60"/></TempoAutomation></Arrangement></Project>)";
+	auto rate = source.media.front ().sample_rate;
+	xml.replace (xml.find ("RATE"), 4, std::to_string (rate));
+	{
+		PX::ProjectArchiveWriter archive (fixture.path ("mixed-looped.dawproject"));
+		archive.add_text ("project.xml", xml);
+		archive.add_text ("metadata.xml", "<MetaData/>");
+		archive.add_file ("audio/source.wav", fixture.path ("source.wav"));
+		archive.finish ();
+	}
+	auto parsed = PX::DawProject::read (fixture.path ("mixed-looped.dawproject"));
+	auto const& original_audio = track_named (parsed, "Beat audio loop").clips;
+	auto const& original_midi = track_named (parsed, "Second MIDI loop").clips;
+	CPPUNIT_ASSERT_EQUAL (size_t (5), original_audio.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (3), original_midi.size ());
+	CPPUNIT_ASSERT (original_audio.front ().position.unit == PX::TimeUnit::Beats);
+	CPPUNIT_ASSERT (original_audio.front ().offset.unit == PX::TimeUnit::Seconds);
+	CPPUNIT_ASSERT (original_midi.front ().position.unit == PX::TimeUnit::Seconds);
+	CPPUNIT_ASSERT (original_midi.front ().offset.unit == PX::TimeUnit::Beats);
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("mixed-looped.dawproject"),
+	                                                        fixture.path ("MixedLooped"), "MixedLooped", fixture.report);
+	for (auto const& detail : {"Audio clip anchored in sample time", "MIDI clip anchored in musical time"}) {
+		CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [&] (const PX::Diagnostic& item) {
+			return item.disposition == PX::Disposition::Transformed && item.detail.find (detail) != std::string::npos;
+		}));
+	}
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("MixedLooped"), "MixedLooped", nullptr, "", true));
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("mixed-looped-return.dawproject"));
+	auto returned = PX::DawProject::read (fixture.path ("mixed-looped-return.dawproject"));
+	PX::TimeMap original_timing (parsed), returned_timing (returned);
+	auto const& audio = track_named (returned, "Beat audio loop").clips;
+	auto const& midi = track_named (returned, "Second MIDI loop").clips;
+	CPPUNIT_ASSERT_EQUAL (original_audio.size (), audio.size ());
+	CPPUNIT_ASSERT_EQUAL (original_midi.size (), midi.size ());
+	for (size_t i = 0; i < audio.size (); ++i) {
+		CPPUNIT_ASSERT (audio[i].offset.unit == PX::TimeUnit::Seconds);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (original_timing.convert (original_audio[i].position, PX::TimeUnit::Seconds),
+		                               returned_timing.convert (audio[i].position, PX::TimeUnit::Seconds), 2.0 / rate);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (original_timing.convert (PX::Time (original_audio[i].position.value + original_audio[i].duration,
+		                                                               original_audio[i].position.unit), PX::TimeUnit::Seconds),
+		                               returned_timing.convert (PX::Time (audio[i].position.value + audio[i].duration,
+		                                                               audio[i].position.unit), PX::TimeUnit::Seconds), 2.0 / rate);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (original_audio[i].offset.value, audio[i].offset.value, 2.0 / rate);
+	}
+	CPPUNIT_ASSERT (!audio.front ().envelope.points.empty ());
+	CPPUNIT_ASSERT (!audio.back ().envelope.points.empty ());
+	for (size_t i = 0; i < midi.size (); ++i) {
+		CPPUNIT_ASSERT (midi[i].offset.unit == PX::TimeUnit::Beats);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (original_timing.convert (original_midi[i].position, PX::TimeUnit::Seconds),
+		                               returned_timing.convert (midi[i].position, PX::TimeUnit::Seconds), 2.0 / rate);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (original_timing.convert (PX::Time (original_midi[i].position.value + original_midi[i].duration,
+		                                                               original_midi[i].position.unit), PX::TimeUnit::Seconds),
+		                               returned_timing.convert (PX::Time (midi[i].position.value + midi[i].duration,
+		                                                               midi[i].position.unit), PX::TimeUnit::Seconds), 2.0 / rate);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (original_midi[i].offset.value, midi[i].offset.value, 1.0 / Temporal::Beats::PPQN);
+	}
+	std::cout << "Mixed-time DAWproject loops survived variable-tempo session save/reopen and return" << std::endl;
 }
 
 void ProjectSessionTest::multichannel_audio_roundtrip ()

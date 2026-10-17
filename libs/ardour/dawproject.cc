@@ -734,25 +734,38 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active, Time orig
 	if (!expression.points.empty ()) { diagnostic (node, "Clip gain expression mapped to an editable sample-timed envelope; holds use a one-sample transition", Disposition::Transformed); }
 	if (repeated_loop && !expanded_nested_loop) {
 		if (result.size () != 1 || (result.front ().kind != ClipKind::Audio && result.front ().kind != ClipKind::MIDI) ||
-		    parent_unit != loop_unit || result.front ().offset.unit != loop_unit) {
-			throw ExchangeError ("Repeated nested or mixed-time clips require a rendered fallback");
+		    result.front ().offset.unit != loop_unit) {
+			throw ExchangeError ("Repeated clip content needs a compatible source time unit or a rendered fallback");
 		}
 		std::vector<Clip> expanded;
 		double elapsed = 0, source = outer.offset.value;
-		while (elapsed < outer.duration - 1e-9) {
-			double span = std::min (loop_end - source, outer.duration - elapsed);
+		const bool mixed = parent_unit != loop_unit;
+		const double extent = mixed ? clip_length : outer.duration;
+		while (elapsed < extent - 1e-9) {
+			double span = std::min (mixed ? timing->duration (Time (loop_end - source, loop_unit),
+			                                                Time (clip_start + elapsed, TimeUnit::Seconds), TimeUnit::Seconds)
+			                              : loop_end - source,
+			                        extent - elapsed);
 			if (!(span > 0) || !(elapsed + span > elapsed)) { throw ExchangeError ("Clip loop is too short to expand"); }
 			size_t objects = 1 + result.front ().notes.size ();
 			for (auto const& control : result.front ().midi_controls) { objects += 1 + control.points.size (); }
 			if (objects > 250000 - expanded_objects) { throw ExchangeError ("Project exceeds the expanded object limit"); }
 			expanded_objects += objects;
 			Clip part = result.front ();
-			part.position.value = outer.position.value + elapsed;
-			part.duration = span;
+			if (mixed) {
+				double begin = clip_start + elapsed, end = begin + span;
+				if (!(end > begin)) { throw ExchangeError ("Clip loop is too short to expand"); }
+				part.position.value = timing->convert (Time (begin, TimeUnit::Seconds), parent_unit);
+				part.duration = timing->convert (Time (end, TimeUnit::Seconds), parent_unit) - part.position.value;
+				if (!(part.duration > 0)) { throw ExchangeError ("Clip loop is too short to expand"); }
+			} else {
+				part.position.value = outer.position.value + elapsed;
+				part.duration = span;
+			}
 			part.offset.value = source;
 			if (!part.envelope.points.empty ()) {
 				double begin = timing->convert (part.position, TimeUnit::Seconds) - clip_start;
-				double end = timing->convert (Time (part.position.value + span, parent_unit), TimeUnit::Seconds) - clip_start;
+				double end = timing->convert (Time (part.position.value + part.duration, parent_unit), TimeUnit::Seconds) - clip_start;
 				part.envelope = slice_automation (result.front ().envelope, begin, end);
 			}
 			expanded.push_back (std::move (part));

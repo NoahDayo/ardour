@@ -125,6 +125,59 @@ class DawProjectTest(unittest.TestCase):
         self.assert_schema(output)
         self.assertEqual(self.semantic(parsed), self.semantic(json.loads(self.command('parse', output).stdout)))
 
+    def test_mixed_time_direct_loops_follow_tempo_map(self):
+        audio = self.timed_project('<RealPoint time="9" value="60"/>')
+        audio = audio.replace('name="Lead" time="8" contentTimeUnit="seconds" playStart="0.25" playStop="1.75"',
+                              'name="Lead" time="8" duration="4" contentTimeUnit="seconds" playStart="0.5" '
+                              'loopStart="0" loopEnd="1" fadeTimeUnit="seconds" fadeInTime="0.2" fadeOutTime="0.2"')
+        parsed = self.parse(audio)
+        self.assert_schema(self.input)
+        clips = [clip for clip in parsed['tracks'][1]['clips'] if clip['name'] == 'Lead']
+        self.assertEqual(len(clips), 5)
+        for clip, position, duration, offset in zip(clips, [8, 8 + 5 / 6, 9.9, 10.9, 11.9],
+                                                    [5 / 6, 9.9 - 8 - 5 / 6, 1, 1, .1], [.5, 0, 0, 0, 0]):
+            self.assertEqual(clip['position'][1], 'beats')
+            self.assertEqual(clip['offset'][1], 'seconds')
+            self.assertAlmostEqual(clip['position'][0], position, places=8)
+            self.assertAlmostEqual(clip['duration'], duration, places=8)
+            self.assertAlmostEqual(clip['offset'][0], offset, places=8)
+        self.assertTrue(clips[0]['envelope'] and clips[-1]['envelope'])
+        output = self.root / 'mixed-audio-loops.xml'
+        self.command('rewrite', self.input, output)
+        self.assert_schema(output)
+        rewritten = json.loads(self.command('parse', output).stdout)
+        for original, returned in zip(parsed['tracks'][1]['clips'], rewritten['tracks'][1]['clips']):
+            if not original['envelope']:
+                self.assertEqual(returned['envelope'], [])
+                continue
+            limit = min(original['envelope'][-1][0], returned['envelope'][-1][0])
+            for index in range(21):
+                point = limit * index / 20
+                self.assertAlmostEqual(self.envelope_value(original['envelope'], point),
+                                       self.envelope_value(returned['envelope'], point), delta=1e-9)
+            original['envelope'] = returned['envelope'] = []
+        self.assertEqual(self.semantic(parsed), self.semantic(rewritten))
+
+        midi = PROJECT.replace('<Lanes track="midi"><Clips>', '<Lanes track="midi" timeUnit="seconds"><Clips>')
+        midi = midi.replace('time="4" duration="4" playStart="1" name="Notes"',
+                            'time="4" duration="4" contentTimeUnit="beats" playStart="1" '
+                            'loopStart="0" loopEnd="3" name="Notes"')
+        midi = midi.replace('<Notes>', '<Notes timeUnit="beats">')
+        parsed = self.parse(midi)
+        self.assert_schema(self.input)
+        clips = parsed['tracks'][2]['clips']
+        self.assertEqual(len(clips), 3)
+        for clip, position, duration, offset in zip(clips, [4, 5.2, 7], [1.2, 1.8, 1], [1, 0, 0]):
+            self.assertEqual(clip['position'][1], 'seconds')
+            self.assertEqual(clip['offset'][1], 'beats')
+            self.assertAlmostEqual(clip['position'][0], position, places=8)
+            self.assertAlmostEqual(clip['duration'], duration, places=8)
+            self.assertAlmostEqual(clip['offset'][0], offset, places=8)
+        output = self.root / 'mixed-midi-loops.xml'
+        self.command('rewrite', self.input, output)
+        self.assert_schema(output)
+        self.assertEqual(self.semantic(parsed), self.semantic(json.loads(self.command('parse', output).stdout)))
+
         midi = PROJECT.replace('time="4" duration="4" playStart="1" name="Notes"',
                                'time="4" duration="7" playStart="1" loopStart="0" loopEnd="3" name="Notes"')
         parsed = self.parse(midi)
@@ -152,7 +205,7 @@ class DawProjectTest(unittest.TestCase):
         self.parse(missing, status=1)
         mixed = PROJECT.replace('name="Lead" time="8" contentTimeUnit="seconds" playStart="0.25" playStop="1.75"',
                                 'name="Lead" time="8" duration="8" contentTimeUnit="seconds" playStart="0" loopStart="0" loopEnd="1"')
-        self.assertIn('mixed-time', self.parse(mixed, status=1).stderr)
+        self.assertEqual(len(self.parse(mixed)['tracks'][1]['clips']), 6)
 
     def test_repeated_nested_clips_preserve_edits_and_source_offsets(self):
         audio = '''<Project version="1.0"><Application name="Fixture" version="1"/>
