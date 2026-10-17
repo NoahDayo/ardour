@@ -871,7 +871,6 @@ void ProjectSessionTest::native_song_export_roundtrip ()
 	Fixture fixture; auto input = example (fixture);
 	for (auto& track : input.tracks) {
 		if (!track.master) { track.destination = "master"; }
-		for (auto& clip : track.clips) { for (auto& note : clip.notes) { note.channel = 0; note.release_velocity = 64.0 / 127; } }
 	}
 	input.tempos = {{PX::Time (0), 100, false}, {PX::Time (3), 120, false}};
 	input.meters = {{PX::Time (0), 3, 4}, {PX::Time (3), 5, 8}};
@@ -895,6 +894,7 @@ void ProjectSessionTest::native_song_export_roundtrip ()
 	CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
 	CPPUNIT_ASSERT (!fixture.session->dirty ());
 	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& d) { return d.detail.find ("Experimental") != std::string::npos; }));
+	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& d) { return d.detail.find ("Per-note MIDI channels and release velocity encoded") != std::string::npos; }));
 	CPPUNIT_ASSERT_EQUAL (0, g_unlink (fixture.path ("input.dawproject").c_str ()));
 	CPPUNIT_ASSERT_EQUAL (0, g_unlink (fixture.path ("source.wav").c_str ()));
 	CPPUNIT_ASSERT_EQUAL (0, g_rename (fixture.path ("Exported Song").c_str (), fixture.path ("Moved Song").c_str ()));
@@ -940,6 +940,7 @@ void ProjectSessionTest::native_song_export_roundtrip ()
 		CPPUNIT_ASSERT_DOUBLES_EQUAL (expected.time, actual.time, 1e-6); CPPUNIT_ASSERT_DOUBLES_EQUAL (expected.duration, actual.duration, 1e-6);
 		CPPUNIT_ASSERT_EQUAL (expected.key, actual.key); CPPUNIT_ASSERT_EQUAL (expected.channel, actual.channel);
 		CPPUNIT_ASSERT_DOUBLES_EQUAL (expected.velocity, actual.velocity, 1e-6);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (expected.release_velocity, actual.release_velocity, 1e-6);
 	}
 	std::cout << "Native song audio/MIDI export, relocation and session reopen passed" << std::endl;
 }

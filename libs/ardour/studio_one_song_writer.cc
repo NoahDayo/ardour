@@ -103,7 +103,10 @@ std::string music (const Clip& clip, const TimeMap& timing, const CancelCheck& c
 		check (cancel);
 		double start = timing.content (Time (note.time, clip.offset.unit), clip.position, clip.offset, TimeUnit::Beats);
 		double end = timing.content (Time (note.time + note.duration, clip.offset.unit), clip.position, clip.offset, TimeUnit::Beats);
-		out += '{'; field (out, "start", start); field (out, "length", end - start); field (out, "pitch", note.key); field (out, "velocity", note.velocity); out += '}';
+		out += '{'; field (out, "start", start); field (out, "length", end - start); field (out, "pitch", note.key); field (out, "velocity", note.velocity);
+		if (note.channel) { field (out, "channel", note.channel); }
+		if (note.release_velocity != .5) { field (out, "releaseVelocity", note.release_velocity); }
+		out += '}';
 		require (out.size () <= 16 * 1024 * 1024 - 64, "Native MIDI exceeds its supported size");
 	}
 	out += ']'; key (out, "envelopes"); out += "[]}"; return out;
@@ -258,10 +261,10 @@ std::vector<Diagnostic> StudioOneSong::export_report (const Project& project)
 			if (!clip.midi_controls.empty ()) { unsupported (clip.name, "Native MIDI controller mapping has not been verified; use DAWproject, AAF/MIDI or rendered audio"); }
 			double in, out, gain; if (!fades (clip, project, timing, in, out, gain)) { unsupported (clip.name, "Native export supports ordinary linear fade lengths; other clip envelopes require rendering"); }
 			else if (!clip.envelope.points.empty ()) { report.push_back ({Disposition::Transformed, clip.name, "Linear clip envelopes become native gain and fade lengths at audio sample resolution"}); }
-			for (auto const& note : clip.notes) {
-				if (note.channel != 0 || std::abs (note.release_velocity - .5) > .5 / 127 + 1e-9) {
-					unsupported (clip.name, "Per-note MIDI channels and nondefault release velocity are not verified in native songs; use rendered audio"); break;
-				}
+			if (std::any_of (clip.notes.begin (), clip.notes.end (), [] (const Note& note) {
+				return note.channel != 0 || note.release_velocity != .5;
+			})) {
+				report.push_back ({Disposition::Transformed, clip.name, "Per-note MIDI channels and release velocity encoded in native music data; target playback is not yet validated"});
 			}
 		}
 	}
