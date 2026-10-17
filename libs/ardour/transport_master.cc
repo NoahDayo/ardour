@@ -86,6 +86,10 @@ TransportMaster::~TransportMaster()
 {
 	DEBUG_TRACE (DEBUG::Destruction, string_compose ("destroying transport master \"%1\" along with port %2\n", name(), (_port ? _port->name() : std::string ("no port"))));
 
+	/* Unregistering a port can emit engine signals. Disconnect this
+	 * master signal handlers before port and property teardown. */
+	port_connection.disconnect ();
+	backend_connection.disconnect ();
 	unregister_port ();
 }
 
