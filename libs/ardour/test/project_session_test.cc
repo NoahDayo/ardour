@@ -493,6 +493,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST_SUITE (ProjectSessionTest);
 	CPPUNIT_TEST (roundtrip);
 	CPPUNIT_TEST (looped_dawproject_roundtrip);
+	CPPUNIT_TEST (nested_looped_dawproject_roundtrip);
 	CPPUNIT_TEST (multichannel_audio_roundtrip);
 	CPPUNIT_TEST (surround_aaf_roundtrip);
 	CPPUNIT_TEST (midi_controller_roundtrip);
@@ -552,6 +553,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 public:
 	void roundtrip ();
 	void looped_dawproject_roundtrip ();
+	void nested_looped_dawproject_roundtrip ();
 	void multichannel_audio_roundtrip ();
 	void surround_aaf_roundtrip ();
 	void midi_controller_roundtrip ();
@@ -2950,6 +2952,67 @@ playStart="0.1" loopStart="0.4" loopEnd="0.8" fadeTimeUnit="seconds" fadeInTime=
 	CPPUNIT_ASSERT_EQUAL (size_t (2), midi[0].notes.size ());
 	CPPUNIT_ASSERT_EQUAL (size_t (2), midi[1].notes.size ());
 	std::cout << "Looped DAWproject audio, fades and MIDI notes survived session save/reopen and return" << std::endl;
+}
+
+void ProjectSessionTest::nested_looped_dawproject_roundtrip ()
+{
+	Fixture fixture;
+	auto source = example (fixture);
+	std::string xml = R"(<Project version="1.0"><Application name="Nested loop fixture" version="1"/>
+<Transport><Tempo unit="bpm" value="100"/><TimeSignature numerator="4" denominator="4"/></Transport>
+<Structure><Track id="audio" name="Nested audio" contentType="audio"><Channel id="ca" audioChannels="2" destination="master"/></Track>
+<Track id="midi" name="Nested notes" contentType="notes"><Channel id="cm" audioChannels="2" destination="master"/></Track>
+<Channel id="master" name="Main" role="master" audioChannels="2"/></Structure>
+<Arrangement><Lanes><Lanes track="audio" timeUnit="seconds"><Clips><Clip time="0" duration="2.5" contentTimeUnit="seconds"
+playStart="0.5" loopStart="0" loopEnd="1.5" fadeTimeUnit="seconds" fadeInTime="0.25" fadeOutTime="0.25">
+<Clips timeUnit="seconds"><Clip time="0" duration="0.75" playStart="0.25">
+<Audio id="source" timeUnit="seconds" duration="2" channels="2" sampleRate="RATE"><File path="audio/source.wav"/></Audio></Clip>
+<Clip time="0.75" duration="0.75" playStart="0.25" reference="source"/></Clips>
+</Clip></Clips></Lanes><Lanes track="midi" timeUnit="beats"><Clips><Clip time="4" duration="5" playStart="1"
+loopStart="0" loopEnd="3"><Clips timeUnit="beats"><Clip time="0" duration="1"><Notes>
+<Note time="0" duration="0.5" channel="0" key="60" vel="0.7"/></Notes></Clip>
+<Clip time="1" duration="2"><Notes><Note time="0" duration="0.5" channel="0" key="67" vel="0.8"/>
+</Notes></Clip></Clips></Clip></Clips></Lanes></Lanes></Arrangement></Project>)";
+	auto rate = source.media.front ().sample_rate;
+	xml.replace (xml.find ("RATE"), 4, std::to_string (rate));
+	{
+		PX::ProjectArchiveWriter archive (fixture.path ("nested-looped.dawproject"));
+		archive.add_text ("project.xml", xml);
+		archive.add_text ("metadata.xml", "<MetaData/>");
+		archive.add_file ("audio/source.wav", fixture.path ("source.wav"));
+		archive.finish ();
+	}
+	auto parsed = PX::DawProject::read (fixture.path ("nested-looped.dawproject"));
+	auto const& original_audio = track_named (parsed, "Nested audio").clips;
+	auto const& original_midi = track_named (parsed, "Nested notes").clips;
+	CPPUNIT_ASSERT_EQUAL (size_t (4), original_audio.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (3), original_midi.size ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.75, original_audio.front ().offset.value, 1e-9);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.25, original_audio.back ().offset.value, 1e-9);
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("nested-looped.dawproject"),
+	                                                        fixture.path ("NestedLooped"), "NestedLooped", fixture.report);
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("NestedLooped"), "NestedLooped", nullptr, "", true));
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("nested-looped-return.dawproject"));
+	auto returned = PX::DawProject::read (fixture.path ("nested-looped-return.dawproject"));
+	auto const& audio = track_named (returned, "Nested audio").clips;
+	auto const& midi = track_named (returned, "Nested notes").clips;
+	CPPUNIT_ASSERT_EQUAL (original_audio.size (), audio.size ());
+	CPPUNIT_ASSERT_EQUAL (original_midi.size (), midi.size ());
+	for (size_t i = 0; i < audio.size (); ++i) {
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (original_audio[i].position.value, audio[i].position.value, 1.0 / rate);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (original_audio[i].duration, audio[i].duration, 1.0 / rate);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (original_audio[i].offset.value, audio[i].offset.value, 1.0 / rate);
+	}
+	for (size_t i = 0; i < midi.size (); ++i) {
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (original_midi[i].position.value, midi[i].position.value, 1e-6);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (original_midi[i].offset.value, midi[i].offset.value, 1e-6);
+		CPPUNIT_ASSERT_EQUAL (original_midi[i].notes.front ().key, midi[i].notes.front ().key);
+	}
+	CPPUNIT_ASSERT (!audio.front ().envelope.points.empty ());
+	CPPUNIT_ASSERT (!audio.back ().envelope.points.empty ());
+	std::cout << "Nested repeated DAWproject audio and MIDI clips survived session save/reopen and return" << std::endl;
 }
 
 void ProjectSessionTest::multichannel_audio_roundtrip ()

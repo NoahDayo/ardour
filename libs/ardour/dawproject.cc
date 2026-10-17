@@ -594,6 +594,7 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active, Time orig
 	}
 	if (is (content, "Points") && midi_points (content, time_unit (content, "timeUnit", content_unit), controls)) { content = nullptr; }
 	std::vector<Clip> result;
+	bool expanded_nested_loop = false;
 	if (is (content, "Audio")) {
 		outer.kind = ClipKind::Audio;
 		outer.media = audio (content);
@@ -630,12 +631,23 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active, Time orig
 		if (!controls.empty ()) { diagnostic (node, "MIDI expression around nested clips is not yet converted"); }
 		attributes (content, {"id", "timeUnit"});
 		TimeUnit unit = time_unit (content, "timeUnit", content_unit);
+		if (repeated_loop && (unit != parent_unit || loop_unit != parent_unit)) {
+			throw ExchangeError ("Repeated nested loop needs matching wrapper and timeline time units");
+		}
 		double start = timing->convert (outer.position, TimeUnit::Seconds);
 		double stop = start + timing->duration (Time (outer.duration, parent_unit), outer.position, TimeUnit::Seconds);
 		Time child_origin (timing->convert (outer.position, outer.offset.unit) - outer.offset.value, outer.offset.unit);
+		std::vector<Clip> nested;
 		for (Node item : children (content)) {
 			if (!is (item, "Clip")) { diagnostic (item, "Unknown nested clips element"); continue; }
-			for (Clip& inner : clip (item, unit, active, child_origin)) {
+			for (Clip& inner : clip (item, unit, active, repeated_loop ? Time () : child_origin)) {
+				if (repeated_loop) {
+					if (inner.position.unit != parent_unit || inner.offset.unit != parent_unit) {
+						throw ExchangeError ("Repeated nested clip needs matching region and source time units");
+					}
+					nested.push_back (std::move (inner));
+					continue;
+				}
 				double inner_start = timing->convert (inner.position, TimeUnit::Seconds);
 				double inner_stop = inner_start + timing->duration (Time (inner.duration, inner.position.unit), inner.position, TimeUnit::Seconds);
 				double begin = std::max (start, inner_start);
@@ -650,6 +662,36 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active, Time orig
 				if (inner.color.empty ()) { inner.color = outer.color; }
 				result.push_back (std::move (inner));
 			}
+		}
+		if (repeated_loop) {
+			double elapsed = 0, source = outer.offset.value;
+			while (elapsed < outer.duration - 1e-9) {
+				expansion ();
+				double span = std::min (loop_end - source, outer.duration - elapsed);
+				if (!(span > 0) || !(elapsed + span > elapsed)) { throw ExchangeError ("Clip loop is too short to expand"); }
+				for (auto const& inner : nested) {
+					double begin = std::max (source, inner.position.value);
+					double end = std::min (source + span, inner.position.value + inner.duration);
+					if (end <= begin) { continue; }
+					size_t objects = 1 + inner.notes.size ();
+					for (auto const& control : inner.midi_controls) { objects += 1 + control.points.size (); }
+					if (objects > 250000 - expanded_objects) { throw ExchangeError ("Project exceeds the expanded object limit"); }
+					expanded_objects += objects;
+					Clip part = inner;
+					part.envelope = slice_automation (inner.envelope, begin - inner.position.value, end - inner.position.value);
+					part.offset.value += begin - inner.position.value;
+					part.position = Time (outer.position.value + elapsed + begin - source, parent_unit);
+					part.duration = end - begin;
+					part.enabled = part.enabled && outer.enabled;
+					if (part.name.empty ()) { part.name = outer.name; }
+					if (part.color.empty ()) { part.color = outer.color; }
+					result.push_back (std::move (part));
+				}
+				elapsed += span;
+				source = loop_start;
+			}
+			expanded_nested_loop = true;
+			diagnostic (node, "Expanded repeated nested clips into editable regions with source offsets", Disposition::Transformed);
 		}
 		diagnostic (node, "Flattened nested clips while preserving audible ranges and source offsets", Disposition::Transformed);
 	} else {
@@ -690,7 +732,7 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active, Time orig
 	}
 	if (fade_in || fade_out) { diagnostic (node, "Duration-only fades converted to linear-amplitude clip envelopes; DAW-specific fade shapes are not specified", Disposition::Transformed); }
 	if (!expression.points.empty ()) { diagnostic (node, "Clip gain expression mapped to an editable sample-timed envelope; holds use a one-sample transition", Disposition::Transformed); }
-	if (repeated_loop) {
+	if (repeated_loop && !expanded_nested_loop) {
 		if (result.size () != 1 || (result.front ().kind != ClipKind::Audio && result.front ().kind != ClipKind::MIDI) ||
 		    parent_unit != loop_unit || result.front ().offset.unit != loop_unit) {
 			throw ExchangeError ("Repeated nested or mixed-time clips require a rendered fallback");

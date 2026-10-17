@@ -154,6 +154,62 @@ class DawProjectTest(unittest.TestCase):
                                 'name="Lead" time="8" duration="8" contentTimeUnit="seconds" playStart="0" loopStart="0" loopEnd="1"')
         self.assertIn('mixed-time', self.parse(mixed, status=1).stderr)
 
+    def test_repeated_nested_clips_preserve_edits_and_source_offsets(self):
+        audio = '''<Project version="1.0"><Application name="Fixture" version="1"/>
+          <Structure><Track id="t" contentType="audio"/></Structure>
+          <Arrangement><Lanes timeUnit="seconds"><Clips track="t"><Clip time="10" duration="5.5" playStart="1"
+          loopStart="0" loopEnd="3" fadeInTime="1" fadeOutTime="1" fadeTimeUnit="seconds" name="Comp">
+          <Clips timeUnit="seconds"><Clip time="0" duration="2" playStart="0.25">
+          <Audio id="a" channels="2" sampleRate="48000" duration="8"><File path="a.wav"/></Audio></Clip>
+          <Clip time="2" duration="2" playStart="1" reference="a"/></Clips>
+          </Clip></Clips></Lanes></Arrangement></Project>'''
+        parsed = self.parse(audio)
+        self.assert_schema(self.input)
+        clips = parsed['tracks'][0]['clips']
+        self.assertEqual([c['position'] for c in clips], [[10, 'seconds'], [11, 'seconds'],
+                                                        [12, 'seconds'], [14, 'seconds'], [15, 'seconds']])
+        self.assertEqual([c['duration'] for c in clips], [1, 1, 2, 1, .5])
+        self.assertEqual([c['offset'] for c in clips], [[1.25, 'seconds'], [1, 'seconds'],
+                                                      [.25, 'seconds'], [1, 'seconds'], [.25, 'seconds']])
+        self.assertEqual([c['name'] for c in clips], ['Comp'] * 5)
+        self.assertAlmostEqual(self.envelope_value(clips[0]['envelope'], 0), 0)
+        self.assertAlmostEqual(self.envelope_value(clips[-1]['envelope'], .5), 0)
+        self.assertTrue(any('Expanded repeated nested clips' in d['detail'] for d in parsed['report']))
+        output = self.root / 'nested-loops.xml'
+        self.command('rewrite', self.input, output)
+        self.assert_schema(output)
+        self.assertEqual(self.semantic(parsed), self.semantic(json.loads(self.command('parse', output).stdout)))
+
+        midi = '''<Project version="1.0"><Application name="Fixture" version="1"/>
+          <Structure><Track id="t" contentType="notes"/></Structure>
+          <Arrangement><Lanes timeUnit="beats"><Clips track="t"><Clip time="4" duration="7" playStart="1"
+          loopStart="0" loopEnd="3" contentTimeUnit="beats"><Clips timeUnit="beats">
+          <Clip time="0" duration="1"><Notes><Note time="0" duration="0.5" channel="0" key="60"/></Notes></Clip>
+          <Clip time="1" duration="2"><Notes><Note time="0" duration="0.5" channel="0" key="64"/></Notes></Clip>
+          </Clips></Clip></Clips></Lanes></Arrangement></Project>'''
+        parsed = self.parse(midi)
+        self.assert_schema(self.input)
+        clips = parsed['tracks'][0]['clips']
+        self.assertEqual([c['position'] for c in clips], [[4, 'beats'], [6, 'beats'], [7, 'beats'],
+                                                        [9, 'beats'], [10, 'beats']])
+        self.assertEqual([c['duration'] for c in clips], [2, 1, 2, 1, 1])
+        self.assertEqual([c['offset'] for c in clips], [[0, 'beats'], [0, 'beats'], [0, 'beats'],
+                                                      [0, 'beats'], [0, 'beats']])
+        self.assertEqual([c['notes'][0][2] for c in clips], [64, 60, 64, 60, 64])
+        output = self.root / 'nested-midi-loops.xml'
+        self.command('rewrite', self.input, output)
+        self.assert_schema(output)
+        self.assertEqual(self.semantic(parsed), self.semantic(json.loads(self.command('parse', output).stdout)))
+
+        mixed = audio.replace('<Clips timeUnit="seconds"><Clip time="0"', '<Clips timeUnit="beats"><Clip time="0"')
+        self.assertIn('matching wrapper and timeline time units', self.parse(mixed, status=1).stderr)
+        excess = (audio.replace('duration="5.5"', 'duration="250001"')
+                       .replace('playStart="1"', 'playStart="0"')
+                       .replace('loopEnd="3"', 'loopEnd="1"')
+                       .replace('<Clip time="0" duration="2"', '<Clip time="10" duration="2"')
+                       .replace('<Clip time="2" duration="2"', '<Clip time="12" duration="2"'))
+        self.assertIn('expanded object limit', self.parse(excess, status=1).stderr)
+
     def test_midi_controller_lanes_schema_roundtrip(self):
         lanes = ''
         for expression, extra, maximum in [('channelController', 'controller="64"', 127), ('pitchBend', '', 16383), ('channelPressure', '', 127), ('polyPressure', 'key="60"', 127)]:
