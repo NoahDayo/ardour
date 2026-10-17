@@ -251,7 +251,7 @@ private:
 	}
 	void index_channels (Node n) {
 		if (Node uid = child (n, "UID", "uniqueID")) {
-			if (is (n, "AudioTrackChannel") || is (n, "MusicTrackChannel") || is (n, "AudioGroupChannel") || is (n, "AudioOutputChannel")) {
+			if (is (n, "AudioTrackChannel") || is (n, "MusicTrackChannel") || is (n, "AudioGroupChannel") || is (n, "AudioEffectChannel") || is (n, "AudioOutputChannel")) {
 				std::string key = value (uid, "uid"); require (!key.empty () && channels.emplace (key, n).second, "Duplicate native channel ID");
 			}
 		}
@@ -260,6 +260,7 @@ private:
 	std::string media_path (const std::string& uri);
 	std::string audio (const std::string& key);
 	void notes (Clip& clip, Node entry);
+	void sends (Track& track, Node rack);
 	void channel (Track& track, Node n);
 	void transport (Node context);
 	void track (Node n);
@@ -334,6 +335,7 @@ void Reader::automation (Node n, const std::string& name)
 	for (Node c : children (n)) {
 		if (!is (c, "AutomationRegion")) { unsupported (name, "Unknown native automation region"); continue; }
 		std::string member = member_url (value (child (c, "Url", "points"), "url"));
+		if (!members.count (member)) { unsupported (name, "Referenced native automation member is missing: " + member); continue; }
 		std::string data = archive.read_text (member); Value envelope = BinaryJSON (data).parse ();
 		auto events = envelope.find ("events");
 		require (events && events->type == Value::Array, "Malformed native automation envelope");
@@ -351,14 +353,14 @@ void Reader::channel (Track& track, Node n)
 	if (number (n, "transpose") || number (n, "velocity")) { unsupported (track.name, "MIDI channel transpose or velocity adjustment"); }
 	for (Node c : children (n)) {
 		std::string identifier = id (c);
-		if (identifier == "Inserts" || identifier == "PostFaderInserts" || identifier == "Sends") {
+		if (identifier == "Inserts" || identifier == "PostFaderInserts") {
 			for (Node item : children (c)) {
 				if (id (item) == "Presets" && children (item).empty ()) { continue; }
 				if (id (item) == "Combinator" && children (item).size () == 1 && is (children (item)[0], "UID")) { continue; }
 				if (identifier == "Inserts" && is (item, "Attributes") && id (item).empty () && !value (item, "name").empty ()) {
 					insert (track, item); continue;
 				}
-				unsupported (track.name, "Plug-ins or sends are not yet supported");
+				unsupported (track.name, "Native plug-in slot is not yet supported");
 			}
 		} else if (identifier == "Panner") {
 			track.pan = number (c, "panX1", track.pan);
@@ -372,6 +374,43 @@ void Reader::channel (Track& track, Node n)
 		auto slash = target.find ('/');
 		require (slash != std::string::npos && target.substr (slash) == "/Input", "Unsupported native channel routing");
 		track.destination = target.substr (0, slash);
+	}
+	if (Node rack = child (n, "Attributes", "Sends")) { sends (track, rack); }
+}
+
+void Reader::sends (Track& track, Node rack)
+{
+	for (Node item : children (rack)) {
+		check ();
+		if (is (item, "Attributes") && id (item) == "Presets" && children (item).empty ()) { continue; }
+		std::string name = value (item, "name");
+		if (!is (item, "Attributes") || name.compare (0, 4, "Send") != 0) {
+			unsupported (track.name, "Native send rack content is not yet supported"); continue;
+		}
+		attributes (item, {"name", "bypass", "prefader", "level", "pan", "lockPan"}, track.name);
+		Node connection = child (item, "Connection", "destination");
+		if (!connection) { unsupported (track.name, "Native send has no destination"); continue; }
+		std::string target = value (connection, "objectID");
+		auto slash = target.find ('/');
+		if (slash == std::string::npos || target.substr (slash) != "/Input") {
+			unsupported (track.name, "Native sidechain or hardware send is not yet supported"); continue;
+		}
+		auto destination = channels.find (target.substr (0, slash));
+		if (destination == channels.end () ||
+		    (!is (destination->second, "AudioGroupChannel") && !is (destination->second, "AudioEffectChannel"))) {
+			unsupported (track.name, "Native send target is not an audio bus"); continue;
+		}
+		for (Node content : children (item)) {
+			if (content != connection) { unsupported (track.name, "Native send content is not yet supported"); }
+		}
+		Send send; send.destination = destination->first; send.pre_fader = boolean (item, "prefader");
+		send.enabled = !boolean (item, "bypass"); send.volume = number (item, "level", 1);
+		send.pan = boolean (item, "lockPan") ? track.pan : number (item, "pan", .5);
+		if (boolean (item, "lockPan")) {
+			result.project.report.push_back ({Disposition::Transformed, track.name,
+			                                   "Channel-linked send pan copied as a static value; later channel-pan edits will not follow"});
+		}
+		track.sends.push_back (send);
 	}
 }
 
@@ -581,7 +620,8 @@ StudioOneSongData Reader::read ()
 	Node meta = document ("metainfo.xml", "MetaInformation"); std::map<std::string, std::string> metadata;
 	for (Node n : children (meta)) { if (is (n, "Attribute")) { require (metadata.emplace (value (n, "id"), value (n, "value")).second, "Duplicate native song metadata"); } }
 	require (metadata["Document:MimeType"] == "application/x.presonus-song", "This file is not a Studio One song");
-	require (metadata["Document:FormatVersion"] == "9", "This Studio One native format version has not yet been validated (supported: 9)");
+	std::string format_version = metadata["Document:FormatVersion"];
+	require (format_version == "7" || format_version == "9", "This Studio One native format version has not yet been validated (supported: 7, 9)");
 	result.project.application = "Studio One / Studio Pro"; result.project.application_version = metadata["Document:Generator"];
 	result.title = metadata["Document:Title"];
 	Node song = document ("Song/song.xml", "Song"); Node root_node = child (song, "Attributes", "Root"); require (root_node, "Native song has no arrangement");
@@ -622,11 +662,16 @@ StudioOneSongData Reader::read ()
 			}
 		} else { unsupported (value (n, "name"), "Native track type is not yet supported: " + std::string (reinterpret_cast<const char*> (n->name))); }
 	}
-	for (auto const& pair : channels) { if (is (pair.second, "AudioGroupChannel")) {
+	for (auto const& pair : channels) { if (is (pair.second, "AudioGroupChannel") || is (pair.second, "AudioEffectChannel")) {
 		Track bus; bus.id = pair.first; bus.kind = TrackKind::Bus; bus.name = value (pair.second, "label", "Bus");
-		bus.color = color (value (pair.second, "color")); channel (bus, pair.second);
+		try { bus.color = color (value (pair.second, "color")); }
+		catch (const ExchangeError&) { result.project.report.push_back ({Disposition::Transformed, bus.name, "Invalid native bus color omitted"}); }
+		channel (bus, pair.second);
 		std::string speaker = value (child (pair.second, "SpeakerSetup", "speakerType"), "type", "Stereo");
 		require (speaker == "Stereo", "Unsupported native bus speaker arrangement");
+		if (is (pair.second, "AudioEffectChannel")) {
+			result.project.report.push_back ({Disposition::Transformed, bus.name, "Native FX channel represented as an audio bus"});
+		}
 		result.project.tracks.push_back (bus);
 	} }
 	for (auto const& pair : channels) { if (is (pair.second, "AudioOutputChannel")) {
@@ -636,14 +681,21 @@ StudioOneSongData Reader::read ()
 	/* Native channel routing references channel IDs, while tracks use trackID. */
 	std::map<std::string, std::string> destinations;
 	for (Node n : children (child (root_node, "List", "Tracks"))) { if (is (n, "MediaTrack")) { destinations[value (child (n, "UID", "channelID"), "uid")] = value (n, "trackID"); } }
-	for (auto& t : result.project.tracks) { auto i = destinations.find (t.destination); if (i != destinations.end ()) { t.destination = i->second; } }
+	for (auto& t : result.project.tracks) {
+		auto i = destinations.find (t.destination); if (i != destinations.end ()) { t.destination = i->second; }
+		for (auto& send : t.sends) { auto target = destinations.find (send.destination); if (target != destinations.end ()) { send.destination = target->second; } }
+	}
 	if (result.has_range) {
 		TimeMap timing (result.project);
 		require (timing.convert (result.end, TimeUnit::Seconds) > timing.convert (result.start, TimeUnit::Seconds), "Invalid native song boundaries");
 	}
 	result.project.markers = result.markers;
 	validate_project (result.project);
-	result.project.report.push_back ({Disposition::Preserved, "Native Studio One song", "Audio, MIDI notes, clip positions and gain, track names, colors, static mixer controls, bus routing and tempo/meter steps read directly from the .song file"});
+	if (format_version == "7") {
+		result.project.report.push_back ({Disposition::Transformed, "Native Studio One song",
+		                                   "Studio One format 7 imported; native re-export writes format 9"});
+	}
+	result.project.report.push_back ({Disposition::Preserved, "Native Studio One song", "Audio, MIDI notes, clip positions and gain, track names, colors, static mixer controls, audio-bus routing, ordinary sends and tempo/meter steps read directly from the .song file"});
 	return result;
 }
 

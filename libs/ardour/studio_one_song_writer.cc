@@ -211,7 +211,9 @@ std::vector<Diagnostic> StudioOneSong::export_report (const Project& project)
 		if (track.kind == TrackKind::Folder && (track.channels != 2 || track.volume != 1 || track.pan != .5 || track.mute || track.solo)) {
 			unsupported (track.name, "Native folder processing requires the rendered mix option");
 		}
-		if (!track.sends.empty ()) { unsupported (track.name, "Native sends require the rendered mix option"); }
+		if (!track.sends.empty () && (track.kind != TrackKind::Audio && track.kind != TrackKind::Bus)) {
+			unsupported (track.name, "Native sends require an audio track or stereo bus");
+		}
 		for (auto const& plugin : track.plugins) {
 			if (track.master || track.kind != TrackKind::Audio || track.channels != 2 || plugin.role != "audioFX" ||
 			    !plugin.enabled || plugin.state.empty ()) {
@@ -338,6 +340,17 @@ void StudioOneSong::write (const StudioOneSongData& song, const std::string& fil
 			Node presets = node (inserts, "Attributes", "Presets"); prop (presets, "pname", "default"); prop (presets, "dirty", 0);
 			Node combinator = node (inserts, "Attributes", "Combinator"); prop (combinator, "name", "Combinator");
 			unique_id (combinator, "uniqueID", uid ());
+		}
+		if (!track.sends.empty ()) {
+			Node rack = node (channel, "Attributes", "Sends"); unsigned send_number = 0;
+			for (auto const& send : track.sends) {
+				check (cancel); Node item = node (rack, "Attributes"); ++send_number;
+				prop (item, "name", std::string ("Send") + (send_number < 10 ? "0" : "") + std::to_string (send_number));
+				prop (item, "bypass", !send.enabled); prop (item, "prefader", send.pre_fader);
+				prop (item, "level", send.volume); prop (item, "pan", send.pan); prop (item, "lockPan", 0);
+				prop (node (item, "Connection", "destination"), "objectID", channels.at (send.destination) + "/Input");
+			}
+			Node presets = node (rack, "Attributes", "Presets"); prop (presets, "pname", "default"); prop (presets, "dirty", 0);
 		}
 		if (track.master || bus) { continue; }
 		Node t = node (tracks, "MediaTrack"); prop (t, "mediaType", musical ? "Music" : "Audio"); prop (t, "tempoFollow", musical ? 2 : 0);

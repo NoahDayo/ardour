@@ -404,6 +404,95 @@ class NativeSongTest(unittest.TestCase):
             group, group.replace('objectID="master/Input"', 'objectID="bus/Input"'))
         self.assertIn("Cyclic", self.read(status=1))
 
+    def test_native_fx_bus_and_audio_send_round_trip(self):
+        effect = ('<ChannelGroup name="AudioEffect"><AudioEffectChannel gain="0.7" pan="0.5" label="Room">'
+                  '<SpeakerSetup x:id="speakerType" type="Stereo"/><UID x:id="uniqueID" uid="room-fx"/>'
+                  '<Connection x:id="destination" objectID="master/Input"/>'
+                  '</AudioEffectChannel></ChannelGroup>')
+        rack = ('<Attributes x:id="Sends"><Attributes name="Send01" bypass="1" prefader="1" '
+                'level="0.25" pan="0.8" lockPan="0">'
+                '<Connection x:id="destination" objectID="room-fx/Input"/></Attributes>'
+                '<Attributes x:id="Presets" pname="default" dirty="0"/></Attributes>')
+        self.entries["Devices/audiomixer.xml"] = (MIXER.replace('</AudioTrackChannel>', rack + '</AudioTrackChannel>')
+            .replace('<ChannelGroup name="AudioOutput">', effect + '<ChannelGroup name="AudioOutput">'))
+        before = self.read()["project"]
+        audio, midi, room, master = before["tracks"]
+        self.assertEqual((room["name"], room["kind"], room["destination"], room["volume"]),
+                         ("Room", 3, master["id"], .7))
+        self.assertEqual(audio["sends"], [{"destination": room["id"], "pre_fader": True,
+                                          "enabled": False, "volume": .25, "pan": .8}])
+        self.assertFalse(any(d["disposition"] == 3 for d in before["report"]))
+        self.writable_fixture()
+        output, _ = self.export()
+        with zipfile.ZipFile(output) as archive:
+            mixer = self.native_xml(archive, "Devices/audiomixer.xml")
+            exported_bus = mixer.find(".//AudioGroupChannel")
+            exported_send = mixer.find(".//AudioTrackChannel/Attributes[@id='Sends']/Attributes[@name='Send01']")
+            self.assertEqual(exported_bus.get("label"), "Room")
+            self.assertEqual(exported_send.find("Connection").get("objectID"),
+                             exported_bus.find("UID").get("uid") + "/Input")
+            self.assertEqual((exported_send.get("prefader"), exported_send.get("bypass"),
+                              exported_send.get("level"), exported_send.get("lockPan")),
+                             ("1", "1", "0.25", "0"))
+            self.assertAlmostEqual(float(exported_send.get("pan")), .8)
+        after = self.read(path=output)["project"]
+        self.assertEqual(after["tracks"][0]["sends"], [{**audio["sends"][0], "destination": after["tracks"][2]["id"]}])
+        self.assertFalse(any(d["disposition"] == 3 for d in after["report"]))
+
+    def test_native_send_pan_link_and_sidechain_are_reported(self):
+        effect = ('<ChannelGroup name="AudioEffect"><AudioEffectChannel label="Room">'
+                  '<UID x:id="uniqueID" uid="room-fx"/>'
+                  '<Connection x:id="destination" objectID="master/Input"/>'
+                  '</AudioEffectChannel></ChannelGroup>')
+        rack = ('<Attributes x:id="Sends"><Attributes name="Send01" level="0.5" pan="0.9" lockPan="1">'
+                '<Connection x:id="destination" objectID="room-fx/Input"/></Attributes>'
+                '<Attributes name="Send02" level="1"><Connection x:id="destination" '
+                'objectID="plugin/AudioInput01"/></Attributes></Attributes>')
+        self.entries["Devices/audiomixer.xml"] = (MIXER.replace('</AudioTrackChannel>', rack + '</AudioTrackChannel>')
+            .replace('<ChannelGroup name="AudioOutput">', effect + '<ChannelGroup name="AudioOutput">'))
+        project = self.read()["project"]
+        self.assertEqual((len(project["tracks"][0]["sends"]), project["tracks"][0]["sends"][0]["pan"]), (1, .25))
+        self.assertTrue(any(d["disposition"] == 1 and "Channel-linked send pan" in d["detail"]
+                            for d in project["report"]))
+        self.assertTrue(any(d["disposition"] == 3 and "sidechain" in d["detail"]
+                            for d in project["report"]))
+
+    def test_missing_native_automation_member_is_reported(self):
+        automation = ('<Attributes x:id="AutomationRegionList"><AutomationRegion title="Volume">'
+                      '<Url x:id="points" url="media:///Envelopes/missing.envelopex"/>'
+                      '</AutomationRegion></Attributes>')
+        self.entries["Song/song.xml"] = SONG.replace('<List x:id="Events">', automation + '<List x:id="Events">', 1)
+        project = self.read()["project"]
+        self.assertTrue(any(d["disposition"] == 3 and "automation member is missing" in d["detail"]
+                            for d in project["report"]))
+        self.writable_fixture()
+        output, error = self.export(status=1)
+        self.assertIn("automation member is missing", error)
+        self.assertFalse(output.exists())
+
+    def test_format_seven_audio_song_converts_to_format_nine(self):
+        self.entries["metainfo.xml"] = META.replace('value="9"', 'value="7"')
+        before = self.read()["project"]
+        self.assertEqual([t["name"] for t in before["tracks"]], ["Audio", "Notes", "Main"])
+        self.assertTrue(any(d["disposition"] == 1 and "format 7" in d["detail"] for d in before["report"]))
+        self.writable_fixture()
+        output, _ = self.export()
+        with zipfile.ZipFile(output) as archive:
+            metadata = {a.get("id"): a.get("value") for a in self.native_xml(archive, "metainfo.xml")}
+            self.assertEqual(metadata["Document:FormatVersion"], "9")
+        self.assertEqual([t["name"] for t in self.read(path=output)["project"]["tracks"]],
+                         ["Audio", "Notes", "Main"])
+
+    def test_application_authored_format_seven_template(self):
+        sample = os.environ.get("ARDOUR_STUDIO_ONE_FORMAT7_TEMPLATE")
+        if not sample:
+            self.skipTest("Pass an installed Studio One 6 format-7 .data template privately")
+        project = self.read(path=Path(sample))["project"]
+        by_name = {track["name"]: track for track in project["tracks"]}
+        self.assertEqual(by_name["Voiceover 1"]["sends"][0]["destination"], by_name["Room"]["id"])
+        self.assertEqual(by_name["Voiceover 2"]["sends"][0]["destination"], by_name["Room"]["id"])
+        self.assertTrue(any(d["disposition"] == 3 and "sidechain" in d["detail"] for d in project["report"]))
+
     def test_native_vst3_insert_reads_embedded_state_without_silent_loss(self):
         class_id = "00112233445566778899AABBCCDDEEFF"
         native_id = "{00112233-4455-6677-8899-AABBCCDDEEFF}"

@@ -162,7 +162,7 @@ void package (Fixture& fixture, const PX::Project& project, const std::string& n
 	PX::DawProject::write (project, fixture.path (name), {{"source", fixture.path ("source.wav")}});
 }
 
-void native_package (Fixture& fixture, bool processing = false, bool variable = false, bool fades = false)
+void native_package (Fixture& fixture, bool processing = false, bool variable = false, bool fades = false, unsigned format_version = 9)
 {
 	auto project = example (fixture);
 	auto uri = [] (const std::string& path) {
@@ -171,7 +171,7 @@ void native_package (Fixture& fixture, bool processing = false, bool variable = 
 		std::string result (raw); g_free (raw); return result;
 	};
 	PX::ProjectArchiveWriter song (fixture.path ("input.song"));
-	song.add_text ("metainfo.xml", "<MetaInformation><Attribute id=\"Document:MimeType\" value=\"application/x.presonus-song\"/><Attribute id=\"Document:FormatVersion\" value=\"9\"/></MetaInformation>");
+	song.add_text ("metainfo.xml", std::string ("<MetaInformation><Attribute id=\"Document:MimeType\" value=\"application/x.presonus-song\"/><Attribute id=\"Document:FormatVersion\" value=\"") + std::to_string (format_version) + "\"/></MetaInformation>");
 	std::string transport = R"(
 <TempoMap x:id="tempoMap"><TempoMapSegment start="0" tempo="0.6"/></TempoMap>
 <TimeSignatureMap x:id="timeSignatureMap"><TimeSignatureMapSegment start="0" numerator="3" denominator="4"/></TimeSignatureMap>
@@ -505,6 +505,8 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (native_song_export_guards);
 	CPPUNIT_TEST (native_song_render_export);
 	CPPUNIT_TEST (bus_sends_roundtrip);
+	CPPUNIT_TEST (native_song_fx_sends_roundtrip);
+	CPPUNIT_TEST (native_song_format_seven_import);
 	CPPUNIT_TEST (native_song_cancel);
 	CPPUNIT_TEST (native_song_unsupported);
 	CPPUNIT_TEST (marker_roundtrip);
@@ -550,6 +552,8 @@ public:
 	void native_song_export_guards ();
 	void native_song_render_export ();
 	void bus_sends_roundtrip ();
+	void native_song_fx_sends_roundtrip ();
+	void native_song_format_seven_import ();
 	void native_song_cancel ();
 	void native_song_unsupported ();
 	void marker_roundtrip ();
@@ -2196,6 +2200,69 @@ void ProjectSessionTest::bus_sends_roundtrip ()
 	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
 	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("sends.dawproject"), fixture.path ("SendsReturn"), "SendsReturn", fixture.report);
 	check ();
+}
+
+void ProjectSessionTest::native_song_fx_sends_roundtrip ()
+{
+	Fixture fixture;
+	auto input = example (fixture);
+	input.tracks.erase (input.tracks.begin () + 3); // MIDI track.
+	input.tracks.erase (input.tracks.begin () + 1); // Folder.
+	auto& audio = input.tracks[1];
+	audio.parent.clear (); audio.destination = "master"; audio.pan = .5;
+	audio.sends = {{"room", true, true, .25, .8}, {"delay", false, false, .625, .2}};
+	PX::Track room; room.id = "room"; room.name = "Room"; room.kind = PX::TrackKind::Bus; room.destination = "master";
+	PX::Track delay = room; delay.id = "delay"; delay.name = "Delay";
+	input.tracks.push_back (room); input.tracks.push_back (delay);
+	package (fixture, input);
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("input.dawproject"), fixture.path ("Source"), "Source", fixture.report);
+	PX::SessionExchange::ExportOptions options;
+	PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("NativeSends"), fixture.report, options);
+	auto verify = [&] (const PX::Project& project) {
+		auto const& sends = track_named (project, "Stereo").sends;
+		CPPUNIT_ASSERT_EQUAL (size_t (2), sends.size ());
+		for (auto const& send : sends) {
+			auto target = std::find_if (project.tracks.begin (), project.tracks.end (), [&] (const PX::Track& t) { return t.id == send.destination; });
+			CPPUNIT_ASSERT (target != project.tracks.end ());
+			CPPUNIT_ASSERT (target->name == "Room" || target->name == "Delay");
+			bool first = target->name == "Room";
+			CPPUNIT_ASSERT_EQUAL (first, send.pre_fader); CPPUNIT_ASSERT_EQUAL (first, send.enabled);
+			CPPUNIT_ASSERT_DOUBLES_EQUAL (first ? .25 : .625, send.volume, .000001);
+			CPPUNIT_ASSERT_DOUBLES_EQUAL (first ? .8 : .2, send.pan, .000001);
+		}
+	};
+	verify (PX::StudioOneSong::read (fixture.path ("NativeSends/Project.song")).project);
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_studio_one (*AudioEngine::instance (), fixture.path ("NativeSends/Project.song"), fixture.path ("Returned"), "Returned", fixture.report);
+	CPPUNIT_ASSERT (fixture.session->route_by_name ("Room"));
+	CPPUNIT_ASSERT (fixture.session->route_by_name ("Delay"));
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("Returned"), "Returned", nullptr, "", true));
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("native-sends-return.dawproject"));
+	verify (PX::DawProject::read (fixture.path ("native-sends-return.dawproject")));
+	std::cout << "Native song FX/bus sends survived Ardour import, save/reopen and DAWproject return" << std::endl;
+}
+
+void ProjectSessionTest::native_song_format_seven_import ()
+{
+	Fixture fixture; native_package (fixture, false, false, false, 7);
+	auto original = PX::StudioOneSong::read (fixture.path ("input.song"));
+	CPPUNIT_ASSERT (std::any_of (original.project.report.begin (), original.project.report.end (), [] (const PX::Diagnostic& d) {
+		return d.disposition == PX::Disposition::Transformed && d.detail.find ("format 7") != std::string::npos;
+	}));
+	fixture.session = PX::SessionExchange::import_studio_one (*AudioEngine::instance (), fixture.path ("input.song"), fixture.path ("OlderSong"), "OlderSong", fixture.report);
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("OlderSong"), "OlderSong", nullptr, "", true));
+	PX::SessionExchange::ExportOptions options;
+	PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("UpgradedSong"), fixture.report, options);
+	PX::ProjectArchive archive (fixture.path ("UpgradedSong/Project.song"));
+	CPPUNIT_ASSERT (archive.read_text ("metainfo.xml").find ("Document:FormatVersion\" value=\"9") != std::string::npos);
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("format-seven-return.dawproject"));
+	auto returned = PX::DawProject::read (fixture.path ("format-seven-return.dawproject"));
+	CPPUNIT_ASSERT_EQUAL (size_t (1), track_named (returned, "Native audio").clips.size ());
+	std::cout << "Format-7 native song imported, saved/reopened and returned through format 9 and DAWproject" << std::endl;
 }
 
 void ProjectSessionTest::native_song_cancel ()
