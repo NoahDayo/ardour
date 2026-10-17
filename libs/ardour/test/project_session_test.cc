@@ -500,6 +500,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (existing_export);
 	CPPUNIT_TEST (reject_unmapped_processing);
 	CPPUNIT_TEST (native_song_import);
+	CPPUNIT_TEST (native_song_mixer_automation);
 	CPPUNIT_TEST (native_song_timing_and_gain);
 	CPPUNIT_TEST (native_song_fades);
 	CPPUNIT_TEST (native_song_export_roundtrip);
@@ -551,6 +552,7 @@ public:
 	void existing_export ();
 	void reject_unmapped_processing ();
 	void native_song_import ();
+	void native_song_mixer_automation ();
 	void native_song_timing_and_gain ();
 	void native_song_fades ();
 	void native_song_export_roundtrip ();
@@ -948,6 +950,7 @@ void ProjectSessionTest::native_song_export_guards ()
 	{
 		auto route = fixture.session->route_by_name ("Native audio"); auto list = route->gain_control ()->alist ();
 		list->clear (); list->add (Temporal::timepos_t (samplepos_t (0)), .5); list->add (Temporal::timepos_t (samplepos_t (48000)), 1); list->set_automation_state (Play);
+		CPPUNIT_ASSERT (list->set_interpolation (Evoral::ControlList::Discrete));
 	}
 	CPPUNIT_ASSERT_THROW (PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("Unsupported"), fixture.report, options), PX::ExchangeError);
 	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& d) { return d.disposition == PX::Disposition::Unsupported; }));
@@ -2176,6 +2179,54 @@ void ProjectSessionTest::native_song_import ()
 		CPPUNIT_ASSERT_EQUAL (float (int (i % 37) - 18) / 32, pcm[2 * i]);
 		CPPUNIT_ASSERT_EQUAL (float (int (i % 61) - 30) / 64, pcm[2 * i + 1]);
 	}
+}
+
+void ProjectSessionTest::native_song_mixer_automation ()
+{
+	Fixture fixture; native_package (fixture);
+	auto source = PX::StudioOneSong::read (fixture.path ("input.song"));
+	auto track = std::find_if (source.project.tracks.begin (), source.project.tracks.end (), [] (const PX::Track& item) { return item.name == "Native audio"; });
+	CPPUNIT_ASSERT (track != source.project.tracks.end ());
+	track->volume_automation.unit = PX::TimeUnit::Seconds;
+	track->volume_automation.points = {{0, .25, true}, {1, .75, true}, {2, .5, true}};
+	track->pan_automation.unit = PX::TimeUnit::Seconds;
+	track->pan_automation.points = {{0, .2, true}, {1, .8, true}, {2, .5, true}};
+	track->volume_automation.points.front ().linear = false;
+	CPPUNIT_ASSERT_THROW (PX::StudioOneSong::write (source, fixture.path ("held.song"), fixture.path ("held.song")), PX::ExchangeError);
+	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("held.song"), Glib::FILE_TEST_EXISTS));
+	track->volume_automation.points.front ().linear = true;
+	PX::StudioOneSong::write (source, fixture.path ("automation.song"), fixture.path ("automation.song"));
+	auto parsed = PX::StudioOneSong::read (fixture.path ("automation.song"));
+	auto const& native = track_named (parsed.project, "Native audio");
+	CPPUNIT_ASSERT_EQUAL (size_t (3), native.volume_automation.points.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (3), native.pan_automation.points.size ());
+	for (double at : {0.0, .5, 1.0, 1.5, 2.0}) {
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (curve_value (track->volume_automation, at), curve_value (native.volume_automation, at), 1e-9);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (curve_value (track->pan_automation, at), curve_value (native.pan_automation, at), 1e-9);
+	}
+	fixture.session = PX::SessionExchange::import_studio_one (*AudioEngine::instance (), fixture.path ("automation.song"),
+	                                                        fixture.path ("Automated"), "Automated", fixture.report);
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("Automated"), "Automated", nullptr, "", true));
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("automation-return.dawproject"));
+	auto returned = PX::DawProject::read (fixture.path ("automation-return.dawproject"));
+	auto const& daw = track_named (returned, "Native audio");
+	for (double at : {0.0, .5, 1.0, 1.5, 2.0}) {
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (curve_value (track->volume_automation, at), curve_value (daw.volume_automation, at), 1e-6);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (curve_value (track->pan_automation, at), curve_value (daw.pan_automation, at), 1e-6);
+	}
+	PX::SessionExchange::ExportOptions options;
+	PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("NativeAutomationReturn"), fixture.report, options);
+	auto native_return = PX::StudioOneSong::read (fixture.path ("NativeAutomationReturn/Project.song"));
+	auto const& final = track_named (native_return.project, "Native audio");
+	CPPUNIT_ASSERT_EQUAL (size_t (3), final.volume_automation.points.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (3), final.pan_automation.points.size ());
+	for (double at : {0.0, .5, 1.0, 1.5, 2.0}) {
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (curve_value (track->volume_automation, at), curve_value (final.volume_automation, at), 1e-6);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (curve_value (track->pan_automation, at), curve_value (final.pan_automation, at), 1e-6);
+	}
+	CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
 }
 
 void ProjectSessionTest::native_song_timing_and_gain ()

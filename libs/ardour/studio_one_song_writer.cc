@@ -109,6 +109,19 @@ std::string music (const Clip& clip, const TimeMap& timing, const CancelCheck& c
 	out += ']'; key (out, "envelopes"); out += "[]}"; return out;
 }
 
+std::string envelope (const Automation& curve, const TimeMap& timing, bool pan, const CancelCheck& cancel) {
+	std::string out = "{";
+	if (pan) { key (out, "bipolar"); out += "i\x01"; }
+	key (out, "events"); out += '[';
+	for (auto const& point : curve.points) {
+		check (cancel);
+		out += '{'; field (out, "start", timing.convert (Time (point.time, curve.unit), TimeUnit::Seconds));
+		field (out, "value", point.value); out += '}';
+		require (out.size () <= 16 * 1024 * 1024 - 64, "Native automation exceeds its supported size");
+	}
+	out += "]}"; return out;
+}
+
 bool fades (const Clip& clip, const Project& project, const TimeMap& timing, double& in, double& out, double& gain) {
 	in = out = 0; gain = 1; auto const& points = clip.envelope.points; if (points.empty ()) { return true; }
 	if (clip.kind != ClipKind::Audio || clip.envelope.unit != TimeUnit::Seconds) { return false; }
@@ -222,7 +235,21 @@ std::vector<Diagnostic> StudioOneSong::export_report (const Project& project)
 				report.push_back ({Disposition::Transformed, plugin.name, "VST3 state embedded in the native song; Studio Pro opening and playback are not yet validated"});
 			}
 		}
-		if (!track.volume_automation.points.empty () || !track.pan_automation.points.empty ()) { unsupported (track.name, "Native mixer automation requires the rendered mix option"); }
+		if (!track.volume_automation.points.empty () || !track.pan_automation.points.empty ()) {
+			bool linear = track.kind == TrackKind::Audio;
+			for (auto const* curve : {&track.volume_automation, &track.pan_automation}) {
+				linear = linear && std::all_of (curve->points.begin (), curve->points.empty () ? curve->points.end () : curve->points.end () - 1,
+				                                [] (const AutomationPoint& point) { return point.linear; });
+			}
+			if (!linear) { unsupported (track.name, "Native mixer automation supports only linear audio-track volume and pan points; render other automation"); }
+			else {
+				report.push_back ({Disposition::Transformed, track.name, "Native audio-track volume and pan automation written as linear points; Studio Pro playback is not yet validated"});
+				if ((!track.volume_automation.points.empty () && track.volume_automation.unit == TimeUnit::Beats) ||
+				    (!track.pan_automation.points.empty () && track.pan_automation.unit == TimeUnit::Beats)) {
+					report.push_back ({Disposition::Transformed, track.name, "Beat-timed mixer automation becomes absolute-time points; later tempo edits will not move those points"});
+				}
+			}
+		}
 		if (track.kind == TrackKind::MIDI && (track.volume != 1 || track.pan != .5)) { unsupported (track.name, "Native MIDI mixer gain and pan require instrument rendering"); }
 		for (auto const& clip : track.clips) {
 			if (!clip.midi_controls.empty ()) { unsupported (clip.name, "Native MIDI controller mapping has not been verified; use DAWproject, AAF/MIDI or rendered audio"); }
@@ -260,7 +287,12 @@ void StudioOneSong::write (const StudioOneSongData& song, const std::string& fil
 	auto const& project = song.project; TimeMap timing (project);
 	double begin = song.has_range ? timing.convert (song.start, TimeUnit::Seconds) : 0;
 	double end = song.has_range ? timing.convert (song.end, TimeUnit::Seconds) : 0;
-	for (auto const& track : project.tracks) { for (auto const& clip : track.clips) { if (!song.has_range) { end = std::max (end, timing.convert (Time (clip.position.value + clip.duration, clip.position.unit), TimeUnit::Seconds)); } } }
+	for (auto const& track : project.tracks) {
+		for (auto const& clip : track.clips) { if (!song.has_range) { end = std::max (end, timing.convert (Time (clip.position.value + clip.duration, clip.position.unit), TimeUnit::Seconds)); } }
+		if (!song.has_range) { for (auto const* curve : {&track.volume_automation, &track.pan_automation}) {
+			if (!curve->points.empty ()) { end = std::max (end, timing.convert (Time (curve->points.back ().time, curve->unit), TimeUnit::Seconds)); }
+		} }
+	}
 	if (!song.has_range) { end = std::max (end, 1.0); }
 	require (std::isfinite (begin) && std::isfinite (end) && begin >= 0 && end > begin, "Invalid native song range");
 	std::map<std::string, std::string> channels, track_ids, media_ids;
@@ -357,6 +389,20 @@ void StudioOneSong::write (const StudioOneSongData& song, const std::string& fil
 		prop (t, "version", 1); prop (t, "trackID", track_ids.at (track.id)); prop (t, "trackNumber", track_number); prop (t, "timeFormat", musical ? 2 : 0); prop (t, "name", track.name); prop (t, "color", color (track.color));
 		if (!track.parent.empty ()) { prop (t, "parentFolder", track_ids.at (track.parent)); }
 		unique_id (t, "channelID", channels[track.id]); if (!musical) { speaker (t, "trackFormat", track.channels); }
+		if (!musical && (!track.volume_automation.points.empty () || !track.pan_automation.points.empty ())) {
+			Node regions = node (t, "Attributes", "AutomationRegionList"); prop (regions, "visible", 0);
+			auto add_curve = [&] (const Automation& curve, bool pan) {
+				if (curve.points.empty ()) { return; }
+				std::string member = "Envelopes/track-" + std::to_string (track_number) + (pan ? "/Pan.envelopex" : "/Volume.envelopex");
+				Node region = node (regions, "AutomationRegion"); prop (region, "title", pan ? "Pan L/R" : "Volume");
+				prop (region, "identity", "param:///AudioMixer/" + channels.at (track.id) + (pan ? "/Panner/panX1" : "/volume"));
+				prop (region, "metaIdentity", pan ? "AudioPanner/panX1" : "AudioTrackChannel/volume");
+				prop (region, "userRenamed", 0); prop (region, "color", pan ? "FFC7FF3A" : "FFFFD829"); prop (region, "mute", 0);
+				Node location = node (region, "Url", "points"); prop (location, "type", 1); prop (location, "url", "media:///" + member);
+				archive.add_text (member, envelope (curve, timing, pan, cancel));
+			};
+			add_curve (track.volume_automation, false); add_curve (track.pan_automation, true);
+		}
 		Node events = node (t, "List", "Events");
 		for (auto const& clip : track.clips) {
 			check (cancel); TimeUnit unit = musical ? TimeUnit::Beats : TimeUnit::Seconds;

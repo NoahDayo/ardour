@@ -265,7 +265,7 @@ private:
 	void transport (Node context);
 	void track (Node n);
 	void folder (Node n);
-	void automation (Node n, const std::string& name);
+	void automation (Node n, Track& track, const std::string& channel_id, TimeUnit time_unit);
 };
 
 std::string Reader::media_path (const std::string& uri)
@@ -330,18 +330,49 @@ void Reader::notes (Clip& clip, Node entry)
 	}
 }
 
-void Reader::automation (Node n, const std::string& name)
+void Reader::automation (Node n, Track& track, const std::string& channel_id, TimeUnit time_unit)
 {
 	for (Node c : children (n)) {
-		if (!is (c, "AutomationRegion")) { unsupported (name, "Unknown native automation region"); continue; }
+		if (!is (c, "AutomationRegion")) { unsupported (track.name, "Unknown native automation region"); continue; }
 		std::string member = member_url (value (child (c, "Url", "points"), "url"));
-		if (!members.count (member)) { unsupported (name, "Referenced native automation member is missing: " + member); continue; }
+		if (!members.count (member)) { unsupported (track.name, "Referenced native automation member is missing: " + member); continue; }
 		std::string data = archive.read_text (member); Value envelope = BinaryJSON (data).parse ();
 		auto events = envelope.find ("events");
 		require (events && events->type == Value::Array, "Malformed native automation envelope");
 		bool unknown = false;
 		for (auto const& item : envelope.object) { unknown = unknown || (item.first != "events" && item.first != "bipolar"); }
-		if (!events->array.empty () || unknown) { unsupported (name, "Automation is not yet supported: " + value (c, "title")); }
+		if (events->array.empty () && !unknown) { continue; }
+		std::string identity = "param:///AudioMixer/" + channel_id + "/";
+		std::string target = value (c, "metaIdentity");
+		bool volume = target == "AudioTrackChannel/volume" && value (c, "identity") == identity + "volume";
+		bool pan = target == "AudioPanner/panX1" && value (c, "identity") == identity + "Panner/panX1";
+		if (unknown || track.kind != TrackKind::Audio || (!volume && !pan) || boolean (c, "mute")) {
+			unsupported (track.name, "Automation is not yet supported: " + value (c, "title")); continue;
+		}
+		if (const Value* bipolar = envelope.find ("bipolar")) {
+			if (bipolar->type != Value::Number || bipolar->number != (pan ? 1 : 0)) {
+				unsupported (track.name, "Native automation polarity is not supported: " + value (c, "title")); continue;
+			}
+		}
+		Automation& curve = pan ? track.pan_automation : track.volume_automation;
+		if (!curve.points.empty () || events->array.size () > 100000) {
+			unsupported (track.name, "Native automation has duplicate or excessive points: " + value (c, "title")); continue;
+		}
+		Automation decoded; decoded.unit = time_unit;
+		double previous = -1;
+		bool supported = true;
+		for (auto const& event : events->array) {
+			check ();
+			if (event.type != Value::Object || event.object.size () != 2 || !event.find ("start") || !event.find ("value")) { supported = false; break; }
+			double at = event.get ("start", -1), value = event.get ("value", -1);
+			if (at < 0 || at <= previous) { throw ExchangeError ("Invalid or unordered native automation points"); }
+			if (value < 0 || (pan && value > 1)) { supported = false; break; }
+			decoded.points.push_back ({at, value, true}); previous = at;
+		}
+		if (!supported) { unsupported (track.name, "Native automation point type or value is not supported: " + value (c, "title")); continue; }
+		curve = std::move (decoded);
+		result.project.report.push_back ({Disposition::Transformed, track.name,
+		                                 "Native " + std::string (pan ? "pan" : "volume") + " automation mapped as linear points; target playback is not yet validated"});
 	}
 }
 
@@ -502,7 +533,7 @@ void Reader::track (Node n)
 	std::string speaker = value (child (n, "SpeakerSetup", "trackFormat"), "type", "Stereo");
 	require (speaker == "Stereo" || speaker == "Mono", "Unsupported native speaker arrangement"); t.channels = speaker == "Mono" ? 1 : 2;
 	if (number (n, "delay") || number (n, "transpose")) { unsupported (t.name, "Track delay or transposition is not yet supported"); }
-	automation (child (n, "Attributes", "AutomationRegionList"), t.name);
+	automation (child (n, "Attributes", "AutomationRegionList"), t, channel_id, unit (format));
 	for (Node c : children (n)) {
 		if (is (c, "List") && id (c) != "Events" && !children (c).empty ()) { unsupported (t.name, "Track layers or additional event lists are not yet supported"); }
 	}
