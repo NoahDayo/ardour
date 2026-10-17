@@ -506,7 +506,8 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active, Time orig
 	if (active.size () >= 128 || !active.insert (node).second) { throw ExchangeError ("Cyclic or excessively deep clip reference"); }
 	attributes (node, {"name", "color", "time", "duration", "contentTimeUnit", "playStart", "playStop", "enable", "reference",
 	                  "loopStart", "loopEnd", "fadeInTime", "fadeOutTime", "fadeTimeUnit"});
-	if (has (node, "loopStart") || has (node, "loopEnd")) { throw ExchangeError ("Looped clips require explicit expansion before exchange"); }
+	const bool loop = has (node, "loopStart") || has (node, "loopEnd");
+	if (loop && (!has (node, "loopStart") || !has (node, "loopEnd"))) { throw ExchangeError ("Clip loop needs both start and end"); }
 	double fade_in = number (node, "fadeInTime"), fade_out = number (node, "fadeOutTime");
 	if (fade_out < 0) { throw ExchangeError ("Negative fade-out duration"); }
 	if ((fade_in || fade_out) && !has (node, "fadeTimeUnit")) { throw ExchangeError ("Nonzero clip fades need an explicit fadeTimeUnit"); }
@@ -520,6 +521,12 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active, Time orig
 	TimeUnit content_unit = time_unit (node, "contentTimeUnit", parent_unit);
 	outer.offset = Time (number (node, "playStart"), content_unit);
 	if (outer.offset.value < 0 || local_position < 0) { throw ExchangeError ("Negative clip time is not supported"); }
+	const TimeUnit loop_unit = content_unit;
+	const double loop_start = loop ? number (node, "loopStart") : 0;
+	const double loop_end = loop ? number (node, "loopEnd") : 0;
+	if (loop && (loop_start < 0 || loop_end <= loop_start || outer.offset.value >= loop_end)) {
+		throw ExchangeError ("Invalid clip loop range or play start");
+	}
 	if (has (node, "duration")) {
 		outer.duration = number (node, "duration");
 	} else {
@@ -535,6 +542,11 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active, Time orig
 			outer.duration = maximum;
 			diagnostic (node, "Clipped the region to its content playback stop", Disposition::Transformed);
 		}
+	}
+	const double first_loop_span = loop ? timing->duration (Time (loop_end - outer.offset.value, loop_unit), outer.position, parent_unit) : 0;
+	const bool repeated_loop = loop && outer.duration > first_loop_span + 1e-9;
+	if (repeated_loop && (has (node, "playStop") || fade_in < 0)) {
+		throw ExchangeError ("Repeated clips with playStop or a negative fade-in need an explicit conversion");
 	}
 	if (fade_in < 0) {
 		Time earlier (timing->convert (outer.position, fade_unit) + fade_in, fade_unit);
@@ -678,6 +690,36 @@ Parser::clip (Node node, TimeUnit parent_unit, std::set<Node>& active, Time orig
 	}
 	if (fade_in || fade_out) { diagnostic (node, "Duration-only fades converted to linear-amplitude clip envelopes; DAW-specific fade shapes are not specified", Disposition::Transformed); }
 	if (!expression.points.empty ()) { diagnostic (node, "Clip gain expression mapped to an editable sample-timed envelope; holds use a one-sample transition", Disposition::Transformed); }
+	if (repeated_loop) {
+		if (result.size () != 1 || (result.front ().kind != ClipKind::Audio && result.front ().kind != ClipKind::MIDI) ||
+		    parent_unit != loop_unit || result.front ().offset.unit != loop_unit) {
+			throw ExchangeError ("Repeated nested or mixed-time clips require a rendered fallback");
+		}
+		std::vector<Clip> expanded;
+		double elapsed = 0, source = outer.offset.value;
+		while (elapsed < outer.duration - 1e-9) {
+			double span = std::min (loop_end - source, outer.duration - elapsed);
+			if (!(span > 0) || !(elapsed + span > elapsed)) { throw ExchangeError ("Clip loop is too short to expand"); }
+			size_t objects = 1 + result.front ().notes.size ();
+			for (auto const& control : result.front ().midi_controls) { objects += 1 + control.points.size (); }
+			if (objects > 250000 - expanded_objects) { throw ExchangeError ("Project exceeds the expanded object limit"); }
+			expanded_objects += objects;
+			Clip part = result.front ();
+			part.position.value = outer.position.value + elapsed;
+			part.duration = span;
+			part.offset.value = source;
+			if (!part.envelope.points.empty ()) {
+				double begin = timing->convert (part.position, TimeUnit::Seconds) - clip_start;
+				double end = timing->convert (Time (part.position.value + span, parent_unit), TimeUnit::Seconds) - clip_start;
+				part.envelope = slice_automation (result.front ().envelope, begin, end);
+			}
+			expanded.push_back (std::move (part));
+			elapsed += span;
+			source = loop_start;
+		}
+		result = std::move (expanded);
+		diagnostic (node, "Expanded repeated clip into editable regions with source offsets", Disposition::Transformed);
+	}
 	active.erase (node);
 	return result;
 }

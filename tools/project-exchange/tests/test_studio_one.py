@@ -497,7 +497,7 @@ class NativeSongTest(unittest.TestCase):
         self.assertIn("instrument routing", error)
         self.assertFalse(output.exists())
 
-    def test_format_seven_audio_song_converts_to_format_nine(self):
+    def test_format_seven_audio_song_preserves_format(self):
         self.entries["metainfo.xml"] = META.replace('value="9"', 'value="7"')
         before = self.read()["project"]
         self.assertEqual([t["name"] for t in before["tracks"]], ["Audio", "Notes", "Main"])
@@ -506,7 +506,7 @@ class NativeSongTest(unittest.TestCase):
         output, _ = self.export()
         with zipfile.ZipFile(output) as archive:
             metadata = {a.get("id"): a.get("value") for a in self.native_xml(archive, "metainfo.xml")}
-            self.assertEqual(metadata["Document:FormatVersion"], "9")
+            self.assertEqual(metadata["Document:FormatVersion"], "7")
         self.assertEqual([t["name"] for t in self.read(path=output)["project"]["tracks"]],
                          ["Audio", "Notes", "Main"])
 
@@ -733,12 +733,16 @@ class NativeSongTest(unittest.TestCase):
         self.assertEqual(output.read_bytes(), b"keep this file")
         self.assertFalse(list(self.root.glob("Export.song.part-*")))
 
-    def test_native_writer_unverified_note_semantics_refused(self):
+    def test_native_writer_note_channels_and_release_velocity(self):
         for parameter, value in (("channel", 2), ("releaseVelocity", .25)):
-            self.entries["Performances/notes.musicx"] = ubj({"events": [{"pitch": 60, "length": 1, parameter: value}], "envelopes": []})
-            output, error = self.export(status=1)
-            self.assertIn("Per-note MIDI channels", error)
-            self.assertFalse(output.exists())
+            with self.subTest(parameter=parameter):
+                self.entries["Performances/notes.musicx"] = ubj({"timeFormat": 2, "events": [
+                    {"start": 1, "pitch": 60, "length": 1, "velocity": .8, parameter: value}], "envelopes": []})
+                output, _ = self.export()
+                note = self.read(path=output)["project"]["tracks"][1]["clips"][0]["notes"][0]
+                self.assertEqual(note[3], 2 if parameter == "channel" else 0)
+                self.assertEqual(note[5], .25 if parameter == "releaseVelocity" else .5)
+                output.unlink()
 
     def test_native_writer_rejects_inconsistent_collected_audio(self):
         self.writable_fixture()

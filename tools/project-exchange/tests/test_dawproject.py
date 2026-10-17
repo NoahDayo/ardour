@@ -38,7 +38,7 @@ PROJECT = '''<Project version="1.0">
       <Clip name="Echo" time="16" duration="1.25" contentTimeUnit="seconds" playStart="1" reference="source" enable="false"/>
     </Clips></Lanes>
     <Lanes track="midi"><Clips><Clip time="4" duration="4" playStart="1" name="Notes">
-      <Notes><Note time="0" duration="0.5" key="60" vel="0.7"/>
+      <Notes><Note time="0" duration="0.5" channel="0" key="60" vel="0.7"/>
         <Note time="1" duration="0.5" key="67" channel="3" vel="0.6" rel="0.2"/>
       </Notes>
     </Clip></Clips></Lanes>
@@ -108,6 +108,51 @@ class DawProjectTest(unittest.TestCase):
 
     def control_fixture(self, points):
         return PROJECT.replace('<Notes>', '<Lanes>' + points + '<Notes>').replace('</Notes>', '</Notes></Lanes>')
+
+    def test_direct_clip_loops_expand_to_editable_regions(self):
+        audio = PROJECT.replace('<Clips timeUnit="beats">', '<Clips timeUnit="seconds">')
+        audio = audio.replace('name="Lead" time="8" contentTimeUnit="seconds" playStart="0.25" playStop="1.75"',
+                              'name="Lead" time="8" duration="3.25" contentTimeUnit="seconds" playStart="0.5" loopStart="1" loopEnd="2"')
+        parsed = self.parse(audio)
+        self.assert_schema(self.input)
+        clips = parsed['tracks'][1]['clips'][:3]
+        self.assertEqual([c['position'] for c in clips], [[8, 'seconds'], [9.5, 'seconds'], [10.5, 'seconds']])
+        self.assertEqual([c['duration'] for c in clips], [1.5, 1, .75])
+        self.assertEqual([c['offset'] for c in clips], [[.5, 'seconds'], [1, 'seconds'], [1, 'seconds']])
+        self.assertTrue(any('Expanded repeated clip' in d['detail'] for d in parsed['report']))
+        output = self.root / 'audio-loops.xml'
+        self.command('rewrite', self.input, output)
+        self.assert_schema(output)
+        self.assertEqual(self.semantic(parsed), self.semantic(json.loads(self.command('parse', output).stdout)))
+
+        midi = PROJECT.replace('time="4" duration="4" playStart="1" name="Notes"',
+                               'time="4" duration="7" playStart="1" loopStart="0" loopEnd="3" name="Notes"')
+        parsed = self.parse(midi)
+        self.assert_schema(self.input)
+        clips = parsed['tracks'][2]['clips']
+        self.assertEqual([c['position'] for c in clips], [[4, 'beats'], [6, 'beats'], [9, 'beats']])
+        self.assertEqual([c['duration'] for c in clips], [2, 3, 2])
+        self.assertEqual([c['offset'] for c in clips], [[1, 'beats'], [0, 'beats'], [0, 'beats']])
+        self.assertTrue(all(len(c['notes']) == 2 for c in clips))
+        output = self.root / 'midi-loops.xml'
+        self.command('rewrite', self.input, output)
+        self.assert_schema(output)
+        self.assertEqual(self.semantic(parsed), self.semantic(json.loads(self.command('parse', output).stdout)))
+
+    def test_loop_metadata_without_repetition_and_invalid_ranges(self):
+        inert = PROJECT.replace('time="4" duration="4" playStart="1" name="Notes"',
+                                'time="4" duration="4" playStart="1" loopStart="0" loopEnd="5" name="Notes"')
+        self.assertEqual(len(self.parse(inert)['tracks'][2]['clips']), 1)
+        for start, end in [('5', '5'), ('6', '5'), ('-1', '5'), ('0', '1')]:
+            bad = PROJECT.replace('time="4" duration="4" playStart="1" name="Notes"',
+                                  f'time="4" duration="4" playStart="1" loopStart="{start}" loopEnd="{end}" name="Notes"')
+            self.parse(bad, status=1)
+        missing = PROJECT.replace('time="4" duration="4" playStart="1" name="Notes"',
+                                  'time="4" duration="4" playStart="1" loopStart="0" name="Notes"')
+        self.parse(missing, status=1)
+        mixed = PROJECT.replace('name="Lead" time="8" contentTimeUnit="seconds" playStart="0.25" playStop="1.75"',
+                                'name="Lead" time="8" duration="8" contentTimeUnit="seconds" playStart="0" loopStart="0" loopEnd="1"')
+        self.assertIn('mixed-time', self.parse(mixed, status=1).stderr)
 
     def test_midi_controller_lanes_schema_roundtrip(self):
         lanes = ''

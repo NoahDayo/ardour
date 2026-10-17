@@ -492,6 +492,7 @@ void assert_graph_pcm (const std::vector<float>& pcm, unsigned rate, double tole
 class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST_SUITE (ProjectSessionTest);
 	CPPUNIT_TEST (roundtrip);
+	CPPUNIT_TEST (looped_dawproject_roundtrip);
 	CPPUNIT_TEST (multichannel_audio_roundtrip);
 	CPPUNIT_TEST (surround_aaf_roundtrip);
 	CPPUNIT_TEST (midi_controller_roundtrip);
@@ -550,6 +551,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST_SUITE_END ();
 public:
 	void roundtrip ();
+	void looped_dawproject_roundtrip ();
 	void multichannel_audio_roundtrip ();
 	void surround_aaf_roundtrip ();
 	void midi_controller_roundtrip ();
@@ -2895,6 +2897,59 @@ void ProjectSessionTest::roundtrip ()
 	fixture.session.reset ();
 	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("output.dawproject"), fixture.path ("Again"), "Again", fixture.report);
 	CPPUNIT_ASSERT (fixture.session);
+}
+
+void ProjectSessionTest::looped_dawproject_roundtrip ()
+{
+	Fixture fixture;
+	auto source = example (fixture);
+	std::string xml = R"(<Project version="1.0"><Application name="Loop fixture" version="1"/>
+<Transport><Tempo unit="bpm" value="100"/><TimeSignature numerator="4" denominator="4"/></Transport>
+<Structure><Track id="audio" name="Loop audio" contentType="audio"><Channel id="ca" audioChannels="2" destination="master"/></Track>
+<Track id="midi" name="Loop notes" contentType="notes"><Channel id="cm" audioChannels="2" destination="master"/></Track>
+<Channel id="master" name="Main" role="master" audioChannels="2"/></Structure>
+<Arrangement><Lanes><Lanes track="audio" timeUnit="seconds"><Clips><Clip time="0" duration="1.1" contentTimeUnit="seconds"
+playStart="0.1" loopStart="0.4" loopEnd="0.8" fadeTimeUnit="seconds" fadeInTime="0.2" fadeOutTime="0.2">
+<Audio id="source" timeUnit="seconds" duration="2" channels="2" sampleRate="RATE"><File path="audio/source.wav"/></Audio>
+</Clip></Clips></Lanes><Lanes track="midi" timeUnit="beats"><Clips><Clip time="4" duration="5" playStart="1" loopStart="0" loopEnd="3">
+<Notes><Note time="0" duration="0.5" key="60" vel="0.7"/><Note time="1" duration="0.5" key="67" vel="0.8"/></Notes>
+</Clip></Clips></Lanes></Lanes></Arrangement></Project>)";
+	auto rate = source.media.front ().sample_rate;
+	xml.replace (xml.find ("RATE"), 4, std::to_string (rate));
+	{
+		PX::ProjectArchiveWriter archive (fixture.path ("looped.dawproject"));
+		archive.add_text ("project.xml", xml);
+		archive.add_text ("metadata.xml", "<MetaData/>");
+		archive.add_file ("audio/source.wav", fixture.path ("source.wav"));
+		archive.finish ();
+	}
+	auto parsed = PX::DawProject::read (fixture.path ("looped.dawproject"));
+	CPPUNIT_ASSERT_EQUAL (size_t (2), track_named (parsed, "Loop audio").clips.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (2), track_named (parsed, "Loop notes").clips.size ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.1, track_named (parsed, "Loop audio").clips[0].offset.value, 1e-9);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.4, track_named (parsed, "Loop audio").clips[1].offset.value, 1e-9);
+	fixture.session = PX::SessionExchange::import_dawproject (*AudioEngine::instance (), fixture.path ("looped.dawproject"),
+	                                                        fixture.path ("Looped"), "Looped", fixture.report);
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("Looped"), "Looped", nullptr, "", true));
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("looped-return.dawproject"));
+	auto returned = PX::DawProject::read (fixture.path ("looped-return.dawproject"));
+	auto const& audio = track_named (returned, "Loop audio").clips;
+	auto const& midi = track_named (returned, "Loop notes").clips;
+	CPPUNIT_ASSERT_EQUAL (size_t (2), audio.size ()); CPPUNIT_ASSERT_EQUAL (size_t (2), midi.size ());
+	for (size_t i = 0; i < 2; ++i) {
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (parsed.tracks[0].clips[i].position.value, audio[i].position.value, 1.0 / rate);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (parsed.tracks[0].clips[i].duration, audio[i].duration, 1.0 / rate);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (parsed.tracks[0].clips[i].offset.value, audio[i].offset.value, 1.0 / rate);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (parsed.tracks[1].clips[i].position.value, midi[i].position.value, 1e-6);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (parsed.tracks[1].clips[i].offset.value, midi[i].offset.value, 1e-6);
+	}
+	CPPUNIT_ASSERT (!audio.front ().envelope.points.empty ());
+	CPPUNIT_ASSERT (!audio.back ().envelope.points.empty ());
+	CPPUNIT_ASSERT_EQUAL (size_t (2), midi[0].notes.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (2), midi[1].notes.size ());
+	std::cout << "Looped DAWproject audio, fades and MIDI notes survived session save/reopen and return" << std::endl;
 }
 
 void ProjectSessionTest::multichannel_audio_roundtrip ()
