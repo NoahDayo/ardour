@@ -433,7 +433,6 @@ void populate (Session& session, const Project& project, const std::map<std::str
 	std::map<std::string, SourceList> sources;
 	for (auto const& media : project.media) {
 		cancelled (cancel);
-		if (media.channels > 2) { throw ExchangeError ("Multichannel media is not yet supported by session exchange"); }
 		PBD::ScopedFileDescriptor fd (g_open (assets.at (media.id).c_str (), O_RDONLY
 #ifdef O_BINARY
 		                                    | O_BINARY
@@ -486,9 +485,15 @@ void populate (Session& session, const Project& project, const std::map<std::str
 	}
 	for (auto const& track : project.tracks) {
 		cancelled (cancel);
-		if (track.channels > 2) { throw ExchangeError ("Multichannel track routing is not yet supported"); }
+		if (track.channels > 2 && track.kind != TrackKind::Audio) { throw ExchangeError ("Multichannel buses and master routing are not yet supported"); }
 		if ((track.kind == TrackKind::Folder || track.kind == TrackKind::Bus) && track.channels != 2) {
 			throw ExchangeError ("Only stereo buses and folders are currently supported");
+		}
+		if (track.channels > 2 && (track.pan != .5 || !track.pan_automation.points.empty ())) {
+			throw ExchangeError (track.name + ": multichannel pan and pan automation require a rendered fallback");
+		}
+		if (track.channels > 2 && (!track.plugins.empty () || !track.sends.empty ())) {
+			throw ExchangeError (track.name + ": multichannel plug-ins and sends require a rendered fallback");
 		}
 		std::shared_ptr<Route> route;
 		std::shared_ptr<RouteGroup> group = track.parent.empty () ? std::shared_ptr<RouteGroup> () : folders.at (track.parent);
@@ -509,10 +514,16 @@ void populate (Session& session, const Project& project, const std::map<std::str
 			if (!list.empty ()) { route = list.front (); }
 		}
 		if (!route) { throw ExchangeError ("Cannot create track: " + track.name); }
+		if (track.channels > 2 && route->input ()->n_ports ().n_audio () != track.channels) {
+			throw ExchangeError (track.name + ": multichannel track input layout could not be created");
+		}
 		routes[track.id] = route;
 		route_ids[track.id] = route->id ().to_s ();
 		if (route->name () != track.name) { report.push_back ({Disposition::Transformed, track.name, "Track renamed to " + route->name ()}); }
 		if (!track.color.empty ()) { route->presentation_info ().set_color (color_value (track.color)); }
+		if (track.channels > 2) {
+			report.push_back ({Disposition::Transformed, track.name, "Multichannel source and track inputs preserved; only the first two output channels reach the stereo master. Provide a premixed stereo reference from the source DAW for complete monitoring"});
+		}
 		if (track.volume > route->gain_control ()->upper ()) { throw ExchangeError (track.name + ": gain exceeds Ardour's supported range"); }
 		if (track.channels == 2 && track.kind != TrackKind::MIDI) {
 			route->panner_shell ()->select_panner_by_uri ("http://ardour.org/plugin/panner_balance");
@@ -592,9 +603,24 @@ void populate (Session& session, const Project& project, const std::map<std::str
 		route->add_extra_xml (*metadata);
 		if (!track.master) {
 			auto target = track.destination.empty () ? session.master_out () : routes.at (track.destination);
-			if (!target || target->input ()->n_ports ().n_audio () != 2 || route->output ()->n_ports ().n_audio () != 2 ||
-			    route->output ()->connect_ports_to_bundle (target->input ()->bundle (), true, true)) {
+			if (!target || target->input ()->n_ports ().n_audio () != 2 || route->output ()->n_ports ().n_audio () < 2) {
 				throw ExchangeError ("Cannot connect imported track: " + track.name);
+			}
+			if (route->output ()->n_ports ().n_audio () == 2) {
+				if (route->output ()->connect_ports_to_bundle (target->input ()->bundle (), true, true)) {
+					throw ExchangeError ("Cannot connect imported track: " + track.name);
+				}
+			} else if (track.kind == TrackKind::Audio && track.channels > 2 && route->output ()->n_ports ().n_audio () == track.channels) {
+				for (unsigned channel = 0; channel < track.channels; ++channel) {
+					route->output ()->audio (channel)->disconnect_all ();
+				}
+				for (unsigned channel = 0; channel < 2; ++channel) {
+					if (route->output ()->audio (channel)->connect (target->input ()->audio (channel).get ())) {
+						throw ExchangeError ("Cannot connect imported multichannel track: " + track.name);
+					}
+				}
+			} else {
+				throw ExchangeError ("Cannot connect imported track output layout: " + track.name);
 			}
 			for (unsigned channel = 0; channel < 2; ++channel) {
 				if (!route->output ()->audio (channel)->connected_to (target->input ()->audio (channel).get ())) {
@@ -643,6 +669,9 @@ void populate (Session& session, const Project& project, const std::map<std::str
 			properties.add (Properties::whole_file, false);
 			properties.add (Properties::opaque, false);
 			SourceList source = midi ? midi_source (session, clip, timing, report, cancel) : sources.at (clip.media);
+			if (!midi && source.size () > 2 && source.size () != track.channels) {
+				throw ExchangeError (clip.name + ": multichannel media must match the destination track input layout");
+			}
 			auto region = RegionFactory::create (source, properties);
 			if (!region) { throw ExchangeError ("Cannot create imported region"); }
 			region->set_muted (!clip.enabled);
@@ -857,15 +886,27 @@ Automation region_envelope (AudioRegion& audio, samplecnt_t rate)
 	return multiply_automation (result, combined, quantum);
 }
 
-/* Only direct, one-to-one stereo connections can be represented by the
- * initial exchange model. Never guess a destination from the first port. */
+/* A multichannel audio track may monitor only its first two outputs through
+ * the stereo master. Never infer routing from only the first port. */
 std::string destination_for (Project& project, const std::shared_ptr<Route>& route, const RouteList& routes)
 {
 	if (route->is_master ()) { return std::string (); }
 	std::vector<std::string> connections[2];
-	if (route->output ()->n_ports ().n_audio () != 2) {
+	unsigned outputs = route->output ()->n_ports ().n_audio ();
+	bool multichannel = outputs > 2 && std::dynamic_pointer_cast<AudioTrack> (route) && route->input ()->n_ports ().n_audio () == outputs;
+	if (outputs != 2 && !multichannel) {
 		unsupported (project, route->name (), "Only stereo main outputs are supported");
 		return std::string ();
+	}
+	if (multichannel) {
+		for (unsigned channel = 2; channel < outputs; ++channel) {
+			std::vector<std::string> extra;
+			route->output ()->audio (channel)->get_connections (extra);
+			if (!extra.empty ()) {
+				unsupported (project, route->name (), "Additional multichannel output routing requires a rendered fallback");
+				return std::string ();
+			}
+		}
 	}
 	for (unsigned channel = 0; channel < 2; ++channel) {
 		route->output ()->audio (channel)->get_connections (connections[channel]);
@@ -1063,11 +1104,21 @@ Project collect (Session& session, AudioAssets& assets, const CancelCheck& cance
 		}
 		std::string panner = route->panner_shell ()->current_panner_uri ();
 		if (route->panner_shell ()->bypassed ()) { unsupported (project, track.name, "Bypassed panning cannot yet be exchanged"); }
+		bool neutral_multichannel = track.kind == TrackKind::Audio && track.channels > 2 &&
+		                             route->output ()->n_ports ().n_audio () == track.channels &&
+		                             route->panner_shell ()->user_selected_panner_uri ().empty () &&
+		                             std::fabs (track.pan - .5) < 1e-6 && track.pan_automation.points.empty ();
+		if (neutral_multichannel) {
+			for (auto const& control : {route->pan_width_control (), route->pan_elevation_control (), route->pan_frontback_control (), route->pan_lfe_control ()}) {
+				check_control (project, track.name + " multichannel pan", control);
+				if (control && std::fabs (control->get_value () - (control == route->pan_width_control () ? 1.0 : control->normal ())) > 1e-6) { neutral_multichannel = false; }
+			}
+		}
 		if (panner == "http://ardour.org/plugin/panner_2in2out") {
 			if (std::fabs (route->pan_width_control ()->get_value () - 1) > 1e-6 || std::fabs (track.pan - 0.5) > 1e-6 || !track.pan_automation.points.empty ()) {
 				unsupported (project, track.name, "Stereo position and width panning cannot yet be exchanged; use a balance panner");
 			}
-		} else if (!panner.empty () && panner != "http://ardour.org/plugin/panner_balance" && panner != "http://ardour.org/plugin/panner_1in2out") {
+		} else if (!neutral_multichannel && !panner.empty () && panner != "http://ardour.org/plugin/panner_balance" && panner != "http://ardour.org/plugin/panner_1in2out") {
 			unsupported (project, track.name, "Unsupported panner");
 		}
 		bool after_fader = false, after_send = false;
@@ -1565,6 +1616,18 @@ void copy_native_audio (const std::string& source, const std::string& destinatio
 	}
 }
 
+void check_rendered_stereo_layout (Session& session, std::vector<Diagnostic>& report)
+{
+	for (auto const& route : *session.get_routes ()) {
+		if (route->is_auditioner () || route->is_monitor ()) { continue; }
+		if (route->input ()->n_ports ().n_audio () > 2 || route->output ()->n_ports ().n_audio () > 2) {
+			std::string detail = "Stereo rendering would omit multichannel audio; provide a premixed stereo reference from the source DAW";
+			report.push_back ({Disposition::Unsupported, route->name (), detail});
+			throw ExchangeError (route->name () + ": " + detail);
+		}
+	}
+}
+
 } // namespace
 
 std::vector<Diagnostic>
@@ -1671,6 +1734,7 @@ SessionExchange::export_dawproject (Session& session, const std::string& destina
 	FileObject target = file_object (destination);
 	if (g_file_query_exists (target.get (), NULL)) { throw ExchangeError ("Export destination already exists"); }
 	cancelled (cancel);
+	if (options.rendered ()) { check_rendered_stereo_layout (session, report); }
 	AudioAssets assets;
 	Project project = options.rendered () ? collect_rendered (session, options) : collect (session, assets, cancel);
 	report = project.report;
@@ -1704,8 +1768,12 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 	FileObject target = file_object (destination);
 	if (g_file_query_exists (target.get (), NULL)) { throw ExchangeError ("Export destination already exists"); }
 	cancelled (cancel);
+	if (options.rendered ()) { check_rendered_stereo_layout (session, report); }
 	AudioAssets assets;
 	Project project = options.rendered () ? collect_rendered (session, options) : collect (session, assets, cancel);
+	for (auto const& media : project.media) {
+		if (media.channels > 2) { unsupported (project, media.id, "AAF/MIDI preserves mono and stereo media; render multichannel audio to a stereo mix or stems"); }
+	}
 	std::string master;
 	for (auto const& track : project.tracks) { if (track.master) { master = track.id; } }
 	for (auto const& track : project.tracks) {
@@ -1718,6 +1786,9 @@ SessionExchange::export_logic (Session& session, const std::string& destination,
 		}
 		if (track.kind == TrackKind::Bus || track.kind == TrackKind::Folder || !track.parent.empty () || track.destination != master) {
 			unsupported (project, track.name, "AAF/MIDI export currently requires tracks connected directly to the master, without folders or buses");
+		}
+		if (track.kind == TrackKind::Audio && track.channels > 2) {
+			unsupported (project, track.name, "AAF/MIDI supports mono and stereo tracks; render multichannel audio to a stereo mix or stems");
 		}
 		if (!track.sends.empty ()) { unsupported (project, track.name, "AAF/MIDI export cannot preserve bus sends; render or remove them first"); }
 		if (!track.plugins.empty ()) { unsupported (project, track.name, "AAF/MIDI cannot preserve VST3 plugin state; render processing first"); }
@@ -1885,6 +1956,7 @@ SessionExchange::export_studio_one (Session& session, const std::string& destina
 	if (!Glib::path_is_absolute (destination)) { throw ExchangeError ("Export destination must be absolute"); }
 	FileObject target = file_object (destination);
 	if (g_file_query_exists (target.get (), NULL)) { throw ExchangeError ("Export destination already exists"); }
+	if (options.rendered ()) { check_rendered_stereo_layout (session, report); }
 	cancelled (cancel); AudioAssets assets; StudioOneSongData song;
 	song.project = options.rendered () ? collect_rendered (session, options) : collect (session, assets, cancel);
 	song.title = session.name (); song.sample_rate = session.sample_rate (); song.format_version = options.studio_one_format_version;

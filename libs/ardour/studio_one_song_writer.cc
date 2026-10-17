@@ -204,12 +204,12 @@ std::vector<Diagnostic> StudioOneSong::export_report (const Project& project)
 	std::set<std::string> folders;
 	for (auto const& track : project.tracks) { if (track.kind == TrackKind::Folder) { folders.insert (track.id); } }
 	if (master.empty ()) { unsupported ("Master", "Native song export requires a stereo master output"); }
-	for (auto const& media : project.media) { if (media.channels > 2) { unsupported (media.id, "Native multichannel audio requires the stereo rendered mix option"); } }
+	for (auto const& media : project.media) { if (media.channels > 2) { unsupported (media.id, "Native multichannel audio requires premixed stereo media from the source DAW"); } }
 	for (auto const& marker : project.markers) {
 		if (marker.duration > 0) { unsupported (marker.name, "Native song range marker encoding has not been verified; export AAF/MIDI to preserve its duration"); }
 	}
 	for (auto const& track : project.tracks) {
-		if (track.channels > 2) { unsupported (track.name, "Native multichannel tracks require the stereo rendered mix option"); }
+		if (track.channels > 2) { unsupported (track.name, "Native multichannel tracks require premixed stereo media from the source DAW"); }
 		if (track.master) {
 			if (track.channels != 2 || track.pan != .5) { unsupported (track.name, "Native master export requires stereo with centered balance"); }
 		} else if (!track.parent.empty () && !folders.count (track.parent)) {
