@@ -484,6 +484,19 @@ class NativeSongTest(unittest.TestCase):
         project = self.read(path=self.song)["project"]
         self.assertFalse(any("automation member is missing" in d["detail"] for d in project["report"]))
 
+    def test_native_midi_instrument_route_preserves_notes_with_report(self):
+        self.entries["Devices/musictrackdevice.xml"] = MUSIC.replace(
+            '<MusicTrackChannel>',
+            '<MusicTrackChannel><Connection x:id="destination" objectID="synth/MusicInput00"/>')
+        project = self.read()["project"]
+        self.assertEqual(len(project["tracks"][1]["clips"][0]["notes"]), 2)
+        self.assertTrue(any(d["disposition"] == 3 and "instrument routing" in d["detail"]
+                            for d in project["report"]))
+        self.writable_fixture()
+        output, error = self.export(status=1)
+        self.assertIn("instrument routing", error)
+        self.assertFalse(output.exists())
+
     def test_format_seven_audio_song_converts_to_format_nine(self):
         self.entries["metainfo.xml"] = META.replace('value="9"', 'value="7"')
         before = self.read()["project"]
@@ -507,6 +520,15 @@ class NativeSongTest(unittest.TestCase):
         self.assertEqual(by_name["Voiceover 2"]["sends"][0]["destination"], by_name["Room"]["id"])
         self.assertTrue(any(d["disposition"] == 3 and "sidechain" in d["detail"] for d in project["report"]))
         self.assertFalse(any("automation member is missing" in d["detail"] for d in project["report"]))
+
+    def test_application_authored_instrument_template(self):
+        sample = os.environ.get("ARDOUR_STUDIO_ONE_INSTRUMENT_TEMPLATE")
+        if not sample:
+            self.skipTest("Pass an installed Studio Pro instrument .data template privately")
+        project = self.read(path=Path(sample))["project"]
+        self.assertEqual(sum(t["kind"] == 1 for t in project["tracks"]), 3)
+        self.assertTrue(any(d["disposition"] == 3 and "instrument routing" in d["detail"]
+                            for d in project["report"]))
 
     def test_native_vst3_insert_reads_embedded_state_without_silent_loss(self):
         class_id = "00112233445566778899AABBCCDDEEFF"

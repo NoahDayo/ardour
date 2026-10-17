@@ -372,8 +372,13 @@ void Reader::channel (Track& track, Node n)
 	if (Node connection = child (n, "Connection", "destination")) {
 		std::string target = value (connection, "objectID");
 		auto slash = target.find ('/');
-		require (slash != std::string::npos && target.substr (slash) == "/Input", "Unsupported native channel routing");
-		track.destination = target.substr (0, slash);
+		if (slash != std::string::npos && target.substr (slash) == "/Input") {
+			track.destination = target.substr (0, slash);
+		} else if (track.kind == TrackKind::MIDI && slash != std::string::npos && target.substr (slash) == "/MusicInput00") {
+			unsupported (track.name, "Native instrument routing is not yet supported");
+		} else {
+			throw ExchangeError ("Unsupported native channel routing");
+		}
 	}
 	if (Node rack = child (n, "Attributes", "Sends")) { sends (track, rack); }
 }
