@@ -431,6 +431,7 @@ void populate (Session& session, const Project& project, const std::map<std::str
 	populate_tempo (project, report);
 
 	std::map<std::string, SourceList> sources;
+	std::map<std::string, unsigned> source_rates;
 	for (auto const& media : project.media) {
 		cancelled (cancel);
 		PBD::ScopedFileDescriptor fd (g_open (assets.at (media.id).c_str (), O_RDONLY
@@ -460,6 +461,7 @@ void populate (Session& session, const Project& project, const std::map<std::str
 		cancelled (cancel);
 		if (status.cancel || status.sources.size () != media.channels) { throw ExchangeError ("Failed to import project audio: " + media.path); }
 		sources[media.id] = status.sources;
+		source_rates[media.id] = media.sample_rate;
 		if (info.samplerate != session.sample_rate ()) {
 			report.push_back ({Disposition::Transformed, media.id, "Audio resampled to the session sample rate"});
 		}
@@ -657,10 +659,28 @@ void populate (Session& session, const Project& project, const std::map<std::str
 			double position = timing.convert (clip.position, native_unit);
 			double duration = timing.duration (Time (clip.duration, clip.position.unit), clip.position, native_unit);
 			double offset = timing.content (clip.offset, clip.position, clip.offset, native_unit);
+			samplecnt_t audio_length = 0;
+			if (!midi) {
+				const samplecnt_t rate = session.sample_rate ();
+				const samplecnt_t start = samples (offset, rate);
+				audio_length = samples (duration, rate);
+				const auto& imported = sources.at (clip.media);
+				samplecnt_t available = imported.front ()->length ().samples ();
+				for (auto const& channel : imported) { available = std::min (available, channel->length ().samples ()); }
+				if (start >= available) { throw ExchangeError (clip.name + ": audio offset exceeds imported source"); }
+				if (audio_length > available - start) {
+					const samplecnt_t excess = audio_length - (available - start);
+					const samplecnt_t rounding = 1 + static_cast<samplecnt_t> (std::ceil (double (rate) / source_rates.at (clip.media)));
+					if (excess > rounding) { throw ExchangeError (clip.name + ": audio clip exceeds imported source after resampling"); }
+					audio_length -= excess;
+					duration = double (audio_length) / rate;
+					report.push_back ({Disposition::Transformed, clip.name, "Clip end rounded to available source frames after audio import"});
+				}
+			}
 			if (midi) { beats (position + duration); beats (offset + duration); }
 			else { samples (position + duration, session.sample_rate ()); samples (offset + duration, session.sample_rate ()); }
 			Temporal::timepos_t pos = midi ? Temporal::timepos_t (beats (position)) : Temporal::timepos_t (samples (position, session.sample_rate ()));
-			Temporal::timecnt_t length = midi ? Temporal::timecnt_t (beats (duration), pos) : Temporal::timecnt_t (samples (duration, session.sample_rate ()), pos);
+			Temporal::timecnt_t length = midi ? Temporal::timecnt_t (beats (duration), pos) : Temporal::timecnt_t (audio_length, pos);
 			if (!length.is_positive ()) { throw ExchangeError ("Clip is shorter than the session timing resolution"); }
 			PBD::PropertyList properties;
 			properties.add (Properties::start, midi ? Temporal::timepos_t (beats (offset)) : Temporal::timepos_t (samples (offset, session.sample_rate ())));

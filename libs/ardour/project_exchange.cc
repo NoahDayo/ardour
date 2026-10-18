@@ -267,10 +267,11 @@ linearize_automation (const Automation& input, double quantum)
 	for (size_t i = 0; i < input.points.size (); ++i) {
 		auto point = input.points[i]; point.time = std::round (point.time / quantum) * quantum;
 		if (i) {
-			// A boundary converted through beats and seconds can differ from
-			// the same explicit point by a few floating-point ulps.
+			// Two equally valued points can land on the same audio sample after
+			// a clip is trimmed or its source is resampled. Keeping either one
+			// gives the same rendered envelope at this resolution. Differing
+			// values still need to be rejected rather than silently discarded.
 			if (point.time == output.points.back ().time &&
-			    std::fabs (input.points[i].time - input.points[i - 1].time) <= 64 * std::numeric_limits<double>::epsilon () * std::max (1.0, std::fabs (input.points[i].time)) &&
 			    std::fabs (point.value - output.points.back ().value) <= 1e-12 * std::max (1.0, std::fabs (point.value))) { continue; }
 			require (point.time > output.points.back ().time, "Envelope points collide at audio resolution");
 			if (!input.points[i - 1].linear && input.points[i - 1].value != point.value && point.time - quantum > output.points.back ().time + quantum * .001) {

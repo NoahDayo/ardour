@@ -95,6 +95,8 @@ class LogicSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (saved_session_export);
 	CPPUNIT_TEST (range_marker_roundtrip);
 	CPPUNIT_TEST (paired_mono_layout);
+	CPPUNIT_TEST (resampled_source_end);
+	CPPUNIT_TEST (subsample_terminal_envelope);
 	CPPUNIT_TEST (stereo_balance_roundtrip);
 	CPPUNIT_TEST (stereo_balance_gain_automation_roundtrip);
 	CPPUNIT_TEST (stereo_balance_automation_roundtrip);
@@ -118,6 +120,8 @@ public:
 	void saved_session_export ();
 	void range_marker_roundtrip ();
 	void paired_mono_layout ();
+	void resampled_source_end ();
+	void subsample_terminal_envelope ();
 	void stereo_balance_roundtrip ();
 	void stereo_balance_gain_automation_roundtrip ();
 	void stereo_balance_automation_roundtrip ();
@@ -194,6 +198,49 @@ void LogicSessionTest::stereo_pairwise_overlap ()
 		}
 	}
 	regions.reset (); restored.reset ();
+}
+
+void LogicSessionTest::resampled_source_end ()
+{
+	Fixture fixture;
+	const char* data = g_getenv ("ARDOUR_TEST_PATH"); CPPUNIT_ASSERT (data);
+	{
+		EnvironmentOverride helper ("ARDOUR_LOGIC_HELPER", Glib::build_filename (data, "aaf_stereo_layout.py"));
+		PX::SessionExchange::export_logic (*fixture.session, fixture.path ("ResampleFixtures"), fixture.report);
+	}
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	CPPUNIT_ASSERT_EQUAL (0, AudioEngine::instance ()->set_sample_rate (48000));
+	const std::string source = fixture.path ("ResampleFixtures/ResampleEnd.aaf");
+	PX::LogicProject model (source);
+	CPPUNIT_ASSERT (!PX::has_unsupported_features (model.project ()));
+	CPPUNIT_ASSERT_EQUAL (size_t (1), model.project ().tracks[1].clips.size ());
+	CPPUNIT_ASSERT_EQUAL (samplecnt_t (48000), AudioEngine::instance ()->sample_rate ());
+	fixture.session = PX::SessionExchange::import_logic (*AudioEngine::instance (), source, "",
+		fixture.path ("Resampled"), "Resampled", fixture.report);
+	auto track = std::dynamic_pointer_cast<Track> (fixture.session->route_by_name ("Stereo split"));
+	CPPUNIT_ASSERT (track && track->playlist ());
+	CPPUNIT_ASSERT_EQUAL (size_t (1), track->playlist ()->region_list ()->size ());
+	auto region = std::dynamic_pointer_cast<AudioRegion> (*track->playlist ()->region_list ()->begin ());
+	CPPUNIT_ASSERT (region && region->audio_source ());
+	CPPUNIT_ASSERT (region->start_sample () + region->length_samples () <= region->audio_source ()->length ().samples ());
+	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& item) {
+		return item.detail.find ("Clip end rounded to available source frames") != std::string::npos;
+	}));
+}
+
+void LogicSessionTest::subsample_terminal_envelope ()
+{
+	const double sample = 1.0 / 48000;
+	const double end = 308254 * sample;
+	PX::Automation envelope;
+	envelope.unit = PX::TimeUnit::Seconds;
+	envelope.points = {{0, 1, true}, {end - .000008, .5, true}, {end, .5, true}};
+	auto rounded = PX::linearize_automation (envelope, sample);
+	CPPUNIT_ASSERT_EQUAL (size_t (2), rounded.points.size ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (end, rounded.points.back ().time, sample * .001);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (.5, rounded.points.back ().value, 1e-12);
+	envelope.points.back ().value = .25;
+	CPPUNIT_ASSERT_THROW (PX::linearize_automation (envelope, sample), PX::ExchangeError);
 }
 
 void LogicSessionTest::paired_mono_layout ()

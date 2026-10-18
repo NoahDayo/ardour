@@ -13,13 +13,14 @@ import aaf2
 
 def make_fixture(path, rate=48000, right_position=12000, empty_pair=True, independent_levels=False,
                  proportional_levels=False, one_tag=False, terminal_duplicate=False,
-                 rounded_duplicate=False, conflicting_duplicate=False):
+                 rounded_duplicate=False, conflicting_duplicate=False, source_frames=None,
+                 clip_start=6000, clip_length=24000, left_position=12000, mono=False):
     sources = []
-    for name, sample in (("Left", 4096), ("Right", -8192)):
+    for name, sample in (("Left", 4096),) if mono else (("Left", 4096), ("Right", -8192)):
         source = path.with_name(path.stem + "-" + name + ".wav")
         with wave.open(str(source), "wb") as audio:
             audio.setparams((1, 2, rate, rate * 2, "NONE", "not compressed"))
-            audio.writeframes(struct.pack("<h", sample) * (rate * 2))
+            audio.writeframes(struct.pack("<h", sample) * (source_frames or rate * 2))
         sources.append(source)
     try:
         with aaf2.open(str(path), "w") as output:
@@ -53,11 +54,11 @@ def make_fixture(path, rate=48000, right_position=12000, empty_pair=True, indepe
                 slot = composition.create_sound_slot(edit_rate=rate)
                 slot.name = "Stereo split"
                 slot["PhysicalTrackNumber"].value = channel
-                position = 12000 if channel == 1 else right_position
+                position = left_position if channel == 1 else right_position
                 slot.segment.components.append(output.create.Filler("sound", position))
                 slot.segment.components.append(master.create_source_clip(
-                    source_slot.slot_id, start=6000, length=24000, media_kind="sound"))
-                slot.segment.length = position + 24000
+                    source_slot.slot_id, start=clip_start, length=clip_length, media_kind="sound"))
+                slot.segment.length = position + clip_length
                 if independent_levels:
                     group = output.create.OperationGroup(definition, slot.segment.length, media_kind="sound")
                     group.segments.append(slot.segment.copy())
@@ -113,6 +114,8 @@ if __name__ == "__main__":
                  rounded_duplicate=True)
     make_fixture(destination / "ConflictingDuplicate.aaf", empty_pair=False, independent_levels=True,
                  conflicting_duplicate=True)
+    make_fixture(destination / "ResampleEnd.aaf", rate=44100, right_position=0, empty_pair=False,
+                 source_frames=285890, clip_start=2681, clip_length=283209, left_position=0, mono=True)
     (destination / "Project.mid").write_bytes(bytes.fromhex(
         "4d54686400000006000000014b004d54726b0000000400ff2f00"))
     (destination / "Metadata.xml").write_text("<IndependentFixture/>", encoding="utf-8")
