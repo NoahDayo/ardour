@@ -523,6 +523,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (native_song_timing_and_gain);
 	CPPUNIT_TEST (native_song_fades);
 	CPPUNIT_TEST (native_song_export_roundtrip);
+	CPPUNIT_TEST (native_song_marker_extents);
 	CPPUNIT_TEST (native_song_export_guards);
 	CPPUNIT_TEST (native_song_render_export);
 	CPPUNIT_TEST (native_song_render_reference);
@@ -586,6 +587,7 @@ public:
 	void native_song_timing_and_gain ();
 	void native_song_fades ();
 	void native_song_export_roundtrip ();
+	void native_song_marker_extents ();
 	void native_song_export_guards ();
 	void native_song_render_export ();
 	void native_song_render_reference ();
@@ -971,6 +973,24 @@ void ProjectSessionTest::native_song_export_roundtrip ()
 		CPPUNIT_ASSERT_DOUBLES_EQUAL (expected.release_velocity, actual.release_velocity, 1e-6);
 	}
 	std::cout << "Native song audio/MIDI export, relocation and session reopen passed" << std::endl;
+}
+
+void ProjectSessionTest::native_song_marker_extents ()
+{
+	Fixture fixture; PX::StudioOneSongData song; song.project = example (fixture);
+	for (auto& track : song.project.tracks) { if (!track.master) { track.destination = "master"; } }
+	song.project.tempos = {{PX::Time (0), 100, false}, {PX::Time (3), 120, false}};
+	song.project.markers = {{"Seconds cue", PX::Time (19, PX::TimeUnit::Seconds)},
+	                        {"Late beat cue", PX::Time (40)}};
+	song.title = "Marker extents"; song.sample_rate = song.project.media.front ().sample_rate;
+	song.audio_files.emplace (song.project.media.front ().id, fixture.path ("source.wav"));
+	PX::StudioOneSong::write (song, fixture.path ("marker-extents.song"), fixture.path ("marker-extents.song"));
+	auto returned = PX::StudioOneSong::read (fixture.path ("marker-extents.song"));
+	CPPUNIT_ASSERT (returned.has_range);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (20.3, returned.end.value, 1e-9);
+	CPPUNIT_ASSERT_EQUAL (size_t (2), returned.project.markers.size ());
+	CPPUNIT_ASSERT_EQUAL (std::string ("Late beat cue"), returned.project.markers[1].name);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (40, returned.project.markers[1].position.value, 1e-9);
 }
 
 void ProjectSessionTest::native_song_export_guards ()
