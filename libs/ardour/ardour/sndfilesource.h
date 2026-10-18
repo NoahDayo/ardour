@@ -24,6 +24,8 @@
 
 #pragma once
 
+#include <mutex>
+
 #include <sndfile.h>
 
 #include "ardour/audiofilesource.h"
@@ -99,6 +101,8 @@ class LIBARDOUR_API SndFileSource : public AudioFileSource {
 	void set_natural_position (timepos_t const &);
 	samplecnt_t nondestructive_write_unlocked (Sample const *src, samplecnt_t cnt);
 	PBD::ScopedConnection header_position_connection;
+	/* Keep seek/read/write and close operations on one SNDFILE handle atomic. */
+	mutable std::mutex _sndfile_mutex;
 };
 
 } // namespace ARDOUR

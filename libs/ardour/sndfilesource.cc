@@ -348,6 +348,7 @@ SndFileSource::init_sndfile ()
 void
 SndFileSource::close ()
 {
+	std::lock_guard<std::mutex> lock (_sndfile_mutex);
 	if (_sndfile) {
 		sf_close (_sndfile);
 		_sndfile = 0;
@@ -507,6 +508,7 @@ samplecnt_t
 SndFileSource::read_unlocked (Sample *dst, samplepos_t start, samplecnt_t cnt) const
 {
 	assert (cnt >= 0);
+	std::lock_guard<std::mutex> lock (_sndfile_mutex);
 
 	samplecnt_t nread;
 	float *ptr;
@@ -605,6 +607,7 @@ SndFileSource::read_unlocked (Sample *dst, samplepos_t start, samplecnt_t cnt) c
 samplecnt_t
 SndFileSource::write_unlocked (Sample const * data, samplecnt_t cnt)
 {
+	std::lock_guard<std::mutex> lock (_sndfile_mutex);
         if (open()) {
                 return 0; // failure
         }
@@ -660,6 +663,7 @@ SndFileSource::update_header (samplepos_t when, struct tm& now, time_t tnow)
 int
 SndFileSource::flush_header ()
 {
+	std::lock_guard<std::mutex> lock (_sndfile_mutex);
 	if (!writable()) {
 		warning << string_compose (_("attempt to flush a non-writable audio file source (%1)"), _path) << endmsg;
 		return -1;
@@ -678,6 +682,7 @@ SndFileSource::flush_header ()
 void
 SndFileSource::flush ()
 {
+	std::lock_guard<std::mutex> lock (_sndfile_mutex);
 	if (!writable()) {
 		warning << string_compose (_("attempt to flush a non-writable audio file source (%1)"), _path) << endmsg;
 		return;
@@ -722,6 +727,7 @@ SndFileSource::setup_broadcast_info (samplepos_t /*when*/, struct tm& now, time_
 void
 SndFileSource::set_header_natural_position ()
 {
+	std::lock_guard<std::mutex> lock (_sndfile_mutex);
 	if (!(_flags & Broadcast)) {
 		return;
 	}
