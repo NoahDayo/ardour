@@ -524,6 +524,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (native_song_fades);
 	CPPUNIT_TEST (native_song_export_roundtrip);
 	CPPUNIT_TEST (native_song_marker_extents);
+	CPPUNIT_TEST (native_song_transport_extents);
 	CPPUNIT_TEST (native_song_export_guards);
 	CPPUNIT_TEST (native_song_render_export);
 	CPPUNIT_TEST (native_song_render_reference);
@@ -588,6 +589,7 @@ public:
 	void native_song_fades ();
 	void native_song_export_roundtrip ();
 	void native_song_marker_extents ();
+	void native_song_transport_extents ();
 	void native_song_export_guards ();
 	void native_song_render_export ();
 	void native_song_render_reference ();
@@ -991,6 +993,23 @@ void ProjectSessionTest::native_song_marker_extents ()
 	CPPUNIT_ASSERT_EQUAL (size_t (2), returned.project.markers.size ());
 	CPPUNIT_ASSERT_EQUAL (std::string ("Late beat cue"), returned.project.markers[1].name);
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (40, returned.project.markers[1].position.value, 1e-9);
+}
+
+void ProjectSessionTest::native_song_transport_extents ()
+{
+	Fixture fixture; PX::StudioOneSongData song; song.project = example (fixture);
+	for (auto& track : song.project.tracks) { if (!track.master) { track.destination = "master"; } }
+	song.project.tempos = {{PX::Time (0), 100, false}, {PX::Time (20), 80, false}};
+	song.project.meters = {{PX::Time (0), 3, 4}, {PX::Time (33), 4, 4}};
+	song.title = "Transport extents"; song.sample_rate = song.project.media.front ().sample_rate;
+	song.audio_files.emplace (song.project.media.front ().id, fixture.path ("source.wav"));
+	PX::StudioOneSong::write (song, fixture.path ("transport-extents.song"), fixture.path ("transport-extents.song"));
+	auto returned = PX::StudioOneSong::read (fixture.path ("transport-extents.song"));
+	CPPUNIT_ASSERT (returned.has_range);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (21.75, returned.end.value, 1e-9);
+	CPPUNIT_ASSERT_EQUAL (size_t (2), returned.project.tempos.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (2), returned.project.meters.size ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (33, returned.project.meters.back ().position.value, 1e-9);
 }
 
 void ProjectSessionTest::native_song_export_guards ()

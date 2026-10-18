@@ -303,6 +303,12 @@ void StudioOneSong::write (const StudioOneSongData& song, const std::string& fil
 	if (!song.has_range) { for (auto const& marker : project.markers) {
 		end = std::max (end, timing.convert (Time (marker.position.value + marker.duration, marker.position.unit), TimeUnit::Seconds));
 	} }
+	if (!song.has_range) { for (auto const& tempo : project.tempos) {
+		end = std::max (end, timing.convert (tempo.position, TimeUnit::Seconds));
+	} }
+	if (!song.has_range) { for (auto const& meter : project.meters) {
+		end = std::max (end, timing.convert (meter.position, TimeUnit::Seconds));
+	} }
 	if (!song.has_range) { end = std::max (end, 1.0); }
 	require (std::isfinite (begin) && std::isfinite (end) && begin >= 0 && end > begin, "Invalid native song range");
 	std::map<std::string, std::string> channels, channel_names, track_ids, media_ids;
