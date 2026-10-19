@@ -147,7 +147,7 @@ class LogicWriterTest(unittest.TestCase):
                 self.root.find("Marker").set("seconds", value)
                 result = self.run_writer()
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("marker time" if value != "NaN" else "Nonfinite seconds", result.stderr)
+                self.assertIn("Invalid AAF marker range" if value != "NaN" else "Nonfinite seconds", result.stderr)
 
     def test_embedded_audio_mixer_and_coordinated_midi(self):
         result = self.run_writer()
@@ -223,6 +223,27 @@ class LogicWriterTest(unittest.TestCase):
         meters = [(tick / PPQN, payload[:2]) for tick, status, kind, payload in tracks[0] if kind == 88]
         self.assertEqual(meters, [(0, bytes([4, 2])), (4.25, bytes([3, 2])), (8.25, bytes([7, 3]))])
         self.assertTrue(all(track[-1][0] == 24 * PPQN for track in tracks))
+
+    def test_logic_authored_tempo_profile(self):
+        # Timing recovered from a public Logic Pro X 10.4.1 project. Its
+        # original audio is unavailable, so exercise only the musical map.
+        profile = [
+            (0, 233, 257511), (56.5, 370, 162162),
+            (95.5, 370, 162162), (123, 200, 300000),
+            (148, 700, 85714), (240.75, 145, 413793),
+            (248.5, 115, 521739), (253.75, 76, 789474),
+            (256, 700, 85714), (346, 260, 230769),
+        ]
+        self.root.set("durationBeats", "400")
+        for beat, bpm, _ in profile:
+            ET.SubElement(self.root, "Tempo", time=str(beat), bpm=str(bpm))
+        result = self.run_writer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tracks = read_midi(self.output / "Project.mid")
+        actual = [(tick / PPQN, int.from_bytes(payload, "big"))
+                  for tick, status, kind, payload in tracks[0] if kind == 81]
+        self.assertEqual(actual, [(beat, micros) for beat, _, micros in profile])
+        self.assertTrue(all(track[-1][0] == 400 * PPQN for track in tracks))
 
     def test_rejects_transport_tick_collision(self):
         ET.SubElement(self.root, "Tempo", time="1", bpm="100")
