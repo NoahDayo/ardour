@@ -2040,7 +2040,10 @@ void
 SessionExchange::export_studio_one (Session& session, const std::string& destination, std::vector<Diagnostic>& report, const ExportOptions& options, CancelCheck cancel)
 {
 	report.clear ();
-	if (options.studio_one_format_version < 7 || options.studio_one_format_version > 9) { throw ExchangeError ("Native song export format must be 7, 8 or 9"); }
+	if (options.studio_one_format_version != 2 &&
+	    (options.studio_one_format_version < 7 || options.studio_one_format_version > 9)) {
+		throw ExchangeError ("Native song export format must be 2, 7, 8 or 9");
+	}
 	if (options.render_editable_references && !options.rendered ()) { throw ExchangeError ("Editable reference tracks require a rendered native song export"); }
 	if (session.transport_rolling () || session.actively_recording ()) { throw ExchangeError ("Stop playback and recording before exporting a project"); }
 	if (!Glib::path_is_absolute (destination)) { throw ExchangeError ("Export destination must be absolute"); }
@@ -2057,7 +2060,7 @@ SessionExchange::export_studio_one (Session& session, const std::string& destina
 	song.has_range = true;
 	song.start = Time (options.rendered () ? 0 : double (session.current_start_sample ()) / session.sample_rate (), TimeUnit::Seconds);
 	song.end = Time (options.rendered () ? song.project.media.front ().duration : double (session.current_end_sample ()) / session.sample_rate (), TimeUnit::Seconds);
-	report = StudioOneSong::export_report (song.project);
+	report = StudioOneSong::export_report (song.project, song.format_version);
 	for (auto const& item : report) { if (item.disposition == Disposition::Unsupported) { throw ExchangeError (item.object + ": " + item.detail); } }
 	report.push_back ({Disposition::Transformed, "Native song format", "Format " + std::to_string (song.format_version) + " selected; opening and playback in the target DAW have not yet been verified"});
 	OwnedDirectory stage (Glib::path_get_dirname (destination));

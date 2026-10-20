@@ -28,6 +28,7 @@ class LIBARDOUR_API StudioOneSong {
 public:
 	static StudioOneSongData read (const std::string& filename, CancelCheck = CancelCheck ());
 	static std::vector<Diagnostic> export_report (const Project&);
+	static std::vector<Diagnostic> export_report (const Project&, unsigned format_version);
 	/* Media must already be collected below filename's parent. document_path
 	 * is the final song filename after the caller publishes its staged folder;
 	 * this avoids putting temporary paths into the native document. */

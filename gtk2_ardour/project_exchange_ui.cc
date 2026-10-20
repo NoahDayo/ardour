@@ -370,10 +370,11 @@ static void export_project (Gtk::Window* parent, ExportKind kind)
 	Gtk::HBox native_format_row (false, 8);
 	Gtk::Label native_format_label (_("Target song format:"));
 	Gtk::ComboBoxText native_format;
+	native_format.append_text (_("Studio One 2 (format 2)"));
 	native_format.append_text (_("Studio One 6 (format 7)"));
 	native_format.append_text (_("Studio One 7 (format 8)"));
 	native_format.append_text (_("Fender Studio Pro 8 (format 9)"));
-	native_format.set_active (2);
+	native_format.set_active (3);
 	native_format_row.pack_start (native_format_label, false, false);
 	native_format_row.pack_start (native_format, true, true);
 	if (native) { options_box.pack_start (native_format_row, false, false); }
@@ -415,7 +416,10 @@ static void export_project (Gtk::Window* parent, ExportKind kind)
 	options.render_stems = render_mode.get_active_row_number () == 2;
 	options.render_editable_references = (native || dawproject) && options.rendered () && editable_references.get_active ();
 	options.render_tail_seconds = tail.get_value ();
-	if (native && native_format.get_active_row_number () >= 0) { options.studio_one_format_version = 7 + native_format.get_active_row_number (); }
+	if (native && native_format.get_active_row_number () >= 0) {
+		options.studio_one_format_version = native_format.get_active_row_number () == 0 ? 2 :
+		                                    6 + native_format.get_active_row_number ();
+	}
 	dialog.hide ();
 	if (dawproject && (destination.size () < 11 || g_ascii_strcasecmp (destination.c_str () + destination.size () - 11, ".dawproject"))) { destination += ".dawproject"; }
 	std::vector<PX::Diagnostic> report;

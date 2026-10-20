@@ -112,6 +112,22 @@ std::string music (const Clip& clip, const TimeMap& timing, const CancelCheck& c
 	out += ']'; key (out, "envelopes"); out += "[]}"; return out;
 }
 
+std::string legacy_music (const Clip& clip, const TimeMap& timing, const CancelCheck& cancel) {
+	Document performance ("MusicPerformance"); prop (performance.root, "timeFormat", 2);
+	for (auto const& note : clip.notes) {
+		check (cancel);
+		double start = timing.content (Time (note.time, clip.offset.unit), clip.position, clip.offset, TimeUnit::Beats);
+		double end = timing.content (Time (note.time + note.duration, clip.offset.unit), clip.position, clip.offset, TimeUnit::Beats);
+		require (std::isfinite (start) && std::isfinite (end) && end > start, "Invalid legacy native MIDI note timing");
+		Node event = node (performance.root, "NoteEvent");
+		prop (event, "start", start); prop (event, "length", end - start);
+		prop (event, "pitch", note.key); prop (event, "velocity", note.velocity);
+		if (note.channel) { prop (event, "channel", note.channel); }
+		if (note.release_velocity != .5) { prop (event, "releaseVelocity", note.release_velocity); }
+	}
+	return performance.text ();
+}
+
 std::string envelope (const Automation& curve, const TimeMap& timing, bool pan, const CancelCheck& cancel) {
 	std::string out = "{";
 	if (pan) { key (out, "bipolar"); out += "i\x01"; }
@@ -199,6 +215,12 @@ unsigned audio_format (const std::string& filename, const Media& media) {
 
 std::vector<Diagnostic> StudioOneSong::export_report (const Project& project)
 {
+	return export_report (project, 9);
+}
+
+std::vector<Diagnostic> StudioOneSong::export_report (const Project& project, unsigned format_version)
+{
+	require (format_version == 2 || (format_version >= 7 && format_version <= 9), "Native song export format must be 2, 7, 8 or 9");
 	validate_project (project); TimeMap timing (project); std::vector<Diagnostic> report = project.report;
 	auto unsupported = [&] (const std::string& name, const std::string& detail) { report.push_back ({Disposition::Unsupported, name, detail}); };
 	std::string master; for (auto const& track : project.tracks) { if (track.master) { master = track.id; } }
@@ -212,6 +234,17 @@ std::vector<Diagnostic> StudioOneSong::export_report (const Project& project)
 		if (marker.duration > 0) { unsupported (marker.name, "Native song range marker encoding has not been verified; export AAF/MIDI to preserve its duration"); }
 	}
 	for (auto const& track : project.tracks) {
+		if (format_version == 2) {
+			if (track.kind == TrackKind::Folder || (track.kind == TrackKind::Bus && !track.master)) {
+				unsupported (track.name, "Studio One 2 folder and bus encoding has not been validated");
+			}
+			if (!track.plugins.empty () || !track.sends.empty ()) {
+				unsupported (track.name, "Studio One 2 plug-in and send encoding has not been validated; render this processing");
+			}
+			if (!track.volume_automation.points.empty () || !track.pan_automation.points.empty ()) {
+				unsupported (track.name, "Studio One 2 XML automation points have not been validated; render this automation");
+			}
+		}
 		if (track.channels > 2) { unsupported (track.name, "Native multichannel tracks require premixed stereo media from the source DAW"); }
 		if (track.master) {
 			if (track.channels != 2 || track.pan != .5) { unsupported (track.name, "Native master export requires stereo with centered balance"); }
@@ -259,6 +292,9 @@ std::vector<Diagnostic> StudioOneSong::export_report (const Project& project)
 		if (track.kind == TrackKind::MIDI && (track.volume != 1 || track.pan != .5)) { unsupported (track.name, "Native MIDI mixer gain and pan require instrument rendering"); }
 		for (auto const& clip : track.clips) {
 			if (!clip.midi_controls.empty ()) { unsupported (clip.name, "Native MIDI controller mapping has not been verified; use DAWproject, AAF/MIDI or rendered audio"); }
+			if (format_version == 2 && !clip.envelope.points.empty ()) {
+				unsupported (clip.name, "Studio One 2 clip fade encoding has not been validated; render these fades");
+			}
 			double in, out, gain; if (!fades (clip, project, timing, in, out, gain)) { unsupported (clip.name, "Native export supports ordinary linear fade lengths; other clip envelopes require rendering"); }
 			else if (!clip.envelope.points.empty ()) { report.push_back ({Disposition::Transformed, clip.name, "Linear clip envelopes become native gain and fade lengths at audio sample resolution"}); }
 			if (std::any_of (clip.notes.begin (), clip.notes.end (), [] (const Note& note) {
@@ -274,18 +310,18 @@ std::vector<Diagnostic> StudioOneSong::export_report (const Project& project)
 	if (std::any_of (project.tracks.begin (), project.tracks.end (), [] (const Track& t) { return t.kind == TrackKind::MIDI; })) {
 		report.push_back ({Disposition::Transformed, "MIDI", "MIDI notes retain musical timing and release velocity without a target instrument; target playback is not yet validated"});
 	}
-	report.push_back ({Disposition::Transformed, "Native Studio One song", "Experimental native export for format versions 7, 8 and 9. Target-application opening and playback have not yet been validated. Audio clips use absolute time; copy the complete song folder when moving it."});
+	report.push_back ({Disposition::Transformed, "Native Studio One song", "Experimental native export for format versions 2, 7, 8 and 9. Target-application opening and playback have not yet been validated. Audio clips use absolute time; copy the complete song folder when moving it."});
 	report.push_back ({Disposition::Transformed, "Audio device", "Hardware assignments are not transferred; choose the target computer's main outputs in Studio One or Studio Pro"});
 	return report;
 }
 
 void StudioOneSong::write (const StudioOneSongData& song, const std::string& filename, const std::string& document_path, CancelCheck cancel)
 {
-	check (cancel); auto report = export_report (song.project);
+	check (cancel); auto report = export_report (song.project, song.format_version);
 	for (auto const& item : report) { if (item.disposition == Disposition::Unsupported) { throw ExchangeError (item.object + ": " + item.detail); } }
 	require (g_path_is_absolute (filename.c_str ()) && g_path_is_absolute (document_path.c_str ()), "Native song filenames must be absolute");
 	require (song.sample_rate >= 8000 && song.sample_rate <= 768000, "Invalid native song sample rate");
-	require (song.format_version >= 7 && song.format_version <= 9, "Native song export format must be 7, 8 or 9");
+	require (song.format_version == 2 || (song.format_version >= 7 && song.format_version <= 9), "Native song export format must be 2, 7, 8 or 9");
 	File output = file (filename), published = file (document_path);
 	File parent (g_file_get_parent (output.get ()), g_object_unref), final_parent (g_file_get_parent (published.get ()), g_object_unref);
 	require (parent && final_parent, "Native song requires a parent folder");
@@ -320,7 +356,8 @@ void StudioOneSong::write (const StudioOneSongData& song, const std::string& fil
 	}
 	Document meta ("MetaInformation"), arrangement ("Song"), pool ("MediaPool"), mixer ("AudioMixer"), midi ("MusicTrackDevice");
 	auto attribute = [&] (const char* id, const std::string& value) { Node a = node (meta.root, "Attribute"); prop (a, "id", id); prop (a, "value", value); };
-	attribute ("Document:MimeType", "application/x.presonus-song"); attribute ("Document:FormatVersion", number (song.format_version));
+	attribute ("Document:MimeType", song.format_version == 2 ? "application/x-presonus-song" : "application/x.presonus-song");
+	attribute ("Document:FormatVersion", number (song.format_version));
 	attribute ("Document:Generator", "Ardour Project Exchange"); attribute ("Document:Title", song.title);
 	attribute ("Media:SampleRate", number (song.sample_rate)); attribute ("Media:Tempo", number (project.tempo));
 	attribute ("Media:TimeSignatureNumerator", number (project.numerator)); attribute ("Media:TimeSignatureDenominator", number (project.denominator));
@@ -342,7 +379,7 @@ void StudioOneSong::write (const StudioOneSongData& song, const std::string& fil
 	marker ("Start", Time (begin, TimeUnit::Seconds), 2); marker ("End", Time (end, TimeUnit::Seconds), 3);
 	for (auto const& item : project.markers) { marker (item.name, item.position, 0); }
 	Node pool_root = node (pool.root, "Attributes", "rootFolder"), audio_pool = node (pool_root, "MediaFolder"), music_pool = node (pool_root, "MediaFolder");
-	prop (audio_pool, "name", "Audio"); prop (music_pool, "name", "Music");
+	prop (audio_pool, "name", song.format_version == 2 ? "Sound" : "Audio"); prop (music_pool, "name", "Music");
 	prop (node (pool.root, "Attributes", "documentPath"), "url", document_uri.get ());
 	for (auto const& media : project.media) {
 		check (cancel); auto f = song.audio_files.find (media.id); require (f != song.audio_files.end (), "Missing collected native song audio");
@@ -351,6 +388,7 @@ void StudioOneSong::write (const StudioOneSongData& song, const std::string& fil
 		Node location = node (n, "Url", "path"); prop (location, "type", 1); prop (location, "url", url);
 		Node info = node (n, "Attributes", "format"); prop (info, "sampleRate", media.sample_rate); prop (info, "numChannels", media.channels);
 		prop (info, "frameCount", std::round (media.duration * media.sample_rate)); prop (info, "bitDepth", bits);
+		if (song.format_version == 2) { node (n, "AudioTempoMap", "tempoMap"); }
 	}
 	Node audio_channels = node (mixer.root, "Attributes", "channels"), music_channels = node (midi.root, "Attributes", "channels");
 	Node outputs = node (audio_channels, "ChannelGroup"), audio_tracks = node (audio_channels, "ChannelGroup"), audio_groups = node (audio_channels, "ChannelGroup"), music_tracks = node (music_channels, "ChannelGroup");
@@ -403,11 +441,23 @@ void StudioOneSong::write (const StudioOneSongData& song, const std::string& fil
 			Node presets = node (rack, "Attributes", "Presets"); prop (presets, "pname", "default"); prop (presets, "dirty", 0);
 		}
 		if (track.master || bus) { continue; }
-		Node t = node (tracks, "MediaTrack"); prop (t, "mediaType", musical ? "Music" : "Audio"); prop (t, "tempoFollow", musical ? 2 : 0);
-		prop (t, "version", 1); prop (t, "trackID", track_ids.at (track.id)); prop (t, "trackNumber", track_number); prop (t, "timeFormat", musical ? 2 : 0); prop (t, "name", track.name); prop (t, "color", color (track.color));
+		Node t = node (tracks, "MediaTrack"); prop (t, "mediaType", musical ? "Music" : "Audio"); prop (t, "tempoFollow", song.format_version == 2 ? 2 : musical ? 2 : 0);
+		prop (t, "version", 1); prop (t, "trackID", track_ids.at (track.id)); prop (t, "trackNumber", track_number); prop (t, "timeFormat", song.format_version == 2 ? 2 : musical ? 2 : 0); prop (t, "name", track.name); prop (t, "color", color (track.color));
 		if (!track.parent.empty ()) { prop (t, "parentFolder", track_ids.at (track.parent)); }
 		unique_id (t, "channelID", channels[track.id]); if (!musical) { speaker (t, "trackFormat", track.channels); }
-		if (!musical && (!track.volume_automation.points.empty () || !track.pan_automation.points.empty ())) {
+		if (!musical && song.format_version == 2) {
+			Node regions = node (t, "Attributes", "AutomationRegionList"); prop (regions, "visible", 0);
+			auto empty_curve = [&] (bool pan) {
+				std::string member = "Envelopes/track-" + std::to_string (track_number) + (pan ? "/Pan.envelope" : "/Volume.envelope");
+				Node region = node (regions, "AutomationRegion"); prop (region, "title", pan ? "Pan" : "Volume");
+				prop (region, "identity", "param:///AudioMixer/" + channels.at (track.id) + (pan ? "/pan" : "/volume"));
+				prop (region, "metaIdentity", pan ? "AudioTrackChannel/pan" : "AudioTrackChannel/volume");
+				prop (region, "color", pan ? "FFC7FF3A" : "FFFFD829"); prop (region, "mute", 0);
+				Node location = node (region, "Url", "points"); prop (location, "type", 1); prop (location, "url", "media:///" + member);
+				archive.add_text (member, pan ? "<Envelope bipolar=\"1\"/>" : "<Envelope/>");
+			};
+			empty_curve (false); empty_curve (true);
+		} else if (!musical && (!track.volume_automation.points.empty () || !track.pan_automation.points.empty ())) {
 			Node regions = node (t, "Attributes", "AutomationRegionList"); prop (regions, "visible", 0);
 			auto add_curve = [&] (const Automation& curve, bool pan) {
 				if (curve.points.empty ()) { return; }
@@ -429,10 +479,11 @@ void StudioOneSong::write (const StudioOneSongData& song, const std::string& fil
 			prop (e, "length", timing.duration (Time (clip.duration, clip.position.unit), clip.position, unit));
 			prop (e, "offset", timing.content (clip.offset, clip.position, clip.offset, unit)); prop (e, "mute", !clip.enabled);
 			if (musical) {
-				std::string id = uid (), member = "Performances/notes-" + std::to_string (++music_number) + ".musicx";
+				std::string id = uid (), member = "Performances/notes-" + std::to_string (++music_number) +
+				                                 (song.format_version == 2 ? ".music" : ".musicx");
 				prop (e, "clipID", id); Node source = node (music_pool, "MusicClip"); prop (source, "mediaID", id);
 				Node location = node (source, "Url", "dataPath"); prop (location, "type", 1); prop (location, "url", "media:///" + member);
-				archive.add_text (member, music (clip, timing, cancel));
+				archive.add_text (member, song.format_version == 2 ? legacy_music (clip, timing, cancel) : music (clip, timing, cancel));
 			} else {
 				double in, out, gain; require (fades (clip, project, timing, in, out, gain), "Unsupported native clip envelope");
 				prop (e, "clipID", media_ids.at (clip.media)); prop (e, "gain", clip.gain * gain); prop (e, "speed", 1);

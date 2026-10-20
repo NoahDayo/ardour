@@ -2771,7 +2771,24 @@ void ProjectSessionTest::native_song_format_two_import ()
 	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("legacy-return.dawproject"));
 	auto returned = PX::DawProject::read (fixture.path ("legacy-return.dawproject"));
 	CPPUNIT_ASSERT_EQUAL (size_t (3), track_named (returned, "Old notes").clips.front ().notes.size ());
-	std::cout << "Legacy XML music, negative source origin and overlapping MIDI notes survived Ardour save/reopen and DAWproject return" << std::endl;
+	PX::SessionExchange::ExportOptions options; options.studio_one_format_version = 2;
+	PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("LegacyReturn"), fixture.report, options);
+	PX::ProjectArchive archive (fixture.path ("LegacyReturn/Project.song"));
+	CPPUNIT_ASSERT (archive.read_text ("metainfo.xml").find ("application/x-presonus-song") != std::string::npos);
+	CPPUNIT_ASSERT (archive.read_text ("Performances/notes-1.music").find ("<MusicPerformance") != std::string::npos);
+	auto native_return = PX::StudioOneSong::read (fixture.path ("LegacyReturn/Project.song"));
+	CPPUNIT_ASSERT_EQUAL (2u, native_return.format_version);
+	CPPUNIT_ASSERT_EQUAL (size_t (3), track_named (native_return.project, "Old notes").clips.front ().notes.size ());
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_studio_one (*AudioEngine::instance (), fixture.path ("LegacyReturn/Project.song"),
+	                                                          fixture.path ("LegacyReimport"), "LegacyReimport", fixture.report);
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("LegacyReimport"), "LegacyReimport", nullptr, "", true));
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("legacy-reimport.dawproject"));
+	auto reimported = PX::DawProject::read (fixture.path ("legacy-reimport.dawproject"));
+	CPPUNIT_ASSERT_EQUAL (size_t (3), track_named (reimported, "Old notes").clips.front ().notes.size ());
+	std::cout << "Legacy XML music and overlapping MIDI notes survived Studio One 2 import, Ardour save/reopen, native export, reimport and DAWproject return" << std::endl;
 }
 
 void ProjectSessionTest::native_song_format_eight_app_authored ()
@@ -2845,6 +2862,17 @@ void ProjectSessionTest::native_song_format_two_app_authored ()
 	CPPUNIT_ASSERT (std::any_of (original.project.report.begin (), original.project.report.end (), [] (const PX::Diagnostic& d) {
 		return d.disposition == PX::Disposition::Unsupported && d.detail.find ("quantization") != std::string::npos;
 	}));
+	auto with_automation = original.project; with_automation.report.clear ();
+	for (auto& track : with_automation.tracks) {
+		if (track.name == "Carol of the bells") {
+			track.volume_automation.unit = PX::TimeUnit::Seconds;
+			track.volume_automation.points = {{0, .8, true}, {1, 1, true}};
+		}
+	}
+	auto legacy_report = PX::StudioOneSong::export_report (with_automation, 2);
+	CPPUNIT_ASSERT (std::any_of (legacy_report.begin (), legacy_report.end (), [] (const PX::Diagnostic& d) {
+		return d.disposition == PX::Disposition::Unsupported && d.detail.find ("Studio One 2 XML automation") != std::string::npos;
+	}));
 	CPPUNIT_ASSERT_THROW (PX::SessionExchange::import_studio_one (*AudioEngine::instance (), source,
 	                     fixture.path ("Strict"), "Strict", fixture.report), PX::ExchangeError);
 	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("Strict"), Glib::FILE_TEST_EXISTS));
@@ -2864,7 +2892,14 @@ void ProjectSessionTest::native_song_format_two_app_authored ()
 	CPPUNIT_ASSERT_EQUAL (size_t (2525), track_named (returned, "MIDI 1").clips.front ().notes.size ());
 	CPPUNIT_ASSERT_EQUAL (size_t (1), track_named (returned, "Carol of the bells").clips.size ());
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (110, returned.tempo, .001);
-	std::cout << "App-authored Studio One 2 song retained 2525 MIDI notes and audio structure through partial import, save/reopen and DAWproject return" << std::endl;
+	PX::SessionExchange::ExportOptions options; options.studio_one_format_version = 2;
+	PX::SessionExchange::export_studio_one (*fixture.session, fixture.path ("LegacyReturn"), fixture.report, options);
+	auto native_return = PX::StudioOneSong::read (fixture.path ("LegacyReturn/Project.song"));
+	CPPUNIT_ASSERT_EQUAL (2u, native_return.format_version);
+	CPPUNIT_ASSERT_EQUAL (size_t (2525), track_named (native_return.project, "MIDI 1").clips.front ().notes.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (1), track_named (native_return.project, "Carol of the bells").clips.size ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (110, native_return.project.tempo, .001);
+	std::cout << "App-authored Studio One 2 song retained 2525 MIDI notes and audio structure through partial import, save/reopen, DAWproject and native-song return" << std::endl;
 }
 
 void ProjectSessionTest::native_song_cancel ()
