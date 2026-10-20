@@ -50,6 +50,7 @@
 #include "ardour/studio_one_song.h"
 #include "ardour/recent_sessions.h"
 #include "ardour/rc_configuration.h"
+#include "ardour/resampled_source.h"
 #include "ardour/session.h"
 #include "ardour/source.h"
 #include "ardour/sndfileimportable.h"
@@ -2875,6 +2876,35 @@ void ProjectSessionTest::native_song_format_seven_app_authored ()
 	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
 	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
 	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("StudioOne6"), "StudioOne6", nullptr, "", true));
+	auto source_pcm = std::make_shared<SndFileImportableSource> (original.audio_files.at (slice->media));
+	CPPUNIT_ASSERT_EQUAL (uint32_t (1), source_pcm->channels ());
+	CPPUNIT_ASSERT_EQUAL (samplecnt_t (44100), source_pcm->samplerate ());
+	const samplecnt_t rate = fixture.session->nominal_sample_rate ();
+	ResampledImportableSource reference (source_pcm, rate, SrcBest);
+	std::vector<Sample> resampled_pcm;
+	std::vector<Sample> block (ResampledImportableSource::blocksize);
+	for (samplecnt_t count; (count = reference.read (block.data (), block.size ())) != 0;) {
+		resampled_pcm.insert (resampled_pcm.end (), block.begin (), block.begin () + count);
+	}
+	auto vocal_route = std::dynamic_pointer_cast<ARDOUR::Track> (fixture.session->route_by_name ("Vocal"));
+	CPPUNIT_ASSERT (vocal_route);
+	const samplepos_t expected_position = std::llround (PX::TimeMap (original.project).convert (slice->position, PX::TimeUnit::Seconds) * rate);
+	std::shared_ptr<AudioRegion> audible;
+	for (auto const& region : *vocal_route->playlist ()->region_list ()) {
+		auto candidate = std::dynamic_pointer_cast<AudioRegion> (region);
+		if (candidate && candidate->name () == slice->name &&
+		    std::llabs (static_cast<long long> (candidate->position_sample ()) - expected_position) <= 1 &&
+		    std::llabs (static_cast<long long> (candidate->start_sample ()) - std::llround (slice->offset.value * rate)) <= 1) {
+			CPPUNIT_ASSERT (!audible); audible = candidate;
+		}
+	}
+	CPPUNIT_ASSERT (audible);
+	CPPUNIT_ASSERT (audible->start_sample () + 512 <= resampled_pcm.size ());
+	std::vector<Sample> playback (512), mix (512), gain (512);
+	CPPUNIT_ASSERT_EQUAL (samplecnt_t (512), audible->read_at (playback.data (), mix.data (), gain.data (), audible->position_sample (), 512, 0));
+	for (size_t i = 0; i < playback.size (); ++i) {
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (resampled_pcm[audible->start_sample () + i], playback[i], 1e-7);
+	}
 	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("studio-one-6-return.dawproject"));
 	auto returned = PX::DawProject::read (fixture.path ("studio-one-6-return.dawproject"));
 	auto const& returned_vocal = track_named (returned, "Vocal");
@@ -2884,7 +2914,19 @@ void ProjectSessionTest::native_song_format_seven_app_authored ()
 	auto returned_slice = std::find_if (returned_vocal.clips.begin (), returned_vocal.clips.end (), [] (const PX::Clip& clip) { return clip.name == "Vocal(4)"; });
 	CPPUNIT_ASSERT (returned_slice != returned_vocal.clips.end ());
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (slice->offset.value, returned_slice->offset.value, 1.0 / 44100);
-	std::cout << "App-authored Studio One 6 song and original WAV media survived partial import, save/reopen and DAWproject return" << std::endl;
+	auto media = std::find_if (returned.media.begin (), returned.media.end (), [&] (const PX::Media& item) { return item.id == returned_slice->media; });
+	CPPUNIT_ASSERT (media != returned.media.end ());
+	PX::ProjectArchive (fixture.path ("studio-one-6-return.dawproject")).copy_file (media->path, fixture.path ("studio-one-6-return-vocal.wav"));
+	SndFileImportableSource returned_pcm (fixture.path ("studio-one-6-return-vocal.wav"));
+	CPPUNIT_ASSERT_EQUAL (samplecnt_t (resampled_pcm.size ()), returned_pcm.length ());
+	CPPUNIT_ASSERT_EQUAL (rate, returned_pcm.samplerate ());
+	CPPUNIT_ASSERT_EQUAL (source_pcm->channels (), returned_pcm.channels ());
+	std::vector<Sample> samples (returned_pcm.length ());
+	CPPUNIT_ASSERT_EQUAL (samplecnt_t (samples.size ()), returned_pcm.read (samples.data (), samples.size ()));
+	for (size_t i = 0; i < samples.size (); ++i) {
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (resampled_pcm[i], samples[i], 1e-7);
+	}
+	std::cout << "App-authored Studio One 6 song retained resampled WAV samples in Ardour playback and DAWproject return" << std::endl;
 }
 
 void ProjectSessionTest::native_song_format_two_app_authored ()
