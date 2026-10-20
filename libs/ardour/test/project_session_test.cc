@@ -532,7 +532,9 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (native_song_fx_sends_roundtrip);
 	CPPUNIT_TEST (native_song_format_seven_import);
 	CPPUNIT_TEST (native_song_format_eight_import);
+	CPPUNIT_TEST (native_song_format_two_import);
 	CPPUNIT_TEST (native_song_format_eight_app_authored);
+	CPPUNIT_TEST (native_song_format_two_app_authored);
 	CPPUNIT_TEST (native_song_cancel);
 	CPPUNIT_TEST (native_song_unsupported);
 	CPPUNIT_TEST (native_song_partial_import);
@@ -597,7 +599,9 @@ public:
 	void native_song_fx_sends_roundtrip ();
 	void native_song_format_seven_import ();
 	void native_song_format_eight_import ();
+	void native_song_format_two_import ();
 	void native_song_format_eight_app_authored ();
+	void native_song_format_two_app_authored ();
 	void native_song_cancel ();
 	void native_song_unsupported ();
 	void native_song_partial_import ();
@@ -2715,6 +2719,61 @@ void native_song_older_format_import (unsigned format_version)
 void ProjectSessionTest::native_song_format_seven_import () { native_song_older_format_import (7); }
 void ProjectSessionTest::native_song_format_eight_import () { native_song_older_format_import (8); }
 
+void ProjectSessionTest::native_song_format_two_import ()
+{
+	Fixture fixture;
+	gchar* raw = g_filename_to_uri (fixture.path ("input.song").c_str (), NULL, NULL);
+	CPPUNIT_ASSERT (raw);
+	std::string uri (raw); g_free (raw);
+	PX::ProjectArchiveWriter song (fixture.path ("input.song"));
+	song.add_text ("metainfo.xml", "<MetaInformation><Attribute id=\"Document:MimeType\" value=\"application/x-presonus-song\"/>"
+	               "<Attribute id=\"Document:FormatVersion\" value=\"2\"/></MetaInformation>");
+	song.add_text ("Song/song.xml", R"(<Song><Attributes x:id="Root"><Attributes x:id="timeContext" sampleRate="48000">
+<TempoMap x:id="tempoMap"><TempoMapSegment start="0" tempo="0.5"/></TempoMap>
+<TimeSignatureMap x:id="timeSignatureMap"><TimeSignatureMapSegment start="0" numerator="4" denominator="4"/></TimeSignatureMap>
+</Attributes><List x:id="Tracks"><MediaTrack trackID="legacy-midi" mediaType="Music" name="Old notes" timeFormat="2">
+<UID x:id="channelID" uid="midi-channel"/><Attributes x:id="AutomationRegionList"><AutomationRegion title="Volume">
+<Url x:id="points" url="media:///Envelopes/volume.envelope"/></AutomationRegion></Attributes>
+<List x:id="Events"><MusicPart clipID="notes" name="Legacy clip" length="4" offset="-1"/></List>
+</MediaTrack></List></Attributes></Song>)");
+	song.add_text ("Song/mediapool.xml", "<MediaPool><Attributes x:id=\"documentPath\" url=\"" + uri +
+	               "\"/><MusicClip mediaID=\"notes\"><Url x:id=\"dataPath\" url=\"media:///Performances/notes.music\"/>"
+	               "</MusicClip></MediaPool>");
+	song.add_text ("Devices/audiomixer.xml", "<AudioMixer><AudioOutputChannel label=\"Main\"><UID x:id=\"uniqueID\" uid=\"master\"/>"
+	               "</AudioOutputChannel></AudioMixer>");
+	song.add_text ("Devices/musictrackdevice.xml", "<MusicTrackDevice><MusicTrackChannel label=\"Old notes\"><UID x:id=\"uniqueID\" uid=\"midi-channel\"/>"
+	               "</MusicTrackChannel></MusicTrackDevice>");
+	song.add_text ("Envelopes/volume.envelope", "<Envelope/>");
+	song.add_text ("Performances/notes.music", R"(<MusicPerformance timeFormat="2">
+<NoteEvent start="-1" length="1" pitch="60" velocity="0.8"/>
+<NoteEvent start="-0.5" length="1" pitch="60" velocity="0.6" quantize.start="0.1"/>
+<NoteEvent start="2" length="0.5" pitch="62" velocity="0.5"/>
+</MusicPerformance>)");
+	song.finish ();
+	auto parsed = PX::StudioOneSong::read (fixture.path ("input.song"));
+	CPPUNIT_ASSERT_EQUAL (2u, parsed.format_version);
+	auto const& clip = track_named (parsed.project, "Old notes").clips.front ();
+	CPPUNIT_ASSERT_EQUAL (size_t (3), clip.notes.size ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (0, clip.offset.value, 1e-9);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (0, clip.notes.front ().time, 1e-9);
+	CPPUNIT_ASSERT_EQUAL (0, clip.notes.front ().channel);
+	CPPUNIT_ASSERT_EQUAL (1, clip.notes[1].channel);
+	CPPUNIT_ASSERT (PX::has_unsupported_features (parsed.project));
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::import_studio_one (*AudioEngine::instance (), fixture.path ("input.song"),
+	                     fixture.path ("Strict"), "Strict", fixture.report), PX::ExchangeError);
+	fixture.report.clear ();
+	fixture.session = PX::SessionExchange::import_studio_one (*AudioEngine::instance (), fixture.path ("input.song"),
+	                                                          fixture.path ("Partial"), "Partial", fixture.report,
+	                                                          PX::CancelCheck (), true);
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("Partial"), "Partial", nullptr, "", true));
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("legacy-return.dawproject"));
+	auto returned = PX::DawProject::read (fixture.path ("legacy-return.dawproject"));
+	CPPUNIT_ASSERT_EQUAL (size_t (3), track_named (returned, "Old notes").clips.front ().notes.size ());
+	std::cout << "Legacy XML music, negative source origin and overlapping MIDI notes survived Ardour save/reopen and DAWproject return" << std::endl;
+}
+
 void ProjectSessionTest::native_song_format_eight_app_authored ()
 {
 	const char* source = std::getenv ("ARDOUR_STUDIO_ONE_7_TEST_SONG");
@@ -2764,6 +2823,48 @@ void ProjectSessionTest::native_song_format_eight_app_authored ()
 	CPPUNIT_ASSERT (track_named (version_matched.project, "Synth").kind == PX::TrackKind::MIDI);
 	CPPUNIT_ASSERT (track_named (version_matched.project, "Track").kind == PX::TrackKind::Audio);
 	std::cout << "App-authored Studio One 7 song retained tracks and tempo through partial import, save/reopen, DAWproject and native-song return" << std::endl;
+}
+
+void ProjectSessionTest::native_song_format_two_app_authored ()
+{
+	const char* source = std::getenv ("ARDOUR_STUDIO_ONE_2_TEST_SONG");
+	if (!source || !*source) { return; }
+	Fixture fixture;
+	auto original = PX::StudioOneSong::read (source);
+	CPPUNIT_ASSERT_EQUAL (2u, original.format_version);
+	CPPUNIT_ASSERT_EQUAL (std::string ("Studio One/2.6.0.24200"), original.project.application_version);
+	CPPUNIT_ASSERT_EQUAL (44100u, original.sample_rate);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (110, original.project.tempo, .001);
+	auto const& midi = track_named (original.project, "MIDI").clips.front ();
+	CPPUNIT_ASSERT_EQUAL (size_t (2525), midi.notes.size ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (0, midi.offset.value, 1e-9);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (0, midi.notes.front ().time, 1e-9);
+	CPPUNIT_ASSERT_EQUAL (size_t (9), size_t (std::count_if (midi.notes.begin (), midi.notes.end (), [] (const PX::Note& note) { return note.channel != 0; })));
+	CPPUNIT_ASSERT_EQUAL (size_t (1), track_named (original.project, "Carol of the bells").clips.size ());
+	CPPUNIT_ASSERT (PX::has_unsupported_features (original.project));
+	CPPUNIT_ASSERT (std::any_of (original.project.report.begin (), original.project.report.end (), [] (const PX::Diagnostic& d) {
+		return d.disposition == PX::Disposition::Unsupported && d.detail.find ("quantization") != std::string::npos;
+	}));
+	CPPUNIT_ASSERT_THROW (PX::SessionExchange::import_studio_one (*AudioEngine::instance (), source,
+	                     fixture.path ("Strict"), "Strict", fixture.report), PX::ExchangeError);
+	CPPUNIT_ASSERT (!Glib::file_test (fixture.path ("Strict"), Glib::FILE_TEST_EXISTS));
+	fixture.report.clear ();
+	fixture.session = PX::SessionExchange::import_studio_one (*AudioEngine::instance (), source,
+	                                                          fixture.path ("Partial"), "Partial", fixture.report,
+	                                                          PX::CancelCheck (), true);
+	CPPUNIT_ASSERT (fixture.session);
+	CPPUNIT_ASSERT (std::any_of (fixture.report.begin (), fixture.report.end (), [] (const PX::Diagnostic& d) {
+		return d.disposition == PX::Disposition::Transformed && d.detail.find ("Track renamed to MIDI 1") != std::string::npos;
+	}));
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("Partial"), "Partial", nullptr, "", true));
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("studio-one-2-return.dawproject"));
+	auto returned = PX::DawProject::read (fixture.path ("studio-one-2-return.dawproject"));
+	CPPUNIT_ASSERT_EQUAL (size_t (2525), track_named (returned, "MIDI 1").clips.front ().notes.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (1), track_named (returned, "Carol of the bells").clips.size ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (110, returned.tempo, .001);
+	std::cout << "App-authored Studio One 2 song retained 2525 MIDI notes and audio structure through partial import, save/reopen and DAWproject return" << std::endl;
 }
 
 void ProjectSessionTest::native_song_cancel ()

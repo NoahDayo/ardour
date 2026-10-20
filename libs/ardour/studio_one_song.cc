@@ -2,6 +2,7 @@
 #include "ardour/studio_one_song.h"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cmath>
 #include <cstring>
@@ -307,6 +308,73 @@ std::string Reader::audio (const std::string& key)
 void Reader::notes (Clip& clip, Node entry)
 {
 	std::string name = member_url (value (child (entry, "Url", "dataPath"), "url"));
+	if (result.format_version == 2) {
+		Node performance = document (name, "MusicPerformance");
+		attributes (performance, {"timeFormat"}, clip.name);
+		clip.offset.unit = unit (integer (performance, "timeFormat", 2));
+		size_t count = 0;
+		bool quantized = false;
+		std::set<std::string> unknown;
+		double earliest = clip.offset.value;
+		for (Node event : children (performance)) {
+			check ();
+			if (!is (event, "NoteEvent")) { unsupported (clip.name, "Legacy native MIDI event is not a note"); continue; }
+			require (++count <= 100000, "Legacy native MIDI exceeds the event limit");
+			Note note;
+			double pitch = number (event, "pitch", -1), channel = number (event, "channel");
+			require (pitch >= 0 && pitch <= 127 && std::floor (pitch) == pitch &&
+			         channel >= 0 && channel <= 15 && std::floor (channel) == channel, "Invalid legacy native MIDI pitch or channel");
+			note.key = pitch; note.channel = channel;
+			note.time = number (event, "start"); note.duration = number (event, "length");
+			note.velocity = number (event, "velocity", 1);
+			note.release_velocity = number (event, "releaseVelocity", .5);
+			require (note.duration > 0 && note.velocity >= 0 && note.velocity <= 1 &&
+			         note.release_velocity >= 0 && note.release_velocity <= 1, "Invalid legacy native MIDI note");
+			for (xmlAttr* attribute = event->properties; attribute; attribute = attribute->next) {
+				std::string property (reinterpret_cast<const char*> (attribute->name));
+				if (property == "quantize.start" || property == "quantize.length") { quantized = true; }
+				else if (!std::set<std::string> {"start", "length", "pitch", "channel", "velocity", "releaseVelocity"}.count (property)) { unknown.insert (property); }
+			}
+			if (!children (event).empty ()) { unsupported (clip.name, "Legacy native MIDI note expressions are not yet supported"); }
+			earliest = std::min (earliest, note.time);
+			clip.notes.push_back (note);
+		}
+		for (auto const& property : unknown) { unsupported (clip.name, "Legacy native MIDI event property: " + property); }
+		if (quantized) { unsupported (clip.name, "Legacy note quantization offsets are not yet interpreted; stored start and length values were imported"); }
+		if (earliest < 0) {
+			/* Older songs can use a negative source origin. Move the source
+			 * coordinates together, leaving every audible clip-relative time intact. */
+			clip.offset.value -= earliest;
+			for (auto& note : clip.notes) { note.time -= earliest; }
+			result.project.report.push_back ({Disposition::Transformed, clip.name, "Legacy negative MIDI source origin normalized without moving visible notes"});
+		}
+		/* Ardour's SMF reader cannot pair overlapping same-pitch note-ons and
+		 * note-offs on one channel. Give only those overlapping voices a free
+		 * channel; preserve every note's pitch, time, length and velocity. */
+		std::vector<size_t> order;
+		for (size_t i = 0; i < clip.notes.size (); ++i) { order.push_back (i); }
+		std::stable_sort (order.begin (), order.end (), [&] (size_t a, size_t b) { return clip.notes[a].time < clip.notes[b].time; });
+		std::array<std::array<double, 16>, 128> channel_ends {};
+		size_t reassigned = 0;
+		for (size_t index : order) {
+			Note& note = clip.notes[index];
+			require (std::isfinite (note.time + note.duration), "Invalid legacy native MIDI note range");
+			auto& ends = channel_ends[note.key];
+			if (ends[note.channel] > note.time) {
+				unsigned replacement = 0;
+				while (replacement < 16 && ends[replacement] > note.time) { ++replacement; }
+				require (replacement < 16, "More than 16 simultaneous legacy MIDI notes share one pitch");
+				note.channel = replacement;
+				++reassigned;
+			}
+			ends[note.channel] = note.time + note.duration;
+		}
+		if (reassigned) {
+			result.project.report.push_back ({Disposition::Transformed, clip.name,
+			                                 std::to_string (reassigned) + " overlapping same-pitch legacy MIDI notes assigned separate channels for unambiguous SMF playback"});
+		}
+		return;
+	}
 	std::string data = archive.read_text (name); Value content = BinaryJSON (data).parse ();
 	double format = content.get ("timeFormat", 2); require (format == 0 || format == 2, "Invalid native MIDI time format");
 	clip.offset.unit = unit (static_cast<unsigned> (format));
@@ -336,6 +404,15 @@ void Reader::automation (Node n, Track& track, const std::string& channel_id, Ti
 		if (!is (c, "AutomationRegion")) { unsupported (track.name, "Unknown native automation region"); continue; }
 		std::string member = member_url (value (child (c, "Url", "points"), "url"));
 		if (!members.count (member)) { unsupported (track.name, "Referenced native automation member is missing: " + member); continue; }
+		if (result.format_version == 2) {
+			Node legacy = document (member, "Envelope");
+			attributes (legacy, {"bipolar"}, track.name);
+			if (!children (legacy).empty ()) { unsupported (track.name, "Legacy XML automation points are not yet supported: " + value (c, "title")); }
+			if (value (legacy, "bipolar") != "" && value (legacy, "bipolar") != "1") {
+				unsupported (track.name, "Legacy automation polarity is not yet supported: " + value (c, "title"));
+			}
+			continue;
+		}
 		std::string data = archive.read_text (member); Value envelope = BinaryJSON (data).parse ();
 		auto events = envelope.find ("events");
 		require (events && events->type == Value::Array, "Malformed native automation envelope");
@@ -528,6 +605,7 @@ void Reader::track (Node n)
 	require (type == "Audio" || type == "Music", "Unsupported native track media type"); t.kind = type == "Audio" ? TrackKind::Audio : TrackKind::MIDI;
 	unsigned format = integer (n, "timeFormat", 2); unit (format);
 	std::string channel_id = value (child (n, "UID", "channelID"), "uid");
+	if (t.id.empty () && result.format_version == 2) { t.id = channel_id; }
 	auto ch = channels.find (channel_id); require (ch != channels.end (), "Missing native track channel");
 	channel (t, ch->second);
 	std::string speaker = value (child (n, "SpeakerSetup", "trackFormat"), "type", "Stereo");
@@ -655,9 +733,9 @@ StudioOneSongData Reader::read ()
 {
 	Node meta = document ("metainfo.xml", "MetaInformation"); std::map<std::string, std::string> metadata;
 	for (Node n : children (meta)) { if (is (n, "Attribute")) { require (metadata.emplace (value (n, "id"), value (n, "value")).second, "Duplicate native song metadata"); } }
-	require (metadata["Document:MimeType"] == "application/x.presonus-song", "This file is not a Studio One song");
 	std::string format_version = metadata["Document:FormatVersion"];
-	require (format_version == "7" || format_version == "8" || format_version == "9", "This Studio One native format version has not yet been validated (supported: 7, 8, 9)");
+	require (format_version == "2" || format_version == "7" || format_version == "8" || format_version == "9", "This Studio One native format version has not yet been validated (supported: 2, 7, 8, 9)");
+	require (metadata["Document:MimeType"] == (format_version == "2" ? "application/x-presonus-song" : "application/x.presonus-song"), "This file is not a Studio One song");
 	result.format_version = static_cast<unsigned> (format_version[0] - '0');
 	result.project.application = "Studio One / Studio Pro"; result.project.application_version = metadata["Document:Generator"];
 	result.title = metadata["Document:Title"];
@@ -728,7 +806,7 @@ StudioOneSongData Reader::read ()
 	}
 	result.project.markers = result.markers;
 	validate_project (result.project);
-	if (format_version == "7" || format_version == "8") {
+	if (format_version == "2" || format_version == "7" || format_version == "8") {
 		result.project.report.push_back ({Disposition::Transformed, "Native Studio One song",
 		                                   "Studio One format " + format_version + " imported; native re-export defaults to format 9 unless an older target format is selected"});
 	}
