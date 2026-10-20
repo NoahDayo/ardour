@@ -882,17 +882,23 @@ void ProjectSessionTest::midi_controller_roundtrip ()
 	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("ReturnedControls"), "ReturnedControls", nullptr, "", true));
 	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("returned-controls.dawproject"));
 	auto returned = PX::DawProject::read (fixture.path ("returned-controls.dawproject"));
-	auto const& flat = track_named (returned, "Notes"); CPPUNIT_ASSERT_EQUAL (size_t (1), flat.clips.size ());
-	CPPUNIT_ASSERT_EQUAL (size_t (5), flat.clips[0].midi_controls.size ());
-	for (auto const& control : flat.clips[0].midi_controls) {
-		if (control.channel == 3) {
-			CPPUNIT_ASSERT_EQUAL (size_t (2), control.points.size ()); CPPUNIT_ASSERT_DOUBLES_EQUAL (8, control.points[0].time, 1e-6); CPPUNIT_ASSERT_EQUAL (30.0, control.points[0].value);
-			CPPUNIT_ASSERT_DOUBLES_EQUAL (9, control.points[1].time, 1e-6); CPPUNIT_ASSERT_EQUAL (90.0, control.points[1].value); continue;
+	auto const& restored = track_named (returned, "Notes");
+	CPPUNIT_ASSERT_EQUAL (actual.clips.size (), restored.clips.size ());
+	for (size_t c = 0; c < actual.clips.size (); ++c) {
+		CPPUNIT_ASSERT_EQUAL (actual.clips[c].name, restored.clips[c].name);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (actual.clips[c].position.value, restored.clips[c].position.value, 1e-6);
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (actual.clips[c].offset.value, restored.clips[c].offset.value, 1e-6);
+		CPPUNIT_ASSERT_EQUAL (actual.clips[c].midi_controls.size (), restored.clips[c].midi_controls.size ());
+		for (auto const& expected : actual.clips[c].midi_controls) {
+			auto found = std::find_if (restored.clips[c].midi_controls.begin (), restored.clips[c].midi_controls.end (),
+			                           [&] (const PX::MidiControl& control) { return control.type == expected.type && control.channel == expected.channel && control.number == expected.number; });
+			CPPUNIT_ASSERT (found != restored.clips[c].midi_controls.end ());
+			CPPUNIT_ASSERT_EQUAL (expected.points.size (), found->points.size ());
+			for (size_t i = 0; i < expected.points.size (); ++i) {
+				CPPUNIT_ASSERT_DOUBLES_EQUAL (expected.points[i].time, found->points[i].time, 1e-6);
+				CPPUNIT_ASSERT_EQUAL (expected.points[i].value, found->points[i].value);
+			}
 		}
-		CPPUNIT_ASSERT_EQUAL (size_t (3), control.points.size ());
-		CPPUNIT_ASSERT_DOUBLES_EQUAL (4, control.points[0].time, 1e-6); CPPUNIT_ASSERT_EQUAL (control.type == 0xe0 ? 8192.0 : 127.0, control.points[0].value);
-		CPPUNIT_ASSERT_DOUBLES_EQUAL (4.25, control.points[1].time, 1e-6); CPPUNIT_ASSERT_EQUAL (0.0, control.points[1].value);
-		CPPUNIT_ASSERT_DOUBLES_EQUAL (6.5, control.points[2].time, 1e-6); CPPUNIT_ASSERT_EQUAL (control.type == 0xe0 ? 16383.0 : 100.0, control.points[2].value);
 	}
 	CPPUNIT_ASSERT_EQUAL (size_t (0), stages (fixture.root));
 	std::cout << "MIDI controller DAWproject and AAF/SMF trim, chase, save/reopen round trips passed" << std::endl;

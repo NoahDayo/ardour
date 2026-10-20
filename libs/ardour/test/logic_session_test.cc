@@ -38,7 +38,7 @@ struct EnvironmentOverride {
 	std::string old;
 };
 struct Fixture {
-	Fixture (float level = .125f) : root (new_test_output_dir ("logic-exchange"))
+	Fixture (float level = .125f, bool midi_control = false) : root (new_test_output_dir ("logic-exchange"))
 	{
 		create_and_start_dummy_backend ();
 		PX::Project project;
@@ -66,6 +66,11 @@ struct Fixture {
 		clip = PX::Clip (); clip.kind = PX::ClipKind::MIDI; clip.name = "Phrase One"; clip.color = "#fedcba";
 		clip.position = PX::Time (4); clip.duration = 4; clip.offset = PX::Time (1);
 		PX::Note note; note.time = 1.25; note.duration = 1.5; note.key = 60; note.channel = 2; note.velocity = 93.0 / 127; note.release_velocity = 45.0 / 127;
+		if (midi_control) {
+			PX::MidiControl control; control.type = 0xb0; control.channel = 2; control.number = 64;
+			control.points = {{.5, 127, false}, {1.5, 0, false}, {4.5, 127, false}};
+			clip.midi_controls.push_back (control);
+		}
 		clip.notes.push_back (note); midi.clips.push_back (clip); project.tracks.push_back (midi);
 		project.markers.push_back ({u8"Refrain 音楽", PX::Time (12.5)});
 		PX::DawProject::write (project, path ("input.dawproject"), {{"source", path ("source.wav")}});
@@ -93,6 +98,7 @@ struct Fixture {
 class LogicSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST_SUITE (LogicSessionTest);
 	CPPUNIT_TEST (saved_session_export);
+	CPPUNIT_TEST (controller_clip_restoration);
 	CPPUNIT_TEST (range_marker_roundtrip);
 	CPPUNIT_TEST (paired_mono_layout);
 	CPPUNIT_TEST (resampled_source_end);
@@ -118,6 +124,7 @@ class LogicSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST_SUITE_END ();
 public:
 	void saved_session_export ();
+	void controller_clip_restoration ();
 	void range_marker_roundtrip ();
 	void paired_mono_layout ();
 	void resampled_source_end ();
@@ -995,6 +1002,69 @@ void LogicSessionTest::saved_session_export ()
 	}
 	free (buffer);
 	CPPUNIT_ASSERT_EQUAL (2u, count);
+}
+
+void LogicSessionTest::controller_clip_restoration ()
+{
+	Fixture fixture (.125f, true);
+	const std::string output = fixture.path ("ControllerReturn");
+	PX::SessionExchange::export_logic (*fixture.session, output, fixture.report);
+	const std::string aaf = Glib::build_filename (output, "Project.aaf");
+	const std::string midi = Glib::build_filename (output, "Project.mid");
+	const std::string sidecar = Glib::build_filename (output, "Metadata.xml");
+	PX::LogicProject restored (aaf, midi);
+	CPPUNIT_ASSERT_EQUAL (size_t (3), restored.project ().tracks.size ());
+	const auto& music = restored.project ().tracks[2];
+	CPPUNIT_ASSERT_EQUAL (size_t (1), music.clips.size ());
+	CPPUNIT_ASSERT_EQUAL (std::string ("Phrase One"), music.clips[0].name);
+	CPPUNIT_ASSERT_EQUAL (std::string ("#fedcba"), music.clips[0].color);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (4, music.clips[0].position.value, 1.0 / 19200);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (1, music.clips[0].offset.value, 1.0 / 19200);
+	CPPUNIT_ASSERT_EQUAL (size_t (1), music.clips[0].midi_controls.size ());
+	const auto& control = music.clips[0].midi_controls[0];
+	CPPUNIT_ASSERT_EQUAL (0xb0u, control.type);
+	CPPUNIT_ASSERT_EQUAL (2u, control.channel);
+	CPPUNIT_ASSERT_EQUAL (64u, control.number);
+	CPPUNIT_ASSERT_EQUAL (size_t (4), control.points.size ());
+	const std::array<double, 4> expected_times {{.5, 1, 1.5, 4.5}};
+	const std::array<double, 4> expected_values {{127, 127, 0, 127}};
+	for (size_t i = 0; i < 4; ++i) {
+		CPPUNIT_ASSERT_DOUBLES_EQUAL (expected_times[i], control.points[i].time, 1.0 / 19200);
+		CPPUNIT_ASSERT_EQUAL (expected_values[i], control.points[i].value);
+	}
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session = PX::SessionExchange::import_logic (*AudioEngine::instance (), aaf, midi,
+	                                                      fixture.path ("ControllerImported"), "ControllerImported", fixture.report);
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("ControllerImported"), "ControllerImported", nullptr, "", true));
+	AudioEngine::instance ()->set_session (fixture.session.get ());
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("controller-return.dawproject"));
+	auto returned = PX::DawProject::read (fixture.path ("controller-return.dawproject"));
+	auto found = std::find_if (returned.tracks.begin (), returned.tracks.end (), [] (const PX::Track& track) { return track.name == "Notes"; });
+	CPPUNIT_ASSERT (found != returned.tracks.end ());
+	const auto& returned_music = *found;
+	CPPUNIT_ASSERT_EQUAL (size_t (1), returned_music.clips.size ());
+	CPPUNIT_ASSERT_EQUAL (std::string ("Phrase One"), returned_music.clips[0].name);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (4, returned_music.clips[0].position.value, 1.0 / 19200);
+	CPPUNIT_ASSERT_EQUAL (size_t (1), returned_music.clips[0].midi_controls.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (4), returned_music.clips[0].midi_controls[0].points.size ());
+	char* data = nullptr;
+	gsize size = 0;
+	CPPUNIT_ASSERT (g_file_get_contents (sidecar.c_str (), &data, &size, nullptr));
+	std::unique_ptr<char, void (*) (void*)> contents (data, g_free);
+	std::string changed (data, size);
+	const size_t lane = changed.find ("<MidiControl");
+	const size_t end = changed.find ("</MidiControl>", lane);
+	const size_t point = changed.find ("value=\"0\"", lane);
+	CPPUNIT_ASSERT (lane != std::string::npos && end != std::string::npos && point > lane && point < end);
+	changed.replace (point, 9, "value=\"1\"");
+	CPPUNIT_ASSERT (g_file_set_contents (sidecar.c_str (), changed.data (), changed.size (), nullptr));
+	PX::LogicProject mismatched (aaf, midi);
+	CPPUNIT_ASSERT_EQUAL (size_t (1), mismatched.project ().tracks[2].clips.size ());
+	CPPUNIT_ASSERT_EQUAL (0.0, mismatched.project ().tracks[2].clips[0].position.value);
+	CPPUNIT_ASSERT_EQUAL (size_t (1), mismatched.project ().tracks[2].clips[0].midi_controls.size ());
+	CPPUNIT_ASSERT_EQUAL (0.0, mismatched.project ().tracks[2].clips[0].midi_controls[0].points[1].value);
 }
 
 void LogicSessionTest::existing_destination ()

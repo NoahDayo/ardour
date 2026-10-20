@@ -99,19 +99,20 @@ bool restore_metadata (Project& project, const std::string& aaf, const std::stri
 		}
 		return true;
 	};
-	/* SMF has no clip boundaries. For an unmodified return from our writer,
-	 * restore them only if the visible notes in the sidecar reproduce the
-	 * independently parsed SMF events at the writer's 19200 PPQN resolution.
-	 * Controller-bearing tracks keep their already parsed, flattened form. */
+	/* SMF has no clip boundaries. Restore them only if the visible notes and
+	 * controller events in the sidecar reproduce the independently parsed SMF
+	 * at the writer's 19200 PPQN resolution. */
 	auto restore_music_clips = [&] (const XMLNode* source, Track& track) {
 		using Event = std::tuple<uint64_t, uint64_t, unsigned, unsigned, unsigned, unsigned>;
+		using ControlKey = std::tuple<unsigned, unsigned, unsigned, uint64_t>;
 		std::vector<Event> expected, actual;
+		std::map<ControlKey, unsigned> expected_controls, actual_controls;
 		std::vector<Clip> restored;
 		auto tick = [] (double beats) { return uint64_t (std::floor (beats * 19200 + .5)); };
-		if (track.clips.size () > 1 || (!track.clips.empty () && !track.clips.front ().midi_controls.empty ())) { return false; }
+		if (track.clips.size () > 1) { return false; }
 		for (auto* item : source->children ("Clip")) {
 			if (cancel && cancel ()) { throw ArchiveCancelled (); }
-			if (!valid_label (item) || !item->children ("MidiControl").empty ()) { return false; }
+			if (!valid_label (item)) { return false; }
 			std::string enabled;
 			double position = 0, length = 0, offset = 0, gain = 0;
 			if (!item->get_property ("enabled", enabled) || enabled != "true" ||
@@ -142,6 +143,41 @@ bool restore_metadata (Project& project, const std::string& aaf, const std::stri
 					expected.emplace_back (on, off, channel, key, velocity, release);
 				}
 			}
+			std::set<std::tuple<unsigned, unsigned, unsigned>> targets;
+			for (auto* lane : item->children ("MidiControl")) {
+				if (cancel && cancel ()) { throw ArchiveCancelled (); }
+				unsigned type = 0, channel = 0, number = 0;
+				if (!lane->get_property ("type", type) || !lane->get_property ("channel", channel) ||
+				    !lane->get_property ("number", number) || channel > 15 ||
+				    !supported_midi_control (type, number) || clip.midi_controls.size () >= 2000000 ||
+				    !targets.emplace (type, channel, number).second) { return false; }
+				MidiControl control; control.type = type; control.channel = channel; control.number = number;
+				double previous = -1;
+				unsigned carry = 0;
+				bool has_carry = false, at_boundary = false;
+				std::vector<std::pair<uint64_t, unsigned>> visible;
+				for (auto* point : lane->children ("Point")) {
+					if (cancel && cancel ()) { throw ArchiveCancelled (); }
+					double at = 0;
+					unsigned value = 0;
+					if (!point->get_property ("time", at) || !point->get_property ("value", value) ||
+					    !std::isfinite (at) || at <= previous || at < 0 || at > std::ldexp (1.0, 40) ||
+					    value > (type == 0xe0 ? 16383u : 127u) || control.points.size () >= 2000000) { return false; }
+					previous = at;
+					control.points.push_back ({at, double (value), false});
+					if (at < offset) { carry = value; has_carry = true; }
+					else if (at < offset + length) {
+						at_boundary |= at == offset;
+						visible.emplace_back (tick (position + at - offset), value);
+					}
+				}
+				if (has_carry && !at_boundary) { visible.insert (visible.begin (), {tick (position), carry}); }
+				for (auto const& point : visible) {
+					auto inserted = expected_controls.emplace (ControlKey (type, channel, number, point.first), point.second);
+					if (!inserted.second && inserted.first->second != point.second) { return false; }
+				}
+				clip.midi_controls.push_back (std::move (control));
+			}
 			restored.push_back (std::move (clip));
 		}
 		for (auto const& clip : track.clips) {
@@ -149,9 +185,15 @@ bool restore_metadata (Project& project, const std::string& aaf, const std::stri
 				actual.emplace_back (tick (note.time), tick (note.time + note.duration), note.channel, note.key,
 				                     unsigned (std::lround (note.velocity * 127)), unsigned (std::lround (note.release_velocity * 127)));
 			}
+			for (auto const& control : clip.midi_controls) {
+				for (auto const& point : control.points) {
+					auto inserted = actual_controls.emplace (ControlKey (control.type, control.channel, control.number, tick (point.time)), unsigned (point.value));
+					if (!inserted.second && inserted.first->second != unsigned (point.value)) { return false; }
+				}
+			}
 		}
 		std::sort (expected.begin (), expected.end ()); std::sort (actual.begin (), actual.end ());
-		if (expected != actual) { return false; }
+		if (expected != actual || expected_controls != actual_controls) { return false; }
 		track.clips = std::move (restored);
 		return true;
 	};
@@ -177,7 +219,7 @@ bool restore_metadata (Project& project, const std::string& aaf, const std::stri
 		apply_label (source, track->name, track->color);
 		if (restore_music_clips (source, *track)) {
 			++restored_music;
-			project.report.push_back ({Disposition::Transformed, track->name, "Original MIDI clip boundaries, names and colors restored from visible-note-matched Metadata.xml"});
+			project.report.push_back ({Disposition::Transformed, track->name, "Original MIDI clip boundaries, names, colors and controller lanes restored from event-matched Metadata.xml"});
 		}
 	}
 	if (!music.empty () && restored_music == music.size ()) {
