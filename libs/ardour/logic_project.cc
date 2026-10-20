@@ -7,6 +7,7 @@
 #include <cstring>
 #include <map>
 #include <set>
+#include <tuple>
 #include <limits>
 #include <fcntl.h>
 #include <glib.h>
@@ -74,7 +75,7 @@ bool restore_metadata (Project& project, const std::string& aaf, const std::stri
 	TimeMap timing (project);
 	auto valid_label = [] (const XMLNode* node) {
 		std::string name, color;
-		return node->get_property ("name", name) && name.size () <= 4096 &&
+		return node->get_property ("name", name) && name.size () <= 4096 && g_utf8_validate (name.data (), name.size (), nullptr) &&
 		       node->get_property ("color", color) &&
 		       (color.empty () || (color.size () == 7 && color[0] == '#' &&
 		        color.find_first_not_of ("0123456789abcdefABCDEF", 1) == std::string::npos));
@@ -98,6 +99,62 @@ bool restore_metadata (Project& project, const std::string& aaf, const std::stri
 		}
 		return true;
 	};
+	/* SMF has no clip boundaries. For an unmodified return from our writer,
+	 * restore them only if the visible notes in the sidecar reproduce the
+	 * independently parsed SMF events at the writer's 19200 PPQN resolution.
+	 * Controller-bearing tracks keep their already parsed, flattened form. */
+	auto restore_music_clips = [&] (const XMLNode* source, Track& track) {
+		using Event = std::tuple<uint64_t, uint64_t, unsigned, unsigned, unsigned, unsigned>;
+		std::vector<Event> expected, actual;
+		std::vector<Clip> restored;
+		auto tick = [] (double beats) { return uint64_t (std::floor (beats * 19200 + .5)); };
+		if (track.clips.size () > 1 || (!track.clips.empty () && !track.clips.front ().midi_controls.empty ())) { return false; }
+		for (auto* item : source->children ("Clip")) {
+			if (cancel && cancel ()) { throw ArchiveCancelled (); }
+			if (!valid_label (item) || !item->children ("MidiControl").empty ()) { return false; }
+			std::string enabled;
+			double position = 0, length = 0, offset = 0, gain = 0;
+			if (!item->get_property ("enabled", enabled) || enabled != "true" ||
+			    !item->get_property ("gain", gain) || gain != 1 ||
+			    !item->get_property ("time", position) || !item->get_property ("length", length) ||
+			    !item->get_property ("offset", offset) || !std::isfinite (position + length) ||
+			    !std::isfinite (offset + length) || position < 0 || length <= 0 || offset < 0 ||
+			    position + length > std::ldexp (1.0, 40) || offset + length > std::ldexp (1.0, 40)) { return false; }
+			Clip clip; clip.kind = ClipKind::MIDI; clip.position = Time (position); clip.duration = length; clip.offset = Time (offset);
+			item->get_property ("name", clip.name); item->get_property ("color", clip.color);
+			for (auto* event : item->children ("Note")) {
+				if (cancel && cancel ()) { throw ArchiveCancelled (); }
+				double start = 0, duration = 0;
+				unsigned key = 0, channel = 0, velocity = 0, release = 0;
+				if (!event->get_property ("time", start) || !event->get_property ("length", duration) ||
+				    !event->get_property ("key", key) || !event->get_property ("channel", channel) ||
+				    !event->get_property ("velocity", velocity) || !event->get_property ("release", release) ||
+				    !std::isfinite (start + duration) || start < 0 || duration <= 0 ||
+				    start + duration > std::ldexp (1.0, 40) || key > 127 ||
+				    channel > 15 || velocity < 1 || velocity > 127 || release > 127 || clip.notes.size () >= 2000000) { return false; }
+				Note note; note.time = start; note.duration = duration; note.key = key; note.channel = channel;
+				note.velocity = velocity / 127.0; note.release_velocity = release / 127.0;
+				clip.notes.push_back (note);
+				double visible_start = std::max (start, offset), visible_end = std::min (start + duration, offset + length);
+				if (visible_start < visible_end) {
+					uint64_t on = tick (position + visible_start - offset), off = tick (position + visible_end - offset);
+					if (off <= on) { return false; }
+					expected.emplace_back (on, off, channel, key, velocity, release);
+				}
+			}
+			restored.push_back (std::move (clip));
+		}
+		for (auto const& clip : track.clips) {
+			for (auto const& note : clip.notes) {
+				actual.emplace_back (tick (note.time), tick (note.time + note.duration), note.channel, note.key,
+				                     unsigned (std::lround (note.velocity * 127)), unsigned (std::lround (note.release_velocity * 127)));
+			}
+		}
+		std::sort (expected.begin (), expected.end ()); std::sort (actual.begin (), actual.end ());
+		if (expected != actual) { return false; }
+		track.clips = std::move (restored);
+		return true;
+	};
 	auto apply_label = [] (const XMLNode* source, std::string& name, std::string& color) {
 		source->get_property ("name", name);
 		source->get_property ("color", color);
@@ -114,7 +171,22 @@ bool restore_metadata (Project& project, const std::string& aaf, const std::stri
 		for (auto* item : source->children ("Clip")) { apply_label (item, clip->name, clip->color); ++clip; }
 	}
 	original = meta_music.begin ();
-	for (auto* track : music) { apply_label (*original++, track->name, track->color); }
+	size_t restored_music = 0;
+	for (auto* track : music) {
+		auto* source = *original++;
+		apply_label (source, track->name, track->color);
+		if (restore_music_clips (source, *track)) {
+			++restored_music;
+			project.report.push_back ({Disposition::Transformed, track->name, "Original MIDI clip boundaries, names and colors restored from visible-note-matched Metadata.xml"});
+		}
+	}
+	if (!music.empty () && restored_music == music.size ()) {
+		for (auto& item : project.report) {
+			if (item.object == "MIDI clips") {
+				item.detail = "Matching return metadata restored the original MIDI clip boundaries; instrument sounds are not included in SMF";
+			}
+		}
+	}
 	return true;
 }
 double rational (const aafRational_t* value) {
