@@ -175,7 +175,7 @@ void native_package (Fixture& fixture, bool processing = false, bool variable = 
 	std::string transport = R"(
 <TempoMap x:id="tempoMap"><TempoMapSegment start="0" tempo="0.6"/></TempoMap>
 <TimeSignatureMap x:id="timeSignatureMap"><TimeSignatureMapSegment start="0" numerator="3" denominator="4"/></TimeSignatureMap>
-)", events = std::string (R"(<AudioEvent clipID="media" start="1.25" length="0.5" offset="0.375" name="Native clip" speed=")") + (processing ? "2" : "1") + R"("/>)";
+)", events = std::string (R"(<AudioEvent clipID="media" start="1.25" length="0.5" offset="0.375" name="Native clip" speed=")") + (processing ? "2" : "1") + R"("><Attributes x:id="attributes" trackID="audio"/></AudioEvent>)";
 	if (variable) {
 		transport = R"(<TempoMap x:id="tempoMap"><TempoMapSegment start="0" end="3" tempo="0.6"/><TempoMapSegment start="3" end="6" tempo="0.5"/><TempoMapSegment start="6" tempo="0.25"/></TempoMap>
 <TimeSignatureMap x:id="timeSignatureMap"><TimeSignatureMapSegment start="0" numerator="3" denominator="4"/><TimeSignatureMapSegment start="3" numerator="5" denominator="8"/><TimeSignatureMapSegment start="5.5" numerator="4" denominator="4"/></TimeSignatureMap>)";
@@ -2862,6 +2862,12 @@ void ProjectSessionTest::native_song_format_seven_app_authored ()
 	CPPUNIT_ASSERT (slice->position.unit == PX::TimeUnit::Beats && slice->offset.unit == PX::TimeUnit::Seconds);
 	CPPUNIT_ASSERT_DOUBLES_EQUAL (3.991 * 60 / 108, slice->offset.value, 1e-6);
 	CPPUNIT_ASSERT (PX::has_unsupported_features (original.project));
+	CPPUNIT_ASSERT (std::none_of (original.project.report.begin (), original.project.report.end (), [] (const PX::Diagnostic& d) {
+		return d.detail == "Event envelopes or other nested processing are not yet supported";
+	}));
+	CPPUNIT_ASSERT (std::any_of (original.project.report.begin (), original.project.report.end (), [] (const PX::Diagnostic& d) {
+		return d.disposition == PX::Disposition::Unsupported && d.detail.find ("trackIndex") != std::string::npos;
+	}));
 	fixture.session = PX::SessionExchange::import_studio_one (*AudioEngine::instance (), source,
 	                                                          fixture.path ("StudioOne6"), "StudioOne6", fixture.report,
 	                                                          PX::CancelCheck (), true);

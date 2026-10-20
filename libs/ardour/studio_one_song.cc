@@ -662,7 +662,15 @@ void Reader::track (Node n)
 		if (number (e, "speed", 1) != 1) { unsupported (c.name, "Event speed adjustment is not yet supported"); }
 		if (midi && number (e, "gain", 1) != 1) { unsupported (c.name, "MIDI event gain requires instrument rendering"); }
 		for (Node part : children (e)) {
-			if (!is (part, "Attributes") || id (part) != "volumeCurve") { unsupported (c.name, "Event envelopes or other nested processing are not yet supported"); }
+			if (is (part, "Attributes") && id (part) == "volumeCurve") { continue; }
+			if (is (part, "Attributes") && id (part) == "attributes" && children (part).empty () &&
+			    value (part, "trackID") == t.id) {
+				/* The owner ID is redundant; other event metadata can carry
+				 * layer or source-origin semantics and remains reportable. */
+				attributes (part, {"x:id", "id", "trackID"}, c.name);
+				continue;
+			}
+			unsupported (c.name, "Event envelopes or other nested processing are not yet supported");
 		}
 		t.clips.push_back (c);
 	}
