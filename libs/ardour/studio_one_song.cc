@@ -615,13 +615,22 @@ void Reader::track (Node n)
 	for (Node c : children (n)) {
 		if (is (c, "List") && id (c) != "Events" && !children (c).empty ()) { unsupported (t.name, "Track layers or additional event lists are not yet supported"); }
 	}
+	TimeMap timing (result.project);
 	for (Node e : children (child (n, "List", "Events"))) {
 		bool midi = t.kind == TrackKind::MIDI;
 		if (!is (e, midi ? "MusicPart" : "AudioEvent")) { unsupported (t.name, "Unsupported native event type"); continue; }
 		Clip c; c.kind = midi ? ClipKind::MIDI : ClipKind::Audio; c.name = value (e, "name", t.name); c.color = color (value (e, "color"));
 		attributes (e, {"clipID", "timeFormat", "start", "length", "name", "color", "offset", "mute", "speed", "transpose", "tune", "normalize", "modification", "velocity", "fadeIn", "fadeOut", "loop", "gain"}, c.name);
-		c.position = Time (number (e, "start"), unit (integer (e, "timeFormat", format))); c.duration = number (e, "length");
-		c.offset = Time (number (e, "offset"), midi ? TimeUnit::Beats : TimeUnit::Seconds); c.enabled = !boolean (e, "mute");
+		TimeUnit event_unit = unit (integer (e, "timeFormat", format));
+		c.position = Time (number (e, "start"), event_unit); c.duration = number (e, "length");
+		double native_offset = number (e, "offset");
+		if (!midi && event_unit == TimeUnit::Beats) {
+			/* Native audio offsets use the event's time format. Resolve the
+			 * preceding musical duration to the source's absolute seconds. */
+			c.offset = Time (timing.duration (Time (native_offset, TimeUnit::Beats),
+			                                  Time (c.position.value - native_offset, TimeUnit::Beats), TimeUnit::Seconds), TimeUnit::Seconds);
+		} else { c.offset = Time (native_offset, midi ? TimeUnit::Beats : TimeUnit::Seconds); }
+		c.enabled = !boolean (e, "mute");
 		std::string key = value (e, "clipID"); auto entry = pool.find (key); require (entry != pool.end (), "Native event references missing media");
 		if (midi) { require (is (entry->second, "MusicClip"), "Wrong native MIDI media type"); notes (c, entry->second); }
 		else { c.media = audio (key); c.gain = number (e, "gain", 1); }

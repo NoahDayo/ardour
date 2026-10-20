@@ -179,9 +179,9 @@ void native_package (Fixture& fixture, bool processing = false, bool variable = 
 	if (variable) {
 		transport = R"(<TempoMap x:id="tempoMap"><TempoMapSegment start="0" end="3" tempo="0.6"/><TempoMapSegment start="3" end="6" tempo="0.5"/><TempoMapSegment start="6" tempo="0.25"/></TempoMap>
 <TimeSignatureMap x:id="timeSignatureMap"><TimeSignatureMapSegment start="0" numerator="3" denominator="4"/><TimeSignatureMapSegment start="3" numerator="5" denominator="8"/><TimeSignatureMapSegment start="5.5" numerator="4" denominator="4"/></TimeSignatureMap>)";
-		events = R"(<AudioEvent clipID="media" start="5" length="2" offset="0.375" timeFormat="2" gain="0.5" name="Quiet"/>
-<AudioEvent clipID="media" start="8" length="1" offset="0.375" timeFormat="2" gain="2" name="Loud"/>
-<AudioEvent clipID="media" start="10" length="1" offset="0.375" timeFormat="2" gain="0" name="Silent"/>)";
+		events = R"(<AudioEvent clipID="media" start="5" length="2" offset="0.75" timeFormat="2" gain="0.5" name="Quiet"/>
+<AudioEvent clipID="media" start="8" length="1" offset="1.5" timeFormat="2" gain="2" name="Loud"/>
+<AudioEvent clipID="media" start="10" length="1" offset="1.5" timeFormat="2" gain="0" name="Silent"/>)";
 	}
 	if (fades) {
 		events = R"(<AudioEvent clipID="media" start="1.25" length="0.5" offset="0.375" timeFormat="0" name="Faded clip"><Attributes x:id="volumeCurve" fadeIn.length="0.125" fadeOut.length="0.125"/></AudioEvent>)";
@@ -533,6 +533,7 @@ class ProjectSessionTest : public CppUnit::TestFixture {
 	CPPUNIT_TEST (native_song_format_seven_import);
 	CPPUNIT_TEST (native_song_format_eight_import);
 	CPPUNIT_TEST (native_song_format_two_import);
+	CPPUNIT_TEST (native_song_format_seven_app_authored);
 	CPPUNIT_TEST (native_song_format_eight_app_authored);
 	CPPUNIT_TEST (native_song_format_two_app_authored);
 	CPPUNIT_TEST (native_song_cancel);
@@ -600,6 +601,7 @@ public:
 	void native_song_format_seven_import ();
 	void native_song_format_eight_import ();
 	void native_song_format_two_import ();
+	void native_song_format_seven_app_authored ();
 	void native_song_format_eight_app_authored ();
 	void native_song_format_two_app_authored ();
 	void native_song_cancel ();
@@ -2840,6 +2842,43 @@ void ProjectSessionTest::native_song_format_eight_app_authored ()
 	CPPUNIT_ASSERT (track_named (version_matched.project, "Synth").kind == PX::TrackKind::MIDI);
 	CPPUNIT_ASSERT (track_named (version_matched.project, "Track").kind == PX::TrackKind::Audio);
 	std::cout << "App-authored Studio One 7 song retained tracks and tempo through partial import, save/reopen, DAWproject and native-song return" << std::endl;
+}
+
+void ProjectSessionTest::native_song_format_seven_app_authored ()
+{
+	const char* source = std::getenv ("ARDOUR_STUDIO_ONE_6_TEST_SONG");
+	if (!source || !*source) { return; }
+	Fixture fixture;
+	auto original = PX::StudioOneSong::read (source);
+	CPPUNIT_ASSERT_EQUAL (7u, original.format_version);
+	CPPUNIT_ASSERT_EQUAL (std::string ("Studio One/6.6.4.102451"), original.project.application_version);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (108, original.project.tempo, .001);
+	CPPUNIT_ASSERT_EQUAL (size_t (10), track_named (original.project, "Vocal").clips.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (15), track_named (original.project, "Tele Front").clips.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (25), track_named (original.project, "Addictive Drums 2").clips.size ());
+	auto const& vocal = track_named (original.project, "Vocal");
+	auto slice = std::find_if (vocal.clips.begin (), vocal.clips.end (), [] (const PX::Clip& clip) { return clip.name == "Vocal(4)"; });
+	CPPUNIT_ASSERT (slice != vocal.clips.end ());
+	CPPUNIT_ASSERT (slice->position.unit == PX::TimeUnit::Beats && slice->offset.unit == PX::TimeUnit::Seconds);
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (3.991 * 60 / 108, slice->offset.value, 1e-6);
+	CPPUNIT_ASSERT (PX::has_unsupported_features (original.project));
+	fixture.session = PX::SessionExchange::import_studio_one (*AudioEngine::instance (), source,
+	                                                          fixture.path ("StudioOne6"), "StudioOne6", fixture.report,
+	                                                          PX::CancelCheck (), true);
+	CPPUNIT_ASSERT (fixture.session && fixture.session->route_by_name ("Vocal"));
+	CPPUNIT_ASSERT_EQUAL (0, fixture.session->save_state (""));
+	AudioEngine::instance ()->remove_session (); fixture.session.reset ();
+	fixture.session.reset (new Session (*AudioEngine::instance (), fixture.path ("StudioOne6"), "StudioOne6", nullptr, "", true));
+	PX::SessionExchange::export_dawproject (*fixture.session, fixture.path ("studio-one-6-return.dawproject"));
+	auto returned = PX::DawProject::read (fixture.path ("studio-one-6-return.dawproject"));
+	auto const& returned_vocal = track_named (returned, "Vocal");
+	CPPUNIT_ASSERT_EQUAL (size_t (10), returned_vocal.clips.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (15), track_named (returned, "Tele Front").clips.size ());
+	CPPUNIT_ASSERT_EQUAL (size_t (25), track_named (returned, "Addictive Drums 2").clips.size ());
+	auto returned_slice = std::find_if (returned_vocal.clips.begin (), returned_vocal.clips.end (), [] (const PX::Clip& clip) { return clip.name == "Vocal(4)"; });
+	CPPUNIT_ASSERT (returned_slice != returned_vocal.clips.end ());
+	CPPUNIT_ASSERT_DOUBLES_EQUAL (slice->offset.value, returned_slice->offset.value, 1.0 / 44100);
+	std::cout << "App-authored Studio One 6 song and original WAV media survived partial import, save/reopen and DAWproject return" << std::endl;
 }
 
 void ProjectSessionTest::native_song_format_two_app_authored ()
